@@ -2,7 +2,7 @@
 // others are CLI tools run through the Tauri `run_tool` command on stdin.
 import { invoke } from "@tauri-apps/api/core";
 import type * as Monaco from "monaco-editor";
-import { get, pushConsole, set } from "./store";
+import { get, pushConsole, readJson, set } from "./store";
 
 export type Linter = "ruff" | "flake8" | "pylint" | "none";
 export type Formatter = "ruff" | "black" | "autopep8" | "none";
@@ -10,7 +10,7 @@ export interface ToolSettings { linter: Linter; formatter: Formatter; linterArgs
 
 const DEFAULTS: ToolSettings = { linter: "ruff", formatter: "ruff", linterArgs: "", formatterArgs: "", lineLength: 88 };
 export function loadToolSettings(): ToolSettings {
-  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem("pide.tools") ?? "{}") }; } catch { return DEFAULTS; }
+  return { ...DEFAULTS, ...readJson("pide.tools", {}) };
 }
 export function saveToolSettings(t: ToolSettings) {
   localStorage.setItem("pide.tools", JSON.stringify(t));

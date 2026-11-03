@@ -22,7 +22,7 @@ import { cont, stepIn, stepOut, stepOver, stopDebugger } from "./debug";
 import EditorPanel, { activeEditorId, editors } from "./panels/Editor";
 import { complete, initKernelBridge, interrupt, restartKernel, setPython, startKernel } from "./kernel";
 import { buildDefaultLayout, dockApi, LAYOUT_KEY, openFile, openNotebook, openVariable, plotVariable, setDockApi, type PlotKind } from "./layout";
-import { get, pushConsole, set, useStore } from "./store";
+import { get, pushConsole, readJson, set, useStore } from "./store";
 
 const components = {
   console: Console,
@@ -87,7 +87,7 @@ export default function App() {
     let ok = false;
     if (saved) {
       try {
-        e.api.fromJSON(JSON.parse(saved));
+        e.api.fromJSON(readJson(LAYOUT_KEY, null) as any);
         // Figures live only in memory, so their floating windows cannot be restored.
         for (const p of [...e.api.panels]) if (p.id.startsWith("fig:") || p.id.startsWith("diff:")) e.api.removePanel(p);
         ok = e.api.panels.length > 0;

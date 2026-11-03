@@ -24,15 +24,6 @@ export interface Breakpoint {
   logMessage?: string;
 }
 
-/** Migrate the old `number[]` storage format and read saved breakpoints. */
-export function loadBreakpoints(): Record<string, Breakpoint[]> {
-  try {
-    const raw = JSON.parse(localStorage.getItem("pide.breakpoints") ?? "{}");
-    const out: Record<string, Breakpoint[]> = {};
-    for (const [k, v] of Object.entries(raw)) out[k] = (v as any[]).map((x) => (typeof x === "number" ? { line: x } : x));
-    return out;
-  } catch { return {}; }
-}
 export const bpLines = (bps: Breakpoint[] | undefined) => (bps ?? []).map((b) => b.line);
 
 export interface Frame { id: number; name: string; path: string | null; line: number; column: number }
@@ -55,7 +46,6 @@ export interface DebugState {
   scopes: { name: string; variablesReference: number }[];
   variables: DapVar[];
 }
-export const initialDebug: DebugState = { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: loadBreakpoints(), exceptions: JSON.parse(localStorage.getItem("pide.exceptions") ?? '{"uncaught":true,"raised":false}'), exceptionInfo: null, cellFiles: {}, scopes: [], variables: [] };
 
 let seq = 0;
 function patch(p: Partial<DebugState>) {
@@ -119,7 +109,8 @@ function saveBreakpoints(editorPath: string, list: Breakpoint[]) {
   const bp = { ...get().debug.breakpoints };
   if (list.length) bp[editorPath] = [...list].sort((a, b) => a.line - b.line); else delete bp[editorPath];
   patch({ breakpoints: bp });
-  localStorage.setItem("pide.breakpoints", JSON.stringify(bp));
+  const persist = Object.fromEntries(Object.entries(bp).filter(([k]) => !k.startsWith("untitled:") && !k.includes("/Untitled-")));
+  localStorage.setItem("pide.breakpoints", JSON.stringify(persist));
   if (get().debug.active && !editorPath.startsWith("untitled:") && !editorPath.startsWith("vscode-notebook-cell:")) pushBreakpoints(editorPath, bp[editorPath] ?? []).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
 }
 

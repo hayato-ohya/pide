@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { execute, refreshWorkspace } from "../kernel";
-import { set, useStore } from "../store";
+import { readJson, set, useStore } from "../store";
 import type { VarInfo } from "../types";
 import { openVariable, plotVariable } from "../layout";
 import DebugVariables from "./DebugVariables";
@@ -64,7 +64,7 @@ export default function Workspace() {
   const showHidden = useStore((s) => s.showHidden);
   const [filter, setFilter] = useState("");
   const [showCode, setShowCode] = useState(false);
-  const [cols, setCols] = useState<ColKey[]>(() => JSON.parse(localStorage.getItem("pide.wscols") ?? "null") ?? ALL_COLS.filter((c) => c.default).map((c) => c.key));
+  const [cols, setCols] = useState<ColKey[]>(() => readJson<ColKey[] | null>("pide.wscols", null) ?? ALL_COLS.filter((c) => c.default).map((c) => c.key));
   const [sort, setSort] = useState<{ key: ColKey; dir: 1 | -1 }>({ key: "name", dir: 1 });
   const [menu, setMenu] = useState<{ x: number; y: number; v: VarInfo } | null>(null);
 

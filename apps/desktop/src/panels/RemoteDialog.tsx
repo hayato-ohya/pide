@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { restartKernel, setConnectionFile, setRemote } from "../kernel";
-import { useStore } from "../store";
+import { readJson, useStore } from "../store";
 
 interface Profile { name: string; host: string; port?: number | null; python: string; cwd?: string | null }
 
 /** Choose a remote kernel: an SSH profile or an existing connection file. */
 export default function RemoteDialog({ onClose }: { onClose: () => void }) {
   const remote = useStore((s) => s.remote);
-  const [profiles, setProfiles] = useState<Profile[]>(() => JSON.parse(localStorage.getItem("pide.remoteProfiles") ?? "[]"));
+  const [profiles, setProfiles] = useState<Profile[]>(() => readJson<Profile[]>("pide.remoteProfiles", []));
   const [p, setP] = useState<Profile>({ name: "", host: remote?.host ?? "", port: remote?.port ?? null, python: remote?.python ?? "python3", cwd: remote?.cwd ?? "" });
   const save = (list: Profile[]) => { setProfiles(list); localStorage.setItem("pide.remoteProfiles", JSON.stringify(list)); };
 

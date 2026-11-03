@@ -41,6 +41,8 @@ pub struct Kernel {
     extra: Mutex<Vec<Child>>,
     /// True when the kernel process is not local (interrupt via control channel).
     pub remote: bool,
+    /// False for kernels we merely attached to: never send them shutdown_request.
+    pub owned: bool,
     pub info: ConnectionInfo,
     signer: Signer,
     session: String,
@@ -78,13 +80,13 @@ impl Kernel {
         if let Some(err) = child.stderr.take() {
             tokio::spawn(pipe_log("kernel.stderr", err));
         }
-        Self::connect_inner(info, Some(child), vec![], false, Some(conn_file)).await
+        Self::connect_inner(info, Some(child), vec![], false, true, Some(conn_file)).await
     }
 
     /// Connect to an already running kernel described by a connection file
     /// (e.g. a kernel started by hand, or in a container with published ports).
     pub async fn connect(info: ConnectionInfo) -> Result<Arc<Kernel>> {
-        Self::connect_inner(info, None, vec![], true, None).await
+        Self::connect_inner(info, None, vec![], true, false, None).await
     }
 
     /// Start a kernel on a remote host over SSH and tunnel its ports.
@@ -95,6 +97,9 @@ impl Kernel {
     /// 3. open a second SSH session with `-L` forwards for the five ports
     pub async fn launch_remote(spec: launch::RemoteSpec, helper_src: &str) -> Result<Arc<Kernel>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        if spec.host.starts_with('-') || spec.host.is_empty() {
+            anyhow::bail!("invalid ssh host {:?}", spec.host);
+        }
         let ssh = spec.ssh.clone().unwrap_or_else(|| "ssh".into());
         let base_args = |s: &launch::RemoteSpec| -> Vec<String> {
             let mut a = vec!["-o".into(), "BatchMode=yes".into(), "-o".into(), "ServerAliveInterval=15".into()];
@@ -105,8 +110,8 @@ impl Kernel {
 
         // 1. helper upload
         let mut up = Command::new(&ssh);
-        up.args(base_args(&spec)).arg(&spec.host)
-            .arg("mkdir -p ~/.pide/pide_kernel && cat > ~/.pide/pide_kernel/__init__.py")
+        up.args(base_args(&spec)).arg("--").arg(&spec.host)
+            .arg("umask 077 && mkdir -p ~/.pide/pide_kernel && chmod 700 ~/.pide && cat > ~/.pide/pide_kernel/__init__.py")
             .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut up_child = up.spawn().context("ssh (upload helper)")?;
         if let Some(mut stdin) = up_child.stdin.take() {
@@ -132,24 +137,16 @@ print("PIDE_CONN:"+json.dumps(info),flush=True)
 os.environ["PYTHONPATH"]=os.path.expanduser("~/.pide")+os.pathsep+os.environ.get("PYTHONPATH","")
 os.environ.setdefault("MPLBACKEND","module://matplotlib_inline.backend_inline")
 os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
-        let b64 = {
-            // avoid any quoting trouble: ship the bootstrap base64-encoded
-            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let d = bootstrap.as_bytes();
-            let mut o = String::new();
-            for c in d.chunks(3) {
-                let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-                o.push(T[(n >> 18 & 63) as usize] as char);
-                o.push(T[(n >> 12 & 63) as usize] as char);
-                o.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-                o.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
-            }
-            o
-        };
-        let remote_cmd = format!("cd {} && {} -c \"import base64;exec(base64.b64decode('{}'))\"", shell_quote(&cwd), shell_quote(&spec.python), b64);
+        let b64 = b64encode(bootstrap.as_bytes());
+        // cwd is handed to Python (expanduser + chdir) so no shell quoting of user paths is needed.
+        let cwd_b64 = b64encode(cwd.as_bytes());
+        let remote_cmd = format!(
+            "PIDE_CWD_B64={} {} -c \"import base64,os;os.chdir(os.path.expanduser(base64.b64decode(os.environ['PIDE_CWD_B64']).decode()));exec(base64.b64decode('{}'))\"",
+            cwd_b64, shell_quote(&spec.python), b64
+        );
         let mut run = Command::new(&ssh);
-        run.args(base_args(&spec)).arg(&spec.host).arg(&remote_cmd)
-            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        run.args(base_args(&spec)).arg("--").arg(&spec.host).arg(&remote_cmd)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut kernel_child = run.spawn().context("ssh (start kernel)")?;
         let stdout = kernel_child.stdout.take().unwrap();
         if let Some(err) = kernel_child.stderr.take() {
@@ -185,7 +182,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         for (l, r) in pairs {
             tun.arg("-L").arg(format!("127.0.0.1:{l}:127.0.0.1:{r}"));
         }
-        tun.arg(&spec.host).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+        tun.arg("--").arg(&spec.host).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut tun_child = tun.spawn().context("ssh (tunnel)")?;
         if let Some(err) = tun_child.stderr.take() {
             tokio::spawn(pipe_log("tunnel.stderr", err));
@@ -194,7 +191,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
         let info = ConnectionInfo { key: remote_info.key.clone(), signature_scheme: remote_info.signature_scheme.clone(), ..local };
-        Self::connect_inner(info, Some(kernel_child), vec![tun_child], true, None).await
+        Self::connect_inner(info, Some(kernel_child), vec![tun_child], true, true, None).await
     }
 
     async fn connect_inner(
@@ -202,6 +199,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         child: Option<Child>,
         extra: Vec<Child>,
         remote: bool,
+        owned: bool,
         conn_file: Option<launch::ConnFile>,
     ) -> Result<Arc<Kernel>> {
         let signer = Signer::new(&info.key);
@@ -245,6 +243,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             child: Mutex::new(child),
             extra: Mutex::new(extra),
             remote,
+            owned,
             info,
             signer,
             session,
@@ -378,8 +377,11 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             self.control_tx.send(msg).await?;
             return Ok(());
         }
-        let child = self.child.lock().await;
-        if let Some(c) = child.as_ref() {
+        let mut child = self.child.lock().await;
+        if let Some(c) = child.as_mut() {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
             if let Some(pid) = c.id() {
                 #[cfg(unix)]
                 unsafe {
@@ -396,12 +398,20 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
     }
 
     pub async fn shutdown(&self, restart: bool) -> Result<()> {
-        let (_, msg) = self.build("shutdown_request", json!({"restart": restart}));
-        let _ = self.control_tx.send(msg).await;
-        // Give it a moment, then make sure the process is gone.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if self.owned {
+            let (_, msg) = self.build("shutdown_request", json!({"restart": restart}));
+            let _ = self.control_tx.send(msg).await;
+        }
         let mut child = self.child.lock().await;
         if let Some(mut c) = child.take() {
+            // Let the kernel exit cleanly (flush files) before forcing it.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             let _ = c.start_kill();
             let _ = c.wait().await;
         }
@@ -496,9 +506,27 @@ async fn dealer(
     Ok(tx)
 }
 
-fn shell_quote(s: &str) -> String {
-    if s == "~" || s.starts_with("~/") {
-        return s.to_string(); // let the remote shell expand it
+pub fn b64encode(d: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = String::new();
+    for c in d.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        o.push(T[(n >> 18 & 63) as usize] as char);
+        o.push(T[(n >> 12 & 63) as usize] as char);
+        o.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        o.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    o
+}
+
+/// POSIX single-quote; `~` is expanded by the remote shell only when it is the
+/// whole string or a `~/` prefix with no further quoting hazards.
+pub fn shell_quote(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        return format!("~/'{}'", rest.replace('\'', "'\\''"));
+    }
+    if s == "~" {
+        return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
 }

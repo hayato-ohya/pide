@@ -56,10 +56,33 @@ pub struct ConnFile(PathBuf);
 
 impl ConnFile {
     pub fn write(info: &ConnectionInfo) -> Result<Self> {
-        let dir = std::env::temp_dir().join("pide-kernels");
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("pide-kernels");
         std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        // Sweep files left behind by crashed sessions (older than a day).
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if let Ok(md) = e.metadata() {
+                    if md.modified().ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() > 86_400).unwrap_or(false) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
         let path = dir.join(format!("kernel-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&path, serde_json::to_vec_pretty(info)?)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        opts.open(&path)?.write_all(&serde_json::to_vec_pretty(info)?)?;
         Ok(ConnFile(path))
     }
     pub fn path(&self) -> &Path {

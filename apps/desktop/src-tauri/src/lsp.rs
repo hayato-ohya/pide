@@ -179,6 +179,13 @@ pub async fn lsp_stop(state: tauri::State<'_, LspState>, name: String) -> Result
     Ok(())
 }
 
+pub async fn shutdown_all(state: &LspState) {
+    for (_, mut s) in state.servers.lock().await.drain() {
+        let _ = s.child.start_kill();
+        let _ = s.child.wait().await;
+    }
+}
+
 /// Poll: report servers that exited so the UI can show it and restart.
 #[tauri::command]
 pub async fn lsp_check(app: AppHandle, state: tauri::State<'_, LspState>) -> Result<Vec<String>, String> {

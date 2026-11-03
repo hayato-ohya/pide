@@ -100,6 +100,10 @@ async fn start_kernel(
         env: vec![
             ("PYTHONPATH".into(), pythonpath),
             ("MPLBACKEND".into(), "module://matplotlib_inline.backend_inline".into()),
+            // ipykernel's parent poller exits the kernel when Pide dies (also on crash).
+            ("JPY_PARENT_PID".into(), std::process::id().to_string()),
+            // Python >= 3.11: do not put the cwd first on sys.path (untrusted folders).
+            ("PYTHONSAFEPATH".into(), "1".into()),
         ],
     };
     let launched = if let Some(mut r) = remote {
@@ -499,6 +503,16 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(st) = app.try_state::<term::TermState>() {
                     term::shutdown_all(&st);
+                }
+                // Kernel (and its SSH sessions / tunnels) and language servers must not outlive the app.
+                if let Some(st) = app.try_state::<AppState>() {
+                    let k = tauri::async_runtime::block_on(async { st.kernel.lock().await.take() });
+                    if let Some(k) = k {
+                        let _ = tauri::async_runtime::block_on(tokio::time::timeout(std::time::Duration::from_secs(4), k.shutdown(false)));
+                    }
+                }
+                if let Some(st) = app.try_state::<lsp::LspState>() {
+                    tauri::async_runtime::block_on(lsp::shutdown_all(&st));
                 }
             }
         });

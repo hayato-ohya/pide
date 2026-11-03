@@ -1,6 +1,21 @@
 import { useSyncExternalStore } from "react";
 import type { ConsoleItem, Figure, KernelState, VarInfo } from "./types";
 
+/** Safe localStorage JSON read (corrupt values must never blank the window). */
+export function readJson<T>(key: string, fallback: T): T {
+  try { const v = localStorage.getItem(key); return v == null ? fallback : (JSON.parse(v) as T); } catch { return fallback; }
+}
+
+function loadBreakpoints(): Record<string, any[]> {
+  const raw = readJson<Record<string, any[]>>("pide.breakpoints", {});
+  const out: Record<string, any[]> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!Array.isArray(v) || k.startsWith("untitled:") || k.startsWith("vscode-notebook-cell:untitled") || k.includes("/Untitled-")) continue;
+    out[k] = v.map((x) => (typeof x === "number" ? { line: x } : x));
+  }
+  return out;
+}
+
 export interface State {
   kernel: KernelState;
   kernelDetail: string | null;
@@ -38,7 +53,7 @@ let state: State = {
   kernelDetail: null,
   python: null,
   cwd: null,
-  remote: JSON.parse(localStorage.getItem("pide.remote") ?? "null"),
+  remote: readJson("pide.remote", null),
   connectionFile: null,
   pythons: [],
   variables: [],
@@ -48,18 +63,18 @@ let state: State = {
   plotExpr: null,
   showHidden: false,
   console: [],
-  history: JSON.parse(localStorage.getItem("pide.history") ?? "[]"),
+  history: readJson<string[]>("pide.history", []),
   figures: [],
   activeFigure: null,
   inputRequest: null,
   execCount: 0,
   lsp: {},
-  tools: (() => { try { return { linter: "ruff", formatter: "ruff", linterArgs: "", formatterArgs: "", lineLength: 88, ...JSON.parse(localStorage.getItem("pide.tools") ?? "{}") }; } catch { return { linter: "ruff", formatter: "ruff", linterArgs: "", formatterArgs: "", lineLength: 88 }; } })(),
+  tools: { linter: "ruff", formatter: "ruff", linterArgs: "", formatterArgs: "", lineLength: 88, ...readJson("pide.tools", {}) },
   themePref: "system",
   theme: "light",
   git: { status: null, log: [], error: null },
   bpEdit: null,
-  debug: { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: {}, exceptions: { uncaught: true, raised: false }, exceptionInfo: null, cellFiles: {}, scopes: [], variables: [] },
+  debug: { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: loadBreakpoints(), exceptions: readJson("pide.exceptions", { uncaught: true, raised: false }), exceptionInfo: null, cellFiles: {}, scopes: [], variables: [] },
 };
 
 const listeners = new Set<() => void>();
