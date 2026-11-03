@@ -1,0 +1,7 @@
+target/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+apps/desktop/src-tauri/gen/schemas/
+.DS_Store

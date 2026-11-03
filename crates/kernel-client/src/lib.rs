@@ -1,0 +1,495 @@
+//! Minimal Jupyter kernel client: launches `ipykernel`, speaks the wire
+//! protocol over ZeroMQ (pure Rust `zeromq` crate) and broadcasts every
+//! message it receives.  UI independent.
+
+pub mod message;
+pub mod launch;
+
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use serde_json::{json, Value};
+use tokio::process::{Child, Command};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use zeromq::{DealerSendHalf, DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+
+pub use launch::{ConnectionInfo, LaunchSpec};
+pub use message::{Header, Message, Signer};
+
+/// Which socket a message arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Shell,
+    IoPub,
+    Control,
+    Stdin,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Event {
+    pub channel: Channel,
+    pub msg: Message,
+}
+
+pub struct Kernel {
+    child: Mutex<Option<Child>>,
+    /// Helper processes (SSH tunnels) that must die with the kernel.
+    extra: Mutex<Vec<Child>>,
+    /// True when the kernel process is not local (interrupt via control channel).
+    pub remote: bool,
+    pub info: ConnectionInfo,
+    signer: Signer,
+    session: String,
+    shell_tx: mpsc::Sender<ZmqMessage>,
+    control_tx: mpsc::Sender<ZmqMessage>,
+    stdin_tx: mpsc::Sender<ZmqMessage>,
+    events: broadcast::Sender<Event>,
+    _conn_file: Option<launch::ConnFile>,
+}
+
+impl Kernel {
+    /// Launch a kernel process and connect all channels.
+    pub async fn launch(spec: LaunchSpec) -> Result<Arc<Kernel>> {
+        let info = ConnectionInfo::new_local()?;
+        let conn_file = launch::ConnFile::write(&info)?;
+
+        let mut cmd = Command::new(&spec.python);
+        cmd.args(["-m", "ipykernel_launcher", "-f"])
+            .arg(conn_file.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (k, v) in &spec.env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().context("spawning ipykernel")?;
+        // Forward kernel stderr/stdout to tracing so they are never lost.
+        if let Some(out) = child.stdout.take() {
+            tokio::spawn(pipe_log("kernel.stdout", out));
+        }
+        if let Some(err) = child.stderr.take() {
+            tokio::spawn(pipe_log("kernel.stderr", err));
+        }
+        Self::connect_inner(info, Some(child), vec![], false, Some(conn_file)).await
+    }
+
+    /// Connect to an already running kernel described by a connection file
+    /// (e.g. a kernel started by hand, or in a container with published ports).
+    pub async fn connect(info: ConnectionInfo) -> Result<Arc<Kernel>> {
+        Self::connect_inner(info, None, vec![], true, None).await
+    }
+
+    /// Start a kernel on a remote host over SSH and tunnel its ports.
+    ///
+    /// 1. upload the `pide_kernel` helper (single file) to `~/.pide`
+    /// 2. run a bootstrap that picks free ports, prints the connection info
+    ///    and execs ipykernel (that SSH session stays open for its lifetime)
+    /// 3. open a second SSH session with `-L` forwards for the five ports
+    pub async fn launch_remote(spec: launch::RemoteSpec, helper_src: &str) -> Result<Arc<Kernel>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let ssh = spec.ssh.clone().unwrap_or_else(|| "ssh".into());
+        let base_args = |s: &launch::RemoteSpec| -> Vec<String> {
+            let mut a = vec!["-o".into(), "BatchMode=yes".into(), "-o".into(), "ServerAliveInterval=15".into()];
+            if let Some(p) = s.port { a.push("-p".into()); a.push(p.to_string()); }
+            a.extend(s.ssh_args.clone());
+            a
+        };
+
+        // 1. helper upload
+        let mut up = Command::new(&ssh);
+        up.args(base_args(&spec)).arg(&spec.host)
+            .arg("mkdir -p ~/.pide/pide_kernel && cat > ~/.pide/pide_kernel/__init__.py")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut up_child = up.spawn().context("ssh (upload helper)")?;
+        if let Some(mut stdin) = up_child.stdin.take() {
+            stdin.write_all(helper_src.as_bytes()).await?;
+            drop(stdin);
+        }
+        let st = up_child.wait_with_output().await?;
+        if !st.status.success() {
+            anyhow::bail!("ssh upload failed: {}", String::from_utf8_lossy(&st.stderr).trim());
+        }
+
+        // 2. remote bootstrap: free ports → connection file → exec ipykernel
+        let cwd = spec.cwd.clone().unwrap_or_else(|| "~".into());
+        let bootstrap = r#"import json,os,socket,sys,uuid
+ls=[socket.socket() for _ in range(5)]
+for s in ls: s.bind(("127.0.0.1",0))
+ports=[s.getsockname()[1] for s in ls]
+for s in ls: s.close()
+info={"transport":"tcp","ip":"127.0.0.1","shell_port":ports[0],"iopub_port":ports[1],"stdin_port":ports[2],"control_port":ports[3],"hb_port":ports[4],"key":uuid.uuid4().hex,"signature_scheme":"hmac-sha256","kernel_name":"python3"}
+d=os.path.expanduser("~/.pide/run"); os.makedirs(d,exist_ok=True)
+f=os.path.join(d,"kernel-%d.json"%os.getpid()); json.dump(info,open(f,"w"))
+print("PIDE_CONN:"+json.dumps(info),flush=True)
+os.environ["PYTHONPATH"]=os.path.expanduser("~/.pide")+os.pathsep+os.environ.get("PYTHONPATH","")
+os.environ.setdefault("MPLBACKEND","module://matplotlib_inline.backend_inline")
+os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
+        let b64 = {
+            // avoid any quoting trouble: ship the bootstrap base64-encoded
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let d = bootstrap.as_bytes();
+            let mut o = String::new();
+            for c in d.chunks(3) {
+                let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+                o.push(T[(n >> 18 & 63) as usize] as char);
+                o.push(T[(n >> 12 & 63) as usize] as char);
+                o.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+                o.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+            }
+            o
+        };
+        let remote_cmd = format!("cd {} && {} -c \"import base64;exec(base64.b64decode('{}'))\"", shell_quote(&cwd), shell_quote(&spec.python), b64);
+        let mut run = Command::new(&ssh);
+        run.args(base_args(&spec)).arg(&spec.host).arg(&remote_cmd)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let mut kernel_child = run.spawn().context("ssh (start kernel)")?;
+        let stdout = kernel_child.stdout.take().unwrap();
+        if let Some(err) = kernel_child.stderr.take() {
+            tokio::spawn(pipe_log("remote.stderr", err));
+        }
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let remote_info: ConnectionInfo = loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(60), lines.next_line()).await
+                .context("timeout waiting for remote kernel to start")??
+                .ok_or_else(|| anyhow::anyhow!("remote kernel exited before printing connection info"))?;
+            if let Some(json) = line.strip_prefix("PIDE_CONN:") {
+                break serde_json::from_str(json).context("parsing remote connection info")?;
+            }
+            tracing::info!(target: "kernel", "[remote.stdout] {line}");
+        };
+        tokio::spawn(async move {
+            while let Ok(Some(l)) = lines.next_line().await {
+                tracing::info!(target: "kernel", "[remote.stdout] {l}");
+            }
+        });
+
+        // 3. tunnels: local free ports → remote kernel ports
+        let local = ConnectionInfo::new_local()?;
+        let pairs = [
+            (local.shell_port, remote_info.shell_port),
+            (local.iopub_port, remote_info.iopub_port),
+            (local.stdin_port, remote_info.stdin_port),
+            (local.control_port, remote_info.control_port),
+            (local.hb_port, remote_info.hb_port),
+        ];
+        let mut tun = Command::new(&ssh);
+        tun.args(base_args(&spec)).arg("-N");
+        for (l, r) in pairs {
+            tun.arg("-L").arg(format!("127.0.0.1:{l}:127.0.0.1:{r}"));
+        }
+        tun.arg(&spec.host).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+        let mut tun_child = tun.spawn().context("ssh (tunnel)")?;
+        if let Some(err) = tun_child.stderr.take() {
+            tokio::spawn(pipe_log("tunnel.stderr", err));
+        }
+        // give the tunnel a moment to bind
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let info = ConnectionInfo { key: remote_info.key.clone(), signature_scheme: remote_info.signature_scheme.clone(), ..local };
+        Self::connect_inner(info, Some(kernel_child), vec![tun_child], true, None).await
+    }
+
+    async fn connect_inner(
+        info: ConnectionInfo,
+        child: Option<Child>,
+        extra: Vec<Child>,
+        remote: bool,
+        conn_file: Option<launch::ConnFile>,
+    ) -> Result<Arc<Kernel>> {
+        let signer = Signer::new(&info.key);
+        let session = uuid::Uuid::new_v4().to_string();
+        let (events, _) = broadcast::channel(4096);
+
+        let ep = |port: u16| format!("tcp://{}:{}", info.ip, port);
+
+        // Dealer sockets (shell / control / stdin): a send half fed by an mpsc
+        // and a recv half pumped into the broadcast channel.
+        let shell_tx = dealer(&ep(info.shell_port), Channel::Shell, signer.clone(), events.clone()).await?;
+        let control_tx = dealer(&ep(info.control_port), Channel::Control, signer.clone(), events.clone()).await?;
+        let stdin_tx = dealer(&ep(info.stdin_port), Channel::Stdin, signer.clone(), events.clone()).await?;
+
+        // IOPub subscriber.
+        let mut sub = SubSocket::new();
+        sub.connect(&ep(info.iopub_port)).await.context("connect iopub")?;
+        sub.subscribe("").await?;
+        {
+            let signer = signer.clone();
+            let events = events.clone();
+            tokio::spawn(async move {
+                loop {
+                    match sub.recv().await {
+                        Ok(m) => match Message::decode(m.into_vec(), &signer) {
+                            Ok(msg) => {
+                                let _ = events.send(Event { channel: Channel::IoPub, msg });
+                            }
+                            Err(e) => tracing::warn!("iopub decode: {e:#}"),
+                        },
+                        Err(e) => {
+                            tracing::warn!("iopub closed: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        let kernel = Arc::new(Kernel {
+            child: Mutex::new(child),
+            extra: Mutex::new(extra),
+            remote,
+            info,
+            signer,
+            session,
+            shell_tx,
+            control_tx,
+            stdin_tx,
+            events,
+            _conn_file: conn_file,
+        });
+
+        // Wait until the kernel answers kernel_info (ipykernel needs ~1s to bind).
+        kernel.wait_ready(std::time::Duration::from_secs(60)).await?;
+        Ok(kernel)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    fn build(&self, msg_type: &str, content: Value) -> (String, ZmqMessage) {
+        let header = Header::new(msg_type, &self.session);
+        let id = header.msg_id.clone();
+        let msg = Message {
+            header,
+            parent_header: json!({}),
+            metadata: json!({}),
+            content,
+            buffers: vec![],
+        };
+        (id, msg.encode(&self.signer))
+    }
+
+    /// Send an execute_request. Returns the msg_id so callers can match replies.
+    pub async fn execute(
+        &self,
+        code: &str,
+        silent: bool,
+        store_history: bool,
+        user_expressions: HashMap<String, String>,
+        allow_stdin: bool,
+    ) -> Result<String> {
+        let (id, msg) = self.build(
+            "execute_request",
+            json!({
+                "code": code,
+                "silent": silent,
+                "store_history": store_history,
+                "user_expressions": user_expressions,
+                "allow_stdin": allow_stdin,
+                "stop_on_error": true,
+            }),
+        );
+        self.shell_tx.send(msg).await?;
+        Ok(id)
+    }
+
+    pub async fn complete(&self, code: &str, cursor_pos: usize) -> Result<String> {
+        let (id, msg) = self.build("complete_request", json!({"code": code, "cursor_pos": cursor_pos}));
+        self.shell_tx.send(msg).await?;
+        Ok(id)
+    }
+
+    pub async fn inspect(&self, code: &str, cursor_pos: usize, detail_level: u8) -> Result<String> {
+        let (id, msg) = self.build(
+            "inspect_request",
+            json!({"code": code, "cursor_pos": cursor_pos, "detail_level": detail_level}),
+        );
+        self.shell_tx.send(msg).await?;
+        Ok(id)
+    }
+
+    pub async fn is_complete(&self, code: &str) -> Result<String> {
+        let (id, msg) = self.build("is_complete_request", json!({"code": code}));
+        self.shell_tx.send(msg).await?;
+        Ok(id)
+    }
+
+    /// Send an arbitrary request on the control channel (e.g. debug_request).
+    pub async fn control(&self, msg_type: &str, content: Value) -> Result<String> {
+        let (id, msg) = self.build(msg_type, content);
+        self.control_tx.send(msg).await?;
+        Ok(id)
+    }
+
+    pub async fn kernel_info(&self) -> Result<String> {
+        let (id, msg) = self.build("kernel_info_request", json!({}));
+        self.shell_tx.send(msg).await?;
+        Ok(id)
+    }
+
+    /// Reply to an input_request from the kernel.
+    pub async fn input_reply(&self, parent: &Header, value: &str) -> Result<()> {
+        let header = Header::new("input_reply", &self.session);
+        let msg = Message {
+            header,
+            parent_header: serde_json::to_value(parent)?,
+            metadata: json!({}),
+            content: json!({"value": value}),
+            buffers: vec![],
+        };
+        self.stdin_tx.send(msg.encode(&self.signer)).await?;
+        Ok(())
+    }
+
+    /// Interrupt the running cell (SIGINT, like Jupyter's default interrupt_mode).
+    pub async fn interrupt(&self) -> Result<()> {
+        if self.remote {
+            let (_, msg) = self.build("interrupt_request", json!({}));
+            self.control_tx.send(msg).await?;
+            return Ok(());
+        }
+        let child = self.child.lock().await;
+        if let Some(c) = child.as_ref() {
+            if let Some(pid) = c.id() {
+                #[cfg(unix)]
+                unsafe {
+                    libc_kill(pid as i32, 2);
+                }
+                #[cfg(not(unix))]
+                {
+                    let (_, msg) = self.build("interrupt_request", json!({}));
+                    self.control_tx.send(msg).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(&self, restart: bool) -> Result<()> {
+        let (_, msg) = self.build("shutdown_request", json!({"restart": restart}));
+        let _ = self.control_tx.send(msg).await;
+        // Give it a moment, then make sure the process is gone.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut child = self.child.lock().await;
+        if let Some(mut c) = child.take() {
+            let _ = c.start_kill();
+            let _ = c.wait().await;
+        }
+        for mut c in self.extra.lock().await.drain(..) {
+            let _ = c.start_kill();
+            let _ = c.wait().await;
+        }
+        Ok(())
+    }
+
+    pub async fn is_alive(&self) -> bool {
+        let mut child = self.child.lock().await;
+        match child.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => true,
+        }
+    }
+
+    async fn wait_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let mut rx = self.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!("kernel did not become ready within {timeout:?}");
+            }
+            let id = self.kernel_info().await?;
+            let wait = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) if ev.channel == Channel::Shell && ev.msg.parent_id() == Some(id.as_str()) => {
+                            return true;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await;
+            if let Ok(true) = wait {
+                return Ok(());
+            }
+            if !self.is_alive().await {
+                anyhow::bail!("kernel process exited during startup");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe fn libc_kill(pid: i32, sig: i32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    kill(pid, sig);
+}
+
+async fn dealer(
+    endpoint: &str,
+    channel: Channel,
+    signer: Signer,
+    events: broadcast::Sender<Event>,
+) -> Result<mpsc::Sender<ZmqMessage>> {
+    let mut sock = DealerSocket::new();
+    sock.connect(endpoint).await.with_context(|| format!("connect {channel:?} {endpoint}"))?;
+    let (mut send_half, mut recv_half): (DealerSendHalf, _) = sock.split();
+    let (tx, mut rx) = mpsc::channel::<ZmqMessage>(256);
+    tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if let Err(e) = send_half.send(m).await {
+                tracing::warn!("{channel:?} send: {e}");
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            match recv_half.recv().await {
+                Ok(m) => match Message::decode(m.into_vec(), &signer) {
+                    Ok(msg) => {
+                        let _ = events.send(Event { channel, msg });
+                    }
+                    Err(e) => tracing::warn!("{channel:?} decode: {e:#}"),
+                },
+                Err(e) => {
+                    tracing::warn!("{channel:?} closed: {e}");
+                    break;
+                }
+            }
+        }
+    });
+    Ok(tx)
+}
+
+fn shell_quote(s: &str) -> String {
+    if s == "~" || s.starts_with("~/") {
+        return s.to_string(); // let the remote shell expand it
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+async fn pipe_log<R: tokio::io::AsyncRead + Unpin>(name: &'static str, r: R) {
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(r).lines();
+    while let Ok(Some(l)) = lines.next_line().await {
+        tracing::info!(target: "kernel", "[{name}] {l}");
+    }
+}
+
+#[allow(dead_code)]
+fn _bytes(v: &[u8]) -> Bytes {
+    Bytes::copy_from_slice(v)
+}

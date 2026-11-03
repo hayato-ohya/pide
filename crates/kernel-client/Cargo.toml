@@ -1,0 +1,22 @@
+[package]
+name = "kernel-client"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+zeromq = { version = "0.7", default-features = false, features = ["tokio-runtime", "all-transport"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+rand = "0.8"
+bytes = "1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
