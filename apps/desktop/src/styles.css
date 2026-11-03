@@ -348,3 +348,14 @@ select option { background: var(--panel); color: var(--text); }
 .modal button.danger { color: var(--error); }
 
 .files-remote { font-size: 10.5px; padding: 1px 6px; border-radius: 3px; background: var(--accent); color: var(--accent-text); white-space: nowrap; }
+
+/* terminal */
+.terminal { display: flex; flex-direction: column; height: 100%; background: var(--panel); overflow: hidden; }
+.term-tabs { display: flex; align-items: center; gap: 2px; padding: 2px 4px; border-bottom: 1px solid var(--border-soft); background: var(--panel-alt); }
+.term-tab { display: flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 12px; }
+.term-tab.on { background: var(--selection); }
+.term-tab.exited span { text-decoration: line-through; color: var(--muted); }
+.term-tab button, .term-add { border: none; background: none; cursor: pointer; color: var(--muted); font-size: 12px; }
+.term-body { flex: 1; min-height: 0; padding: 4px; overflow: hidden; position: relative; }
+.term-host { height: 100%; overflow: hidden; }
+.term-host .xterm { height: 100%; }

@@ -17,7 +17,8 @@ export function buildDefaultLayout(a: DockviewApi) {
   a.clear();
   const editor = a.addPanel({ id: "editor:untitled", component: "editor", title: "untitled.py", params: { path: null } });
   a.addPanel({ id: "figures", component: "figures", title: "Figures", position: { referencePanel: editor, direction: "within" }, inactive: true });
-  a.addPanel({ id: "console", component: "console", title: "Command Window", position: { referencePanel: editor, direction: "below" }, initialHeight: 320 });
+  const console_ = a.addPanel({ id: "console", component: "console", title: "Command Window", position: { referencePanel: editor, direction: "below" }, initialHeight: 320 });
+  a.addPanel({ id: "terminal", component: "terminal", title: "Terminal", position: { referencePanel: console_, direction: "within" }, inactive: true });
   const files = a.addPanel({ id: "files", component: "files", title: "Current Folder", position: { referencePanel: editor, direction: "left" }, initialWidth: 280 });
   a.addPanel({ id: "git", component: "git", title: "Git", position: { referencePanel: files, direction: "within" }, inactive: true });
   const ws = a.addPanel({ id: "workspace", component: "workspace", title: "Workspace", position: { referencePanel: editor, direction: "right" }, initialWidth: 460 });

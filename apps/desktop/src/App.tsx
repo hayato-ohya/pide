@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { DockviewReact, type DockviewReadyEvent, type DockviewApi, themeLight, themeDark } from "dockview";
 import { applyTheme } from "./theme";
 import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import Console from "./panels/Console";
 import Workspace from "./panels/Workspace";
 import VariableViewer from "./panels/VariableViewer";
@@ -15,6 +16,7 @@ import RemoteDialog from "./panels/RemoteDialog";
 import NotebookPanel from "./panels/Notebook";
 import BreakpointDialog from "./panels/BreakpointDialog";
 import ToolsDialog from "./panels/ToolsDialog";
+import TerminalPanel from "./panels/Terminal";
 import { setExceptionFilters } from "./debug";
 import { cont, stepIn, stepOut, stepOver, stopDebugger } from "./debug";
 import EditorPanel, { activeEditorId, editors } from "./panels/Editor";
@@ -34,11 +36,12 @@ const components = {
   diff: DiffView,
   debugger: Debugger,
   notebook: NotebookPanel,
+  terminal: TerminalPanel,
   editor: EditorPanel,
 };
 
 // Dev handle for scripted UI checks (PIDE_DEV_SCRIPT).
-(window as any).pide = { saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
+(window as any).pide = { ptyWrite: (id: number, data: string) => invoke("pty_write", { id, data }), saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
 
 const STATE_LABEL: Record<string, string> = { stopped: "Kernel stopped", starting: "Starting kernel…", idle: "Ready", busy: "Busy", dead: "Kernel died" };
 
@@ -92,6 +95,10 @@ export default function App() {
         if (ok && !e.api.getPanel("debugger")) {
           const hist = e.api.getPanel("history");
           e.api.addPanel({ id: "debugger", component: "debugger", title: "Debugger", position: hist ? { referencePanel: hist, direction: "within" } : undefined, inactive: true });
+        }
+        if (ok && !e.api.getPanel("terminal")) {
+          const con = e.api.getPanel("console");
+          e.api.addPanel({ id: "terminal", component: "terminal", title: "Terminal", position: con ? { referencePanel: con, direction: "within" } : undefined, inactive: true });
         }
         if (ok && !e.api.getPanel("git")) {
           const files = e.api.getPanel("files");
@@ -187,6 +194,7 @@ export default function App() {
                 <button onClick={() => showPanel("history", "history", "Command History")}>Command History</button>
                 <button onClick={() => showPanel("git", "git", "Git")}>Git</button>
                 <button onClick={() => showPanel("debugger", "debugger", "Debugger")}>Debugger</button>
+                <button onClick={() => showPanel("terminal", "terminal", "Terminal")}>Terminal</button>
                 <button onClick={() => showPanel("figures", "figures", "Figures")}>Figures</button>
               </div><div className="ts-label">PANELS</div></div>
               <div className="ts-group"><div className="ts-row"><button onClick={() => apiRef.current && buildDefaultLayout(apiRef.current)}>Default Layout</button></div><div className="ts-label">LAYOUT</div></div>

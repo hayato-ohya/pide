@@ -95,6 +95,13 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 - Docker 専用の起動は未実装(SSH でコンテナに入るか、接続ファイル方式を使う)
 - リモートファイルの閲覧: リモートカーネル使用中は Current Folder、エディタ、ノートブックがカーネル側のファイルを扱う(カーネル内の `pide_kernel.fs_*` 経由、追加の SSH セッション不要)。接続後は作業フォルダがリモートの cwd になり、Current Folder にホスト名バッジが付く。「名前を付けて保存」はパス入力。Git パネルはリモート中は無効。LSP はローカルの環境で解析するため、リモートにしかないパッケージは未解決と出ることがある
 
+## ターミナル
+
+- Command Window の隣の「Terminal」タブ(VIEW タブや Ctrl+` でも開く)。＋ で複数タブ
+- Rust 側は portable-pty で PTY を開き、ログインシェル(`$SHELL -l`、conda / pyenv の初期化が走る)を作業フォルダで起動。表示は xterm.js で、パネルのサイズに追従し、テーマにも連動
+- リモートカーネル使用中に開くと、そのホストへ `ssh -t` で入り、設定したリモートフォルダに移動する
+- 環境変数 `PIDE=1` と `PIDE_PYTHON`(選択中のインタープリタ)を渡す
+
 ## ノートブック(.ipynb)
 
 - Current Folder や Open… から .ipynb を開くとノートブックパネルになる。HOME の「New Notebook」で新規作成

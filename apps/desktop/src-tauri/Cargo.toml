@@ -24,4 +24,5 @@ anyhow.workspace = true
 tracing.workspace = true
 base64 = "0.22"
 git2 = { version = "0.20", default-features = false }
+portable-pty = "0.9"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -3,6 +3,7 @@
 
 mod git;
 mod lsp;
+mod term;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -427,6 +428,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
         .manage(lsp::LspState::default())
+        .manage(term::TermState::default())
         .invoke_handler(tauri::generate_handler![
             start_kernel,
             execute,
@@ -458,6 +460,11 @@ pub fn run() {
             lsp::lsp_stop,
             lsp::lsp_check,
             lsp::run_tool,
+            term::pty_spawn,
+            term::pty_write,
+            term::pty_resize,
+            term::pty_kill,
+            term::pty_reap,
             git::git_status,
             git::git_log,
             git::git_diff,
@@ -476,6 +483,13 @@ pub fn run() {
             git::git_remotes,
             git::git_add_remote,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(st) = app.try_state::<term::TermState>() {
+                    term::shutdown_all(&st);
+                }
+            }
+        });
 }
