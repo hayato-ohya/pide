@@ -53,7 +53,9 @@ export default function Console() {
   const history = useStore((s) => s.history);
   const inputReq = useStore((s) => s.inputRequest);
   const stopped = useStore((s) => s.debug.stopped);
-  const [code, setCode] = useState("");
+  const [code, setCodeState] = useState("");
+  const codeRef = useRef("");
+  const setCode = (v: string) => { codeRef.current = v; setCodeState(v); };
   const [hIdx, setHIdx] = useState<number | null>(null);
   const [comp, setComp] = useState<{ matches: string[]; start: number; end: number; sel: number } | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -78,7 +80,7 @@ export default function Console() {
   };
 
   const submit = async () => {
-    const c = code;
+    const c = codeRef.current;
     if (inputReq) {
       setCode("");
       await replyInput(c);
@@ -126,7 +128,7 @@ export default function Console() {
       if (!multiline && !inputReq) {
         e.preventDefault();
         const st = await isComplete(code);
-        if (st === "incomplete") setCode(code + "\n");
+        if (st === "incomplete") setCode(codeRef.current + "\n");
         else await submit();
         return;
       }

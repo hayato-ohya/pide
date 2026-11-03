@@ -38,7 +38,7 @@ class LspClient {
     // in that case run without a workspace folder (open files still work).
     const home = await invoke<string>("home_dir");
     const useRoot = cwd !== "/" && cwd.replace(/\/$/, "") !== home.replace(/\/$/, "") && !get().remote && !get().connectionFile;
-    const rootUri = useRoot ? "file://" + cwd : null;
+    const rootUri = useRoot ? monacoRef!.Uri.file(cwd).toString() : null;
     this.initialized = this.request("initialize", {
       processId: null,
       rootUri,
