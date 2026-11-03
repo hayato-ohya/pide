@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { awaitReply } from "./kernel";
 import { get } from "./store";
+import { promptAsync } from "./dialogs";
 
 export interface Entry { name: string; path: string; is_dir: boolean; size: number; modified: number | null }
 
@@ -62,6 +63,5 @@ export async function savePath(defaultName: string, filters: { name: string; ext
     return save({ defaultPath: defaultName, filters });
   }
   const base = get().cwd ?? "~";
-  const p = prompt(`Save on ${get().remote?.host ?? "remote"} as:`, `${base.replace(/\/$/, "")}/${defaultName}`);
-  return p && p.trim() ? p.trim() : null;
+  return promptAsync(`Save on ${get().remote?.host ?? "remote"} as:`, `${base.replace(/\/$/, "")}/${defaultName}`);
 }

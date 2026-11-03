@@ -45,6 +45,7 @@ export interface State {
   debug: import("./debug").DebugState;
   /** Breakpoint being edited in the dialog. */
   bpEdit: { uri: string; line: number } | null;
+  promptReq: { message: string; value: string; placeholder: string; resolve: (v: string | null) => void } | null;
   git: { status: import("./git").GitStatus | null; log: import("./git").Commit[]; error: string | null };
 }
 
@@ -74,6 +75,7 @@ let state: State = {
   theme: "light",
   git: { status: null, log: [], error: null },
   bpEdit: null,
+  promptReq: null,
   debug: { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: loadBreakpoints(), exceptions: readJson("pide.exceptions", { uncaught: true, raised: false }), exceptionInfo: null, cellFiles: {}, scopes: [], variables: [] },
 };
 
@@ -99,26 +101,41 @@ export function useStore<T>(selector: (s: State) => T): T {
   );
 }
 
+/** Panels with unsaved changes: panel id → title. Kept outside dockview params (those do not round-trip). */
+export const dirtyPanels = new Map<string, string>();
+export function setDirtyPanel(id: string, title: string, dirty: boolean) {
+  if (dirty) dirtyPanels.set(id, title); else dirtyPanels.delete(id);
+}
+
 let nextId = 1;
 export function uid() {
   return nextId++;
 }
 
 const MAX_CONSOLE = 5000;
+/** A single stream item never grows past this; a new item is started instead (keeps re-render cost bounded). */
+const MAX_STREAM_ITEM = 64 * 1024;
+/** Total retained stream text; oldest items are dropped beyond it. */
+const MAX_CONSOLE_BYTES = 8 * 1024 * 1024;
 type NewItem = ConsoleItem extends infer T ? (T extends ConsoleItem ? Omit<T, "id"> : never) : never;
 export function pushConsole(item: NewItem) {
   set((s) => {
     const list = s.console;
-    // Merge consecutive stream chunks of the same stream to keep the list small.
-    if (item.kind === "stream") {
-      const last = list[list.length - 1];
-      if (last && last.kind === "stream" && last.name === item.name) {
-        const merged = { ...last, text: last.text + item.text };
-        return { console: [...list.slice(0, -1), merged] };
-      }
+    let next: ConsoleItem[];
+    const last = list[list.length - 1];
+    if (item.kind === "stream" && last && last.kind === "stream" && last.name === item.name && last.text.length + item.text.length <= MAX_STREAM_ITEM) {
+      next = [...list.slice(0, -1), { ...last, text: last.text + item.text }];
+    } else {
+      next = [...list, { ...item, id: uid() } as ConsoleItem];
     }
-    const next = [...list, { ...item, id: uid() } as ConsoleItem];
-    return { console: next.length > MAX_CONSOLE ? next.slice(next.length - MAX_CONSOLE) : next };
+    if (next.length > MAX_CONSOLE) next = next.slice(next.length - MAX_CONSOLE);
+    let bytes = 0;
+    for (let i = next.length - 1; i >= 0; i--) {
+      const it = next[i];
+      bytes += it.kind === "stream" ? it.text.length : it.kind === "error" ? it.traceback.join("").length : 200;
+      if (bytes > MAX_CONSOLE_BYTES) { next = next.slice(i + 1); break; }
+    }
+    return { console: next };
   });
 }
 

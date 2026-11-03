@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { AnsiUp } from "ansi_up";
 import { complete, execute, interrupt, isComplete, replyInput } from "../kernel";
 import { useStore } from "../store";
@@ -17,7 +17,7 @@ export function Output({ data }: { data: Mime }) {
   return null;
 }
 
-function Item({ it }: { it: ConsoleItem }) {
+const Item = memo(function Item({ it }: { it: ConsoleItem }) {
   switch (it.kind) {
     case "input":
       return (
@@ -45,7 +45,7 @@ function Item({ it }: { it: ConsoleItem }) {
     case "info":
       return <div className="c-info">{it.text}</div>;
   }
-}
+});
 
 export default function Console() {
   const items = useStore((s) => s.console);
@@ -180,6 +180,10 @@ export default function Console() {
       )}
       <div className={`console-input ${kernel}`}>
         <span className="prompt">{inputReq ? "?" : stopped ? "K>>" : kernel === "busy" ? "…" : ">>"}</span>
+        {inputReq?.password ? (
+          <input type="password" className="console-password" value={code} autoFocus onChange={(e) => setCode(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }} />
+        ) : (
         <textarea
           ref={taRef}
           value={code}
@@ -190,6 +194,7 @@ export default function Console() {
           spellCheck={false}
           autoFocus
         />
+        )}
       </div>
     </div>
   );

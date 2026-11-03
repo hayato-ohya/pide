@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { pushConsole, useStore } from "../store";
 import { gitCall, layoutGraph, refreshGit, type Commit, type FileDiff, type StatusEntry } from "../git";
 import { openDiff } from "../layout";
+import { confirmAsync, promptAsync } from "../dialogs";
 
 const COLORS = ["#0076a8", "#d9534f", "#5cb85c", "#f0ad4e", "#8e44ad", "#17a2b8", "#e83e8c", "#6c757d"];
 
@@ -63,7 +64,7 @@ export default function Git() {
     }
   };
   const addRemote = async () => {
-    const url = prompt("Remote URL (origin)", "git@github.com:user/repo.git");
+    const url = await promptAsync("Remote URL (origin)", "", "git@github.com:user/repo.git");
     if (!url) return;
     await gitCall("git_add_remote", { name: "origin", url });
     setRemotes(await invoke<any[]>("git_remotes", { cwd }).catch(() => []));
@@ -112,7 +113,7 @@ export default function Git() {
     <div className="git">
       <div className="panel-toolbar git-head">
         <select className="branch" value={st?.branch ?? ""} onFocus={loadBranches} onChange={async (e) => {
-          if (e.target.value === "__new__") { const n = prompt("New branch name"); if (n) await gitCall("git_create_branch", { name: n }); }
+          if (e.target.value === "__new__") { const n = await promptAsync("New branch name"); if (n) await gitCall("git_create_branch", { name: n }); }
           else await gitCall("git_checkout", { name: e.target.value });
         }} title={st?.upstream ? `upstream ${st.upstream}` : "no upstream"}>
           <option value={st?.branch ?? ""}>{st?.detached ? `(detached ${st.head?.slice(0, 7)})` : st?.branch ?? "(no commits)"}</option>
@@ -130,7 +131,7 @@ export default function Git() {
                 onContextMenu={(e) => { e.preventDefault(); net("pull --rebase", "git_pull", { rebase: true }); }}>{busy?.startsWith("pull") ? "…" : `⇩ Pull${st?.behind ? ` ${st.behind}` : ""}`}</button>
               <button disabled={!!busy} onClick={() => net(st?.upstream ? "push" : "push -u", "git_push", { setUpstream: st?.upstream ? null : st?.branch, force: false })}
                 title={st?.upstream ? "git push (right-click: --force-with-lease)" : `Publish ${st?.branch} to origin`}
-                onContextMenu={(e) => { e.preventDefault(); if (confirm("Force push (--force-with-lease)?")) net("push --force-with-lease", "git_push", { setUpstream: null, force: true }); }}>
+                onContextMenu={async (e) => { e.preventDefault(); if (await confirmAsync("Force push (--force-with-lease)?")) net("push --force-with-lease", "git_push", { setUpstream: null, force: true }); }}>
                 {busy?.startsWith("push") ? "…" : st?.upstream ? `⇧ Push${st?.ahead ? ` ${st.ahead}` : ""}` : "⇧ Publish"}
               </button>
             </>
@@ -156,7 +157,7 @@ export default function Git() {
           <div className="git-lists">
             <Section title="Conflicts" entries={conflicted} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }]} />
             <Section title="Staged" entries={staged} onOpen={openEntry} actions={[{ label: "unstage", fn: (p) => gitCall("git_unstage", { paths: p.map(abs) }) }]} />
-            <Section title="Changes" entries={unstaged} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }, { label: "discard", danger: true, fn: (p) => { if (confirm(`Discard changes in ${p.length} file(s)?`)) gitCall("git_discard", { paths: p.map(abs) }); } }]} />
+            <Section title="Changes" entries={unstaged} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }, { label: "discard", danger: true, fn: async (p) => { if (await confirmAsync(`Discard changes in ${p.length} file(s)? This cannot be undone.`)) gitCall("git_discard", { paths: p.map(abs) }); } }]} />
             <Section title="Untracked" entries={untracked} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }]} />
             {st && !st.entries.length && <div className="muted center">Working tree clean</div>}
           </div>
@@ -190,7 +191,7 @@ export default function Git() {
             <div className="git-commit-files">
               <div className="git-section-h"><span>{files.length} file{files.length !== 1 ? "s" : ""} changed in {sel.slice(0, 7)}</span></div>
               {files.map((f) => (
-                <div key={f.path} className="git-file" onDoubleClick={() => openDiff(f, sel.slice(0, 7))}>
+                <div key={f.path} className="git-file" onDoubleClick={async () => { const full = await invoke<FileDiff | null>("git_commit_file", { cwd, id: sel, path: f.path }).catch(() => null); openDiff(full ?? f, sel.slice(0, 7)); }}>
                   <span className={`git-code c-${f.code}`}>{f.code}</span>
                   <span className="git-path" title={f.path}>{f.path}</span>
                   <span className="muted">+{f.additions} −{f.deletions}</span>

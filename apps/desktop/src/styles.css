@@ -359,3 +359,5 @@ select option { background: var(--panel); color: var(--text); }
 .term-body { flex: 1; min-height: 0; padding: 4px; overflow: hidden; position: relative; }
 .term-host { height: 100%; overflow: hidden; }
 .term-host .xterm { height: 100%; }
+
+.console-password { flex: 1; border: none; outline: none; font: inherit; background: transparent; }

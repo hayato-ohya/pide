@@ -37,7 +37,7 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| if cfg!(windows) { "powershell.exe".into() } else { "/bin/sh".into() })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pty_spawn(
     app: AppHandle,
     state: tauri::State<'_, TermState>,
@@ -103,7 +103,7 @@ pub fn pty_spawn(
     Ok(id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pty_write(state: tauri::State<'_, TermState>, id: u32, data: String) -> Result<(), String> {
     let mut terms = state.terms.lock().unwrap();
     let t = terms.get_mut(&id).ok_or("no such terminal")?;

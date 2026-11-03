@@ -5,7 +5,7 @@ import type { IDockviewPanelProps } from "dockview";
 import { readText, savePath, writeText } from "../fs";
 import { marked } from "marked";
 import { execute, interrupt, type OutputItem } from "../kernel";
-import { pushConsole, set as setStore, useStore } from "../store";
+import { pushConsole, set as setStore, setDirtyPanel, useStore } from "../store";
 import { Output, ansi } from "./Console";
 import { safeHtml } from "../sanitize";
 import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, syncNotebookStructure } from "../lsp";
@@ -198,6 +198,9 @@ function MarkdownEditor({ value, theme, onChange, onDone, onMount, render }: { v
 
 export default function NotebookPanel(props: IDockviewPanelProps<{ path: string | null }>) {
   const [path, setPath] = useState<string | null>(props.params.path);
+  const pathRef = useRef<string | null>(props.params.path);
+  pathRef.current = path;
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [nb, setNb] = useState<Notebook | null>(null);
   const [dirty, setDirty] = useState(false);
   const [sel, setSel] = useState<string | null>(null);
@@ -231,7 +234,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   }, []);
 
   useEffect(() => {
-    if (path) readText(path).then((t) => setNb(parseNotebook(t))).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setNb(parseNotebook("")); });
+    if (path) readText(path).then((t) => { try { setNb(parseNotebook(t)); } catch (e) { setLoadError(`not a valid notebook: ${e}`); } }).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setLoadError(String(e)); });
     else setNb(parseNotebook(""));
   }, []);
   useEffect(() => { props.api.setTitle((path ? path.split("/").pop()! : "untitled.ipynb") + (dirty ? " *" : "")); }, [path, dirty]);
@@ -245,14 +248,14 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
 
   const doSave = async () => {
     const cur = nbRef.current;
-    if (!cur) return;
-    let p = path;
+    if (!cur) { pushConsole({ kind: "info", text: "Notebook did not load; refusing to overwrite it." }); return; }
+    let p = pathRef.current;
     if (!p) {
       p = await savePath("untitled.ipynb", [{ name: "Notebook", extensions: ["ipynb"] }]);
       if (!p) return;
       setPath(p);
     }
-    await writeText(p, serializeNotebook(cur));
+    try { await writeText(p, serializeNotebook(cur)); } catch (e) { pushConsole({ kind: "info", text: `Save failed: ${e}` }); return; }
     setDirty(false);
     pushConsole({ kind: "info", text: `Saved ${p}` });
   };
@@ -361,6 +364,9 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const md = useMemo(() => (src: string) => safeHtml(marked.parse(src, { async: false }) as string), []);
   const monacoTheme = theme === "dark" ? "vs-dark" : "vs";
 
+  useEffect(() => { setDirtyPanel(props.api.id, path ? path.split("/").pop()! : "untitled.ipynb", dirty); }, [dirty, path]);
+  useEffect(() => () => setDirtyPanel(props.api.id, "", false), []);
+  if (loadError) return <div className="vv-error">Could not open {path}: {loadError}</div>;
   if (!nb) return <div className="vv-loading">Loading…</div>;
   return (
     <div className="notebook" onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); doSave(); } }}>

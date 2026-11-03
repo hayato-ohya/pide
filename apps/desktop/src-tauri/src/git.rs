@@ -12,7 +12,14 @@ fn open(cwd: &str) -> Result<Repository, String> {
 
 fn rel(repo: &Repository, path: &str) -> PathBuf {
     let root = repo.workdir().unwrap_or_else(|| repo.path());
-    Path::new(path).strip_prefix(root).map(|p| p.to_path_buf()).unwrap_or_else(|_| PathBuf::from(path))
+    let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let p = Path::new(path);
+    let p_c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    p_c.strip_prefix(&root_c).or_else(|_| p.strip_prefix(root)).map(|x| x.to_path_buf()).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+fn workdir(repo: &Repository) -> Result<PathBuf, String> {
+    repo.workdir().map(|p| p.to_path_buf()).ok_or_else(|| "bare repository has no working tree".to_string())
 }
 
 #[derive(Serialize)]
@@ -36,7 +43,7 @@ pub struct GitStatus {
     entries: Vec<StatusEntry>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_status(cwd: String) -> Result<GitStatus, String> {
     let repo = open(&cwd)?;
     let root = repo.workdir().map(|p| p.to_string_lossy().trim_end_matches('/').to_string()).unwrap_or_default();
@@ -98,7 +105,7 @@ pub struct Commit {
     refs: Vec<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_log(cwd: String, limit: usize, all: bool) -> Result<Vec<Commit>, String> {
     let repo = open(&cwd)?;
     let mut walk = repo.revwalk().map_err(|e| e.message().to_string())?;
@@ -161,7 +168,9 @@ fn blob_text(repo: &Repository, oid: Oid) -> Option<String> {
     Some(String::from_utf8_lossy(b.content()).to_string())
 }
 
-fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool) -> Vec<FileDiff> {
+const MAX_DIFF_TEXT: u64 = 4 * 1024 * 1024;
+
+fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool, with_content: bool) -> Vec<FileDiff> {
     let mut out = vec![];
     let root = repo.workdir().map(|p| p.to_path_buf());
     for d in diff.deltas() {
@@ -173,11 +182,23 @@ fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool) -> Vec<FileD
             git2::Delta::Renamed => "R",
             _ => "M",
         };
-        let binary = d.flags().is_binary();
-        let old = if d.old_file().id().is_zero() { None } else { blob_text(repo, d.old_file().id()) };
-        let new = if workdir_new {
-            root.as_ref().and_then(|r| std::fs::read(r.join(&newp)).ok()).and_then(|b| if b.contains(&0) { None } else { Some(String::from_utf8_lossy(&b).to_string()) })
-        } else if d.new_file().id().is_zero() { None } else { blob_text(repo, d.new_file().id()) };
+        let mut binary = d.flags().is_binary();
+        let too_big = d.old_file().size() > MAX_DIFF_TEXT || d.new_file().size() > MAX_DIFF_TEXT;
+        if too_big { binary = true; }
+        let (old, new) = if !with_content || binary {
+            (None, None)
+        } else {
+            let old = if d.old_file().id().is_zero() { None } else { blob_text(repo, d.old_file().id()) };
+            let new = if workdir_new {
+                root.as_ref().and_then(|r| {
+                    let p = r.join(&newp);
+                    let md = std::fs::metadata(&p).ok()?;
+                    if md.len() > MAX_DIFF_TEXT { return None; }
+                    std::fs::read(p).ok()
+                }).and_then(|b| if b.contains(&0) { None } else { Some(String::from_utf8_lossy(&b).to_string()) })
+            } else if d.new_file().id().is_zero() { None } else { blob_text(repo, d.new_file().id()) };
+            (old, new)
+        };
         out.push(FileDiff { path: newp, old_path: oldp.filter(|_| code == "R"), code: code.into(), old, new, binary, additions: 0, deletions: 0 });
     }
     for (i, fd) in out.iter_mut().enumerate() {
@@ -189,11 +210,14 @@ fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool) -> Vec<FileD
 }
 
 /// Diff of the working tree vs index (unstaged), or index vs HEAD (staged).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_diff(cwd: String, staged: bool, path: Option<String>) -> Result<Vec<FileDiff>, String> {
     let repo = open(&cwd)?;
     let mut opts = DiffOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true).show_untracked_content(true);
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    // Untracked content (and file text in general) is only read for a single requested path.
+    let with_content = path.is_some();
+    opts.show_untracked_content(with_content);
     if let Some(p) = &path { opts.pathspec(rel(&repo, p)); }
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let diff = if staged {
@@ -202,11 +226,11 @@ pub fn git_diff(cwd: String, staged: bool, path: Option<String>) -> Result<Vec<F
         repo.diff_index_to_workdir(None, Some(&mut opts))
     }
     .map_err(|e| e.message().to_string())?;
-    Ok(collect(&repo, &diff, !staged))
+    Ok(collect(&repo, &diff, !staged, with_content))
 }
 
 /// Files changed by a commit (vs its first parent), with full old/new text.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_commit_diff(cwd: String, id: String) -> Result<Vec<FileDiff>, String> {
     let repo = open(&cwd)?;
     let oid = Oid::from_str(&id).map_err(|e| e.message().to_string())?;
@@ -215,22 +239,36 @@ pub fn git_commit_diff(cwd: String, id: String) -> Result<Vec<FileDiff>, String>
     let parent = c.parent(0).ok().and_then(|p| p.tree().ok());
     let mut opts = DiffOptions::new();
     let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
-    Ok(collect(&repo, &diff, false))
+    Ok(collect(&repo, &diff, false, false))
 }
 
-#[tauri::command]
+/// Full text of one file in a commit diff (vs first parent).
+#[tauri::command(async)]
+pub fn git_commit_file(cwd: String, id: String, path: String) -> Result<Option<FileDiff>, String> {
+    let repo = open(&cwd)?;
+    let oid = Oid::from_str(&id).map_err(|e| e.message().to_string())?;
+    let c = repo.find_commit(oid).map_err(|e| e.message().to_string())?;
+    let tree = c.tree().map_err(|e| e.message().to_string())?;
+    let parent = c.parent(0).ok().and_then(|p| p.tree().ok());
+    let mut opts = DiffOptions::new();
+    opts.pathspec(&path);
+    let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
+    Ok(collect(&repo, &diff, false, true).into_iter().find(|f| f.path == path))
+}
+
+#[tauri::command(async)]
 pub fn git_stage(cwd: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open(&cwd)?;
     let mut idx = repo.index().map_err(|e| e.message().to_string())?;
     for p in paths {
         let r = rel(&repo, &p);
-        let abs = repo.workdir().unwrap().join(&r);
+        let abs = workdir(&repo)?.join(&r);
         if abs.exists() { idx.add_path(&r).map_err(|e| e.message().to_string())?; } else { idx.remove_path(&r).map_err(|e| e.message().to_string())?; }
     }
     idx.write().map_err(|e| e.message().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_unstage(cwd: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open(&cwd)?;
     let head = repo.head().ok().and_then(|h| h.peel(git2::ObjectType::Commit).ok());
@@ -246,7 +284,7 @@ pub fn git_unstage(cwd: String, paths: Vec<String>) -> Result<(), String> {
 }
 
 /// Discard working-tree changes of a file (checkout from index).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_discard(cwd: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open(&cwd)?;
     let mut cb = git2::build::CheckoutBuilder::new();
@@ -255,7 +293,7 @@ pub fn git_discard(cwd: String, paths: Vec<String>) -> Result<(), String> {
     repo.checkout_index(None, Some(&mut cb)).map_err(|e| e.message().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_commit(cwd: String, message: String, amend: bool) -> Result<String, String> {
     let repo = open(&cwd)?;
     let sig = repo.signature().map_err(|e| format!("git identity not configured: {}", e.message()))?;
@@ -276,7 +314,7 @@ pub fn git_commit(cwd: String, message: String, amend: bool) -> Result<String, S
 #[derive(Serialize)]
 pub struct Branch { name: String, remote: bool, current: bool }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_branches(cwd: String) -> Result<Vec<Branch>, String> {
     let repo = open(&cwd)?;
     let mut out = vec![];
@@ -289,7 +327,7 @@ pub fn git_branches(cwd: String) -> Result<Vec<Branch>, String> {
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_checkout(cwd: String, name: String) -> Result<(), String> {
     let repo = open(&cwd)?;
     let (obj, reference) = repo.revparse_ext(&name).map_err(|e| e.message().to_string())?;
@@ -300,7 +338,7 @@ pub fn git_checkout(cwd: String, name: String) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_create_branch(cwd: String, name: String) -> Result<(), String> {
     let repo = open(&cwd)?;
     let head = repo.head().and_then(|h| h.peel_to_commit()).map_err(|e| e.message().to_string())?;
@@ -308,7 +346,7 @@ pub fn git_create_branch(cwd: String, name: String) -> Result<(), String> {
     git_checkout(cwd, name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_init(cwd: String) -> Result<(), String> {
     Repository::init(&cwd).map(|_| ()).map_err(|e| e.message().to_string())
 }
@@ -332,7 +370,7 @@ async fn run_git(cwd: &str, args: &[&str]) -> Result<CmdResult, String> {
             .args(args)
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0") // never hang on a password prompt
-            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+            .env("GIT_SSH_COMMAND", std::env::var("GIT_SSH_COMMAND").map(|v| format!("{v} -o BatchMode=yes")).unwrap_or_else(|_| "ssh -o BatchMode=yes".into()))
             .output(),
     )
     .await
@@ -365,6 +403,9 @@ pub async fn git_push(cwd: String, set_upstream: Option<String>, force: bool) ->
     }
     let branch;
     if let Some(b) = set_upstream {
+        if b.starts_with('-') || b.contains(char::is_whitespace) || b.is_empty() {
+            return Err(format!("invalid branch name {b:?}"));
+        }
         branch = b;
         args.extend(["-u", "origin", branch.as_str()]);
     }
@@ -374,14 +415,14 @@ pub async fn git_push(cwd: String, set_upstream: Option<String>, force: bool) ->
 #[derive(Serialize)]
 pub struct Remote { name: String, url: String }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_remotes(cwd: String) -> Result<Vec<Remote>, String> {
     let repo = open(&cwd)?;
     let names = repo.remotes().map_err(|e| e.message().to_string())?;
     Ok(names.iter().flatten().filter_map(|n| repo.find_remote(n).ok().map(|r| Remote { name: n.to_string(), url: r.url().unwrap_or("").to_string() })).collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_add_remote(cwd: String, name: String, url: String) -> Result<(), String> {
     let repo = open(&cwd)?;
     repo.remote(&name, &url).map(|_| ()).map_err(|e| e.message().to_string())

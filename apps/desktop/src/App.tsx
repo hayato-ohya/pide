@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { DockviewReact, type DockviewReadyEvent, type DockviewApi, themeLight, themeDark } from "dockview";
+import { DockviewReact, DockviewDefaultTab, type DockviewReadyEvent, type DockviewApi, type IDockviewPanelHeaderProps, themeLight, themeDark } from "dockview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { applyTheme } from "./theme";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -16,13 +17,15 @@ import RemoteDialog from "./panels/RemoteDialog";
 import NotebookPanel from "./panels/Notebook";
 import BreakpointDialog from "./panels/BreakpointDialog";
 import ToolsDialog from "./panels/ToolsDialog";
+import PromptDialog from "./panels/PromptDialog";
+import { confirmAsync } from "./dialogs";
 import TerminalPanel from "./panels/Terminal";
 import { setExceptionFilters } from "./debug";
 import { cont, stepIn, stepOut, stepOver, stopDebugger } from "./debug";
 import EditorPanel, { activeEditorId, editors } from "./panels/Editor";
 import { complete, initKernelBridge, interrupt, restartKernel, setPython, startKernel } from "./kernel";
 import { buildDefaultLayout, dockApi, LAYOUT_KEY, openFile, openNotebook, openVariable, plotVariable, setDockApi, type PlotKind } from "./layout";
-import { get, pushConsole, readJson, set, useStore } from "./store";
+import { dirtyPanels, get, pushConsole, readJson, set, useStore } from "./store";
 
 const components = {
   console: Console,
@@ -41,7 +44,16 @@ const components = {
 };
 
 // Dev handle for scripted UI checks (PIDE_DEV_SCRIPT).
-if (import.meta.env.DEV) (window as any).pide = { ptyWrite: (id: number, data: string) => invoke("pty_write", { id, data }), saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
+if (import.meta.env.DEV) (window as any).pide = { closeWindow: () => getCurrentWindow().close(), ptyWrite: (id: number, data: string) => invoke("pty_write", { id, data }), saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
+
+/** Tab that asks before closing an unsaved editor / notebook. */
+function GuardedTab(props: IDockviewPanelHeaderProps) {
+  return <DockviewDefaultTab {...props} closeActionOverride={async () => {
+    const title = dirtyPanels.get(props.api.id);
+    if (title && !(await confirmAsync(`${title} has unsaved changes. Close anyway?`))) return;
+    props.api.close();
+  }} />;
+}
 
 const STATE_LABEL: Record<string, string> = { stopped: "Kernel stopped", starting: "Starting kernel…", idle: "Ready", busy: "Busy", dead: "Kernel died" };
 
@@ -69,6 +81,10 @@ export default function App() {
   useEffect(() => {
     initKernelBridge().then(startKernel);
     const t = setInterval(() => import("./git").then((g) => g.refreshGit()), 4000);
+    const unlisten = getCurrentWindow().onCloseRequested(async (ev) => {
+      const dirty = [...dirtyPanels.values()];
+      if (dirty.length && !(await confirmAsync(`Unsaved changes in: ${dirty.join(", ")}. Quit anyway?`))) ev.preventDefault();
+    });
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "F5" && !e.shiftKey && get().debug.stopped) { e.preventDefault(); e.stopPropagation(); cont(); }
       else if (e.key === "F10") { e.preventDefault(); stepOver(); }
@@ -77,7 +93,7 @@ export default function App() {
       else if (e.key === "F5" && e.shiftKey) { e.preventDefault(); stopDebugger(); }
     };
     window.addEventListener("keydown", onKey);
-    return () => { clearInterval(t); window.removeEventListener("keydown", onKey); };
+    return () => { clearInterval(t); window.removeEventListener("keydown", onKey); unlisten.then((u) => u()); };
   }, []);
 
   const onReady = (e: DockviewReadyEvent) => {
@@ -109,7 +125,20 @@ export default function App() {
       }
     }
     if (!ok) buildDefaultLayout(e.api);
-    e.api.onDidLayoutChange(() => localStorage.setItem(LAYOUT_KEY, JSON.stringify(e.api.toJSON())));
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    e.api.onDidLayoutChange(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        try {
+          const json = e.api.toJSON() as any;
+          for (const [id, p] of Object.entries<any>(json.panels ?? {})) {
+            if (id.startsWith("diff:") || id.startsWith("fig:")) delete json.panels[id];
+            else if (p.params) { delete p.params.reveal; delete p.params.revealTick; }
+          }
+          localStorage.setItem(LAYOUT_KEY, JSON.stringify(json));
+        } catch (err) { console.warn("layout save failed", err); }
+      }, 500);
+    });
   };
 
   const showPanel = (id: string, component: string, title: string) => {
@@ -208,9 +237,10 @@ export default function App() {
       </div>
       {remoteDlg && <RemoteDialog onClose={() => setRemoteDlg(false)} />}
       <BreakpointDialog />
+      <PromptDialog />
       {toolsDlg && <ToolsDialog onClose={() => setToolsDlg(false)} />}
       <div className="dock">
-        <DockviewReact components={components} onReady={onReady} theme={theme === "dark" ? themeDark : themeLight} />
+        <DockviewReact components={components} defaultTabComponent={GuardedTab} onReady={onReady} theme={theme === "dark" ? themeDark : themeLight} />
       </div>
       <div className={`statusbar ${kernel}`}>
         <span className="dot" />

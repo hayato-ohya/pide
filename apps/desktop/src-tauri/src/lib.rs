@@ -41,6 +41,25 @@ struct KernelStatus {
     detail: Option<String>,
 }
 
+/// Append an event, merging it into the previous one when both are `stream`
+/// messages of the same parent and stream name.
+fn push_coalesced(batch: &mut Vec<KernelEvent>, ev: KernelEvent) {
+    if ev.msg_type == "stream" {
+        if let Some(last) = batch.last_mut() {
+            if last.msg_type == "stream" && last.parent_id == ev.parent_id && last.content.get("name") == ev.content.get("name") {
+                let add = ev.content.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                if let Some(serde_json::Value::String(t)) = last.content.get_mut("text") {
+                    if t.len() + add.len() <= 256 * 1024 {
+                        t.push_str(&add);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    batch.push(ev);
+}
+
 fn emit_status(app: &AppHandle, state: &str, python: Option<String>, cwd: Option<String>, detail: Option<String>) {
     let _ = app.emit("kernel-status", KernelStatus { state: state.into(), python, cwd, detail });
 }
@@ -128,28 +147,52 @@ async fn start_kernel(
         }
     };
 
-    // Forward every message to the webview.
+    // Forward every message to the webview, batched per ~16 ms frame with
+    // consecutive stream chunks coalesced, so a tight print loop cannot
+    // out-run IPC serialization and starve the reply that ends the cell.
     let mut rx = k.subscribe();
     let app2 = app.clone();
     tokio::spawn(async move {
+        let mut batch: Vec<KernelEvent> = Vec::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(16));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut lagged: u64 = 0;
         loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let payload = KernelEvent {
-                        channel: ev.channel,
-                        msg_type: ev.msg.header.msg_type.clone(),
-                        msg_id: ev.msg.header.msg_id.clone(),
-                        parent_id: ev.msg.parent_id().map(|s| s.to_string()),
-                        header: ev.msg.header.clone(),
-                        content: ev.msg.content,
-                        metadata: ev.msg.metadata,
-                    };
-                    let _ = app2.emit("kernel-event", payload);
+            tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(ev) => {
+                        let payload = KernelEvent {
+                            channel: ev.channel,
+                            msg_type: ev.msg.header.msg_type.clone(),
+                            msg_id: ev.msg.header.msg_id.clone(),
+                            parent_id: ev.msg.parent_id().map(|s| s.to_string()),
+                            header: ev.msg.header.clone(),
+                            content: ev.msg.content,
+                            metadata: ev.msg.metadata,
+                        };
+                        push_coalesced(&mut batch, payload);
+                        if batch.len() >= 2048 {
+                            let _ = app2.emit("kernel-events", std::mem::take(&mut batch));
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("UI lagged {n} kernel events");
+                        lagged += n;
+                    }
+                    Err(_) => {
+                        if !batch.is_empty() { let _ = app2.emit("kernel-events", std::mem::take(&mut batch)); }
+                        break;
+                    }
+                },
+                _ = tick.tick() => {
+                    if !batch.is_empty() {
+                        let _ = app2.emit("kernel-events", std::mem::take(&mut batch));
+                    }
+                    if lagged > 0 {
+                        let _ = app2.emit("kernel-lagged", lagged);
+                        lagged = 0;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("UI lagged {n} kernel events");
-                }
-                Err(_) => break,
             }
         }
     });
@@ -330,7 +373,7 @@ struct DirEntry {
     modified: Option<u64>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let mut out = vec![];
     for e in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
@@ -352,14 +395,30 @@ fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn write_text_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+    write_atomic(&path, content.as_bytes())
+}
+
+/// Write to a sibling temp file and rename, so a crash never leaves a truncated file.
+fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let p = std::path::Path::new(path);
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(".{}.pide-tmp", p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+    let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().ok();
+    #[cfg(unix)]
+    if let Ok(md) = std::fs::metadata(p) {
+        let _ = std::fs::set_permissions(&tmp, md.permissions());
+    }
+    std::fs::rename(&tmp, p).map_err(|e| { let _ = std::fs::remove_file(&tmp); e.to_string() })
 }
 
 /// Launch-time overrides (safe to ship): interpreter and working folder.
@@ -385,11 +444,11 @@ fn dev_script() -> Option<String> {
     if cfg!(debug_assertions) { std::env::var("PIDE_DEV_SCRIPT").ok() } else { None }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn write_binary_file(path: String, b64: String) -> Result<(), String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string())?;
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+    write_atomic(&path, &bytes)
 }
 
 #[tauri::command]
@@ -398,7 +457,7 @@ fn home_dir() -> String {
 }
 
 /// Candidate interpreters: PATH python3, conda base + envs, common venvs.
-#[tauri::command]
+#[tauri::command(async)]
 fn detect_pythons() -> Vec<String> {
     let mut found: Vec<String> = vec![];
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
@@ -483,6 +542,7 @@ pub fn run() {
             git::git_log,
             git::git_diff,
             git::git_commit_diff,
+            git::git_commit_file,
             git::git_stage,
             git::git_unstage,
             git::git_discard,

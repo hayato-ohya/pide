@@ -29,10 +29,10 @@ export function awaitReply(msgId: string, timeoutMs = 600_000): Promise<any> {
     return Promise.resolve(c);
   }
   return new Promise((resolve, reject) => {
-    pending.set(msgId, { resolve, reject });
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       if (pending.delete(msgId)) reject(new Error("timeout waiting for kernel reply"));
     }, timeoutMs);
+    pending.set(msgId, { resolve: (c) => { clearTimeout(timer); resolve(c); }, reject: (e) => { clearTimeout(timer); reject(e); } });
   });
 }
 
@@ -137,15 +137,45 @@ function routeFigure(data: Record<string, unknown>, title: string) {
   }
 }
 
+/** Reject every outstanding reply and drop output sinks (kernel died / restarted / lagged). */
+function settlePending(reason: string, resolveInstead = false) {
+  for (const [id, p] of pending) {
+    pending.delete(id);
+    if (resolveInstead) p.resolve({ status: "unknown", lagged: true });
+    else p.reject(new Error(reason));
+  }
+  for (const [id, sink] of sinks) { sinks.delete(id); sink({ kind: "count", count: null }); }
+  early.clear();
+}
+
+/** Events were dropped under load: once the kernel answers a cheap request, settle everything older. */
+let resyncing = false;
+async function resyncAfterLag(n: number) {
+  pushConsole({ kind: "info", text: `${n} kernel messages were dropped (output too fast); re-synchronizing.` });
+  if (resyncing) return;
+  resyncing = true;
+  try {
+    const stale = [...pending.keys()];
+    const id = await invoke<string>("is_complete", { code: "" });
+    await awaitReply(id, 30_000).catch(() => {});
+    for (const k of stale) { const p = pending.get(k); if (p) { pending.delete(k); p.resolve({ status: "unknown", lagged: true }); } }
+    for (const k of stale) { const sink = sinks.get(k); if (sink) { sinks.delete(k); sink({ kind: "count", count: null }); } }
+    set({ kernel: "idle" });
+  } finally {
+    resyncing = false;
+  }
+}
+
 let started = false;
 export async function initKernelBridge() {
   if (started) return;
   started = true;
-  await listen<KernelEvent>("kernel-event", (e) => handleEvent(e.payload));
+  await listen<KernelEvent[]>("kernel-events", (e) => { for (const ev of e.payload) handleEvent(ev); });
+  await listen<number>("kernel-lagged", (e) => resyncAfterLag(e.payload));
   await listen<any>("kernel-status", (e) => {
     const p = e.payload;
     set({ kernel: p.state, python: p.python ?? get().python, cwd: p.cwd ?? get().cwd, kernelDetail: p.detail ?? null });
-    if (p.state === "dead" && p.detail) pushConsole({ kind: "info", text: `Kernel died: ${p.detail}` });
+    if (p.state === "dead") { settlePending("kernel died"); if (p.detail) pushConsole({ kind: "info", text: `Kernel died: ${p.detail}` }); }
   });
   const pythons = await invoke<string[]>("detect_pythons");
   const overrides = await invoke<{ python: string | null; cwd: string | null }>("launch_overrides").catch(() => ({ python: null, cwd: null }));
@@ -203,6 +233,7 @@ let autorunDone = false;
 
 export async function restartKernel() {
   pushConsole({ kind: "info", text: "Restarting kernel..." });
+  settlePending("kernel restarted");
   set((s) => ({ variables: [], changed: new Set(), debug: { ...s.debug, active: false, stopped: false, frames: [], frameId: null, variables: [], cellFiles: {} } }));
   await startKernel();
 }
@@ -218,7 +249,15 @@ export async function execute(code: string, { echo = true, sink, history = true 
   const id = crypto.randomUUID();
   if (sink) sinks.set(id, sink);
   const reply = awaitReply(id);
-  await invoke<string>("execute", { code, opts: { workspace: true, include_hidden: get().showHidden, msg_id: id } }).catch((e) => { sinks.delete(id); throw e; });
+  try {
+    await invoke<string>("execute", { code, opts: { workspace: true, include_hidden: get().showHidden, msg_id: id } });
+  } catch (e) {
+    sinks.delete(id);
+    const p = pending.get(id); if (p) { pending.delete(id); p.reject(new Error(String(e))); }
+    pushConsole({ kind: "info", text: `Cannot execute: ${e}` });
+    reply.catch(() => {});
+    return { status: "error", error: String(e) };
+  }
   if (echo) pushConsole({ kind: "input", code, count: get().execCount + 1, msgId: id });
   if (history) addHistory(code);
   return reply;

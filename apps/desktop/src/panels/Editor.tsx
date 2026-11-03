@@ -5,8 +5,8 @@ import type { IDockviewPanelProps } from "dockview";
 import { readText, savePath, writeText } from "../fs";
 import { scheduleLint } from "../tools";
 import { execute } from "../kernel";
-import { pushConsole, useStore } from "../store";
-import { debugCell, debugFile, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
+import { get, pushConsole, setDirtyPanel, useStore } from "../store";
+import { cont, debugCell, debugFile, editorPathFor, setBreakpoint, toggleBreakpoint, type Breakpoint } from "../debug";
 import { set as setStore } from "../store";
 import { changeDocument, closeDocument, initLsp, openDocument, saveDocument } from "../lsp";
 
@@ -42,6 +42,7 @@ function cellAt(code: string, line: number): { code: string; start: number } {
 export default function EditorPanel(props: IDockviewPanelProps<{ path: string | null; reveal?: number | null }>) {
   const [path, setPath] = useState<string | null>(props.params.path);
   const [content, setContent] = useState<string | null>(props.params.path ? null : "");
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const ed = useRef<Editor | null>(null);
   const id = props.api.id;
@@ -50,8 +51,8 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const uri = uriRef.current;
 
   useEffect(() => {
-    if (path) readText(path).then(setContent).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setContent(""); });
-  }, []);
+    if (path) readText(path).then(setContent).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setLoadError(String(e)); });
+  }, [loadError === "retry"]);
 
   useEffect(() => {
     props.api.setTitle((path ? path.split("/").pop()! : "untitled.py") + (dirty ? " *" : ""));
@@ -71,17 +72,33 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   };
 
   const doSave = async () => {
+    if (content === null) { pushConsole({ kind: "info", text: "File did not load; refusing to overwrite it." }); return; }
     let p = path;
+    const wasUntitled = !p;
     if (!p) {
       p = await savePath("untitled.py", [{ name: "Python", extensions: ["py"] }]);
       if (!p) return;
-      setPath(p);
     }
     const text = ed.current?.getValue() ?? content ?? "";
-    await writeText(p, text);
+    try {
+      await writeText(p, text);
+    } catch (e) {
+      pushConsole({ kind: "info", text: `Save failed: ${e}` });
+      return;
+    }
     setDirty(false);
-    saveDocument(uri);
     pushConsole({ kind: "info", text: `Saved ${p}` });
+    if (wasUntitled) {
+      // Re-open under the real path so LSP, breakpoints and "open file" all key on it.
+      const { openFile } = await import("../layout");
+      const bps = get().debug.breakpoints[uri];
+      closeDocument(uri);
+      props.api.close();
+      openFile(p, ed.current?.getPosition()?.lineNumber);
+      if (bps?.length) setTimeout(() => { for (const b of bps) setBreakpoint(monaco.Uri.file(p!).toString(), b.line, b); }, 300);
+      return;
+    }
+    saveDocument(uri);
   };
 
   /** MATLAB-style Run: save, then execute the file by name so tracebacks and breakpoints point at it. */
@@ -121,12 +138,14 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   });
 
   useEffect(() => () => closeDocument(uri), []);
+  useEffect(() => { setDirtyPanel(id, path ? path.split("/").pop()! : "untitled.py", dirty); }, [dirty, path]);
+  useEffect(() => () => setDirtyPanel(id, "", false), []);
 
   const onMount: OnMount = (editor, m) => {
     ed.current = editor;
     if (import.meta.env.DEV && (window as any).pide) (window as any).pide.editor = editor;
     editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.Enter, () => editors.get(id)?.runCell());
-    editor.addCommand(m.KeyCode.F5, () => editors.get(id)?.run());
+    editor.addCommand(m.KeyCode.F5, () => { if (get().debug.stopped) cont(); else editors.get(id)?.run(); });
     editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, () => editors.get(id)?.save());
     editor.addCommand(m.KeyCode.F9, () => editors.get(id)?.runCell());
     editor.addCommand(m.KeyMod.Shift | m.KeyMod.Alt | m.KeyCode.KeyF, () => editors.get(id)?.format());
@@ -186,6 +205,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     } else curDec.current.set([]);
   }, [debug.stopped, debug.frameId, debug.frames, content]);
 
+  if (loadError && loadError !== "retry") return <div className="vv-error">Could not open {path}: {loadError} <button onClick={() => setLoadError("retry")}>Retry</button></div>;
   if (content === null) return <div className="vv-loading">Loading…</div>;
   return (
     <div className="editor-panel">

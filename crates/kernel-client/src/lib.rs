@@ -204,7 +204,8 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
     ) -> Result<Arc<Kernel>> {
         let signer = Signer::new(&info.key);
         let session = uuid::Uuid::new_v4().to_string();
-        let (events, _) = broadcast::channel(4096);
+        // Large enough that a tight print loop does not drop the execute_reply.
+        let (events, _) = broadcast::channel(65_536);
 
         let ep = |port: u16| format!("tcp://{}:{}", info.ip, port);
 
