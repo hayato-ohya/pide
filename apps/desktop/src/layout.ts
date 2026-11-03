@@ -27,8 +27,18 @@ export function buildDefaultLayout(a: DockviewApi) {
 }
 
 export const revealRequests = new Map<string, number>();
+export function openNotebook(path: string | null) {
+  if (!api) return;
+  const id = path ? `nb:${path}` : `nb:untitled-${Date.now()}`;
+  const existing = api.getPanel(id);
+  if (existing) { existing.api.setActive(); return; }
+  const ref = api.panels.find((p) => p.id.startsWith("nb:") || p.id.startsWith("editor:"));
+  api.addPanel({ id, component: "notebook", title: path ? path.split("/").pop() : "untitled.ipynb", params: { path }, position: ref ? { referencePanel: ref, direction: "within" } : undefined });
+}
+
 export function openFile(path: string, line?: number) {
   if (!api) return;
+  if (path.endsWith(".ipynb")) { openNotebook(path); return; }
   const id = `editor:${path}`;
   if (line) revealRequests.set(path, line);
   const existing = api.getPanel(id);

@@ -4,10 +4,10 @@ import { complete, execute, interrupt, isComplete, replyInput } from "../kernel"
 import { useStore } from "../store";
 import type { ConsoleItem, Mime } from "../types";
 
-const ansi = new AnsiUp();
+export const ansi = new AnsiUp();
 ansi.use_classes = false;
 
-function Output({ data }: { data: Mime }) {
+export function Output({ data }: { data: Mime }) {
   if (data["text/html"]) return <div className="out-html" dangerouslySetInnerHTML={{ __html: String(data["text/html"]) }} />;
   if (data["image/png"]) return <img className="out-img" src={`data:image/png;base64,${data["image/png"]}`} />;
   if (data["image/svg+xml"]) return <div className="out-img" dangerouslySetInnerHTML={{ __html: String(data["image/svg+xml"]) }} />;

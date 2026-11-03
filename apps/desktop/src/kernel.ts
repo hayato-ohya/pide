@@ -10,6 +10,17 @@ const pending = new Map<string, { resolve: (c: any) => void; reject: (e: any) =>
 const early = new Map<string, any>();
 const userExecs = new Set<string>();
 
+/** Per-execution output sinks (notebook cells). Items mirror console items, plus "clear". */
+export type OutputItem =
+  | { kind: "stream"; name: "stdout" | "stderr"; text: string }
+  | { kind: "result"; data: Mime; count: number | null }
+  | { kind: "display"; data: Mime; displayId?: string }
+  | { kind: "error"; ename: string; evalue: string; traceback: string[] }
+  | { kind: "clear"; wait: boolean }
+  | { kind: "count"; count: number | null };
+type Mime = Record<string, unknown>;
+const sinks = new Map<string, (item: OutputItem) => void>();
+
 /** Resolve when the shell reply for `msgId` arrives. */
 export function awaitReply(msgId: string, timeoutMs = 600_000): Promise<any> {
   if (early.has(msgId)) {
@@ -52,24 +63,39 @@ function handleEvent(ev: KernelEvent) {
       case "execute_input":
         // Only echo code we did not print ourselves (e.g. from other clients).
         return;
-      case "stream":
-        pushConsole({ kind: "stream", name: c.name, text: c.text });
+      case "stream": {
+        const sink = ev.parent_id && sinks.get(ev.parent_id);
+        if (sink) sink({ kind: "stream", name: c.name, text: c.text });
+        else pushConsole({ kind: "stream", name: c.name, text: c.text });
         return;
-      case "execute_result":
+      }
+      case "execute_result": {
         set({ execCount: c.execution_count ?? get().execCount });
-        pushConsole({ kind: "result", data: c.data, count: c.execution_count });
+        const sink = ev.parent_id && sinks.get(ev.parent_id);
+        if (sink) sink({ kind: "result", data: c.data, count: c.execution_count });
+        else pushConsole({ kind: "result", data: c.data, count: c.execution_count });
         routeFigure(c.data, `Out[${c.execution_count}]`);
         return;
+      }
       case "display_data":
-      case "update_display_data":
-        pushConsole({ kind: "display", data: c.data, displayId: c.transient?.display_id });
+      case "update_display_data": {
+        const sink = ev.parent_id && sinks.get(ev.parent_id);
+        if (sink) sink({ kind: "display", data: c.data, displayId: c.transient?.display_id });
+        else pushConsole({ kind: "display", data: c.data, displayId: c.transient?.display_id });
         routeFigure(c.data, `Figure ${get().figures.length + 1}`);
         return;
-      case "error":
-        pushConsole({ kind: "error", ename: c.ename, evalue: c.evalue, traceback: c.traceback ?? [] });
+      }
+      case "error": {
+        const sink = ev.parent_id && sinks.get(ev.parent_id);
+        if (sink) sink({ kind: "error", ename: c.ename, evalue: c.evalue, traceback: c.traceback ?? [] });
+        else pushConsole({ kind: "error", ename: c.ename, evalue: c.evalue, traceback: c.traceback ?? [] });
         return;
-      case "clear_output":
+      }
+      case "clear_output": {
+        const sink = ev.parent_id && sinks.get(ev.parent_id);
+        if (sink) sink({ kind: "clear", wait: !!c.wait });
         return;
+      }
       case "debug_event":
         import("./debug").then((d) => d.onDebugEvent(c));
         return;
@@ -83,6 +109,8 @@ function handleEvent(ev: KernelEvent) {
     if (ev.msg_type === "execute_reply") {
       applyWorkspace(c.user_expressions);
       if (c.execution_count != null) set({ execCount: c.execution_count });
+      const sink = ev.parent_id && sinks.get(ev.parent_id);
+      if (sink) { sink({ kind: "count", count: c.execution_count ?? null }); sinks.delete(ev.parent_id!); }
     }
     const p = ev.parent_id && pending.get(ev.parent_id);
     if (p) {
@@ -171,13 +199,16 @@ export async function interrupt() {
 }
 
 /** Execute user code: echoes it in the console and records history. */
-export async function execute(code: string, { echo = true } = {}): Promise<any> {
+export async function execute(code: string, { echo = true, sink, history = true }: { echo?: boolean; sink?: (item: OutputItem) => void; history?: boolean } = {}): Promise<any> {
   if (!code.trim()) return;
   if (get().kernel === "stopped" || get().kernel === "dead") await startKernel();
-  const id = await invoke<string>("execute", { code, opts: { workspace: true, include_hidden: get().showHidden } });
+  const id = crypto.randomUUID();
+  if (sink) sinks.set(id, sink);
+  const reply = awaitReply(id);
+  await invoke<string>("execute", { code, opts: { workspace: true, include_hidden: get().showHidden, msg_id: id } }).catch((e) => { sinks.delete(id); throw e; });
   if (echo) pushConsole({ kind: "input", code, count: get().execCount + 1, msgId: id });
-  addHistory(code);
-  return awaitReply(id);
+  if (history) addHistory(code);
+  return reply;
 }
 
 export async function runSilent(code: string): Promise<any> {

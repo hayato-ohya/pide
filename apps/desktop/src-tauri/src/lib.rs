@@ -177,10 +177,12 @@ struct ExecOpts {
     store_history: bool,
     workspace: bool,
     include_hidden: bool,
+    /// Client-chosen msg_id (lets the UI register output handlers first).
+    msg_id: Option<String>,
 }
 impl Default for ExecOpts {
     fn default() -> Self {
-        ExecOpts { silent: false, store_history: true, workspace: true, include_hidden: false }
+        ExecOpts { silent: false, store_history: true, workspace: true, include_hidden: false, msg_id: None }
     }
 }
 
@@ -192,7 +194,7 @@ async fn execute(state: State<'_, AppState>, code: String, opts: Option<ExecOpts
     if opts.workspace {
         ue.insert("ws".to_string(), ws_expr(opts.include_hidden));
     }
-    k.execute(&code, opts.silent, opts.store_history, ue, true)
+    k.execute_with_id(&code, opts.silent, opts.store_history, ue, true, opts.msg_id)
         .await
         .map_err(|e| e.to_string())
 }

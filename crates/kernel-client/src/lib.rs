@@ -265,7 +265,16 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
     }
 
     fn build(&self, msg_type: &str, content: Value) -> (String, ZmqMessage) {
-        let header = Header::new(msg_type, &self.session);
+        self.build_with_id(msg_type, content, None)
+    }
+
+    /// Like `build`, but the caller may supply the msg_id so it can register
+    /// handlers before the request is even sent (avoids reply/ID races).
+    fn build_with_id(&self, msg_type: &str, content: Value, msg_id: Option<String>) -> (String, ZmqMessage) {
+        let mut header = Header::new(msg_type, &self.session);
+        if let Some(id) = msg_id {
+            header.msg_id = id;
+        }
         let id = header.msg_id.clone();
         let msg = Message {
             header,
@@ -286,7 +295,19 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         user_expressions: HashMap<String, String>,
         allow_stdin: bool,
     ) -> Result<String> {
-        let (id, msg) = self.build(
+        self.execute_with_id(code, silent, store_history, user_expressions, allow_stdin, None).await
+    }
+
+    pub async fn execute_with_id(
+        &self,
+        code: &str,
+        silent: bool,
+        store_history: bool,
+        user_expressions: HashMap<String, String>,
+        allow_stdin: bool,
+        msg_id: Option<String>,
+    ) -> Result<String> {
+        let (id, msg) = self.build_with_id(
             "execute_request",
             json!({
                 "code": code,
@@ -296,6 +317,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                 "allow_stdin": allow_stdin,
                 "stop_on_error": true,
             }),
+            msg_id,
         );
         self.shell_tx.send(msg).await?;
         Ok(id)

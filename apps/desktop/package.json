@@ -16,6 +16,7 @@
     "@tauri-apps/plugin-dialog": "^2",
     "ansi_up": "^6.0.2",
     "dockview": "^4",
+    "marked": "^15.0.12",
     "monaco-editor": "^0.52.2",
     "plotly.js-dist-min": "^3",
     "react": "^18.3.1",

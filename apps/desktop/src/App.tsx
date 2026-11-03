@@ -12,10 +12,11 @@ import Git from "./panels/Git";
 import DiffView from "./panels/DiffView";
 import Debugger from "./panels/Debugger";
 import RemoteDialog from "./panels/RemoteDialog";
+import NotebookPanel from "./panels/Notebook";
 import { cont, stepIn, stepOut, stepOver, stopDebugger } from "./debug";
 import EditorPanel, { activeEditorId, editors } from "./panels/Editor";
 import { complete, initKernelBridge, interrupt, restartKernel, setPython, startKernel } from "./kernel";
-import { buildDefaultLayout, dockApi, LAYOUT_KEY, openFile, openVariable, plotVariable, setDockApi, type PlotKind } from "./layout";
+import { buildDefaultLayout, dockApi, LAYOUT_KEY, openFile, openNotebook, openVariable, plotVariable, setDockApi, type PlotKind } from "./layout";
 import { get, pushConsole, set, useStore } from "./store";
 
 const components = {
@@ -29,6 +30,7 @@ const components = {
   git: Git,
   diff: DiffView,
   debugger: Debugger,
+  notebook: NotebookPanel,
   editor: EditorPanel,
 };
 
@@ -106,7 +108,7 @@ export default function App() {
   };
 
   const openDialog = async () => {
-    const p = await open({ multiple: false, filters: [{ name: "Python / text", extensions: ["py", "txt", "md", "json", "toml", "yaml", "csv"] }] });
+    const p = await open({ multiple: false, filters: [{ name: "Python / notebook / text", extensions: ["py", "ipynb", "txt", "md", "json", "toml", "yaml", "csv"] }] });
     if (typeof p === "string") openFile(p);
   };
   const newScript = () => {
@@ -134,7 +136,7 @@ export default function App() {
         <div className="ts-body">
           {tab === "home" && (
             <>
-              <div className="ts-group"><div className="ts-row"><button onClick={newScript}>＋ New Script</button><button onClick={openDialog}>Open…</button><button onClick={() => active()?.save()}>Save</button></div><div className="ts-label">FILE</div></div>
+              <div className="ts-group"><div className="ts-row"><button onClick={newScript}>＋ New Script</button><button onClick={() => openNotebook(null)}>＋ New Notebook</button><button onClick={openDialog}>Open…</button><button onClick={() => active()?.save()}>Save</button></div><div className="ts-label">FILE</div></div>
               <div className="ts-group"><div className="ts-row"><button className="primary" onClick={() => active()?.run()} title="F5">▶ Run</button><button onClick={() => active()?.runCell()} title="Ctrl+Enter">Run Section</button></div><div className="ts-label">RUN</div></div>
               <div className="ts-group"><div className="ts-row"><button onClick={interrupt} disabled={kernel !== "busy"}>⏹ Interrupt</button><button onClick={restartKernel}>⟳ Restart</button><button onClick={() => set({ console: [] })}>Clear Console</button></div><div className="ts-label">KERNEL</div></div>
               <div className="ts-group"><div className="ts-row">
