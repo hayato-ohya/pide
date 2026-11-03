@@ -41,7 +41,7 @@ const components = {
 };
 
 // Dev handle for scripted UI checks (PIDE_DEV_SCRIPT).
-(window as any).pide = { ptyWrite: (id: number, data: string) => invoke("pty_write", { id, data }), saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
+if (import.meta.env.DEV) (window as any).pide = { ptyWrite: (id: number, data: string) => invoke("pty_write", { id, data }), saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
 
 const STATE_LABEL: Record<string, string> = { stopped: "Kernel stopped", starting: "Starting kernel…", idle: "Ready", busy: "Busy", dead: "Kernel died" };
 
@@ -70,7 +70,7 @@ export default function App() {
     initKernelBridge().then(startKernel);
     const t = setInterval(() => import("./git").then((g) => g.refreshGit()), 4000);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "F5" && !e.shiftKey && (window as any).pide?.isStopped?.()) { e.preventDefault(); e.stopPropagation(); cont(); }
+      if (e.key === "F5" && !e.shiftKey && get().debug.stopped) { e.preventDefault(); e.stopPropagation(); cont(); }
       else if (e.key === "F10") { e.preventDefault(); stepOver(); }
       else if (e.key === "F11" && e.shiftKey) { e.preventDefault(); stepOut(); }
       else if (e.key === "F11") { e.preventDefault(); stepIn(); }

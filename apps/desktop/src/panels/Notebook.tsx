@@ -7,6 +7,7 @@ import { marked } from "marked";
 import { execute, interrupt, type OutputItem } from "../kernel";
 import { pushConsole, set as setStore, useStore } from "../store";
 import { Output, ansi } from "./Console";
+import { safeHtml } from "../sanitize";
 import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, syncNotebookStructure } from "../lsp";
 import { debugCell, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
 import { bpTitle } from "./Editor";
@@ -357,7 +358,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, () => { const c = nbRef.current?.cells.find((x) => x.id === id); if (c) patchCell(id, { collapsed: !c.collapsed }); });
   };
 
-  const md = useMemo(() => (src: string) => ({ __html: marked.parse(src, { async: false }) as string }), []);
+  const md = useMemo(() => (src: string) => safeHtml(marked.parse(src, { async: false }) as string), []);
   const monacoTheme = theme === "dark" ? "vs-dark" : "vs";
 
   if (!nb) return <div className="vv-loading">Loading…</div>;
@@ -408,7 +409,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
                   onChange={(e) => patchCell(c.id, { source: e.target.value })}
                   onKeyDown={(e) => { if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); patchCell(c.id, { editing: false }, false); selectNext(c.id, true); } }} />
               ) : (
-                <div className={c.cell_type === "markdown" ? "nb-md" : "nb-raw"} onDoubleClick={() => patchCell(c.id, { editing: true }, false)} dangerouslySetInnerHTML={c.cell_type === "markdown" ? md(c.source) : { __html: `<pre>${c.source.replace(/</g, "&lt;")}</pre>` }} />
+                <div className={c.cell_type === "markdown" ? "nb-md" : "nb-raw"} onDoubleClick={() => patchCell(c.id, { editing: true }, false)} dangerouslySetInnerHTML={c.cell_type === "markdown" ? md(c.source) : safeHtml(`<pre>${c.source.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`)} />
               )}
               {c.cell_type === "code" && <CellOutputs outputs={c.outputs ?? []} collapsed={!!c.collapsed} onToggle={() => patchCell(c.id, { collapsed: !c.collapsed })} />}
             </div>

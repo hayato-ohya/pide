@@ -148,11 +148,12 @@ export async function initKernelBridge() {
     if (p.state === "dead" && p.detail) pushConsole({ kind: "info", text: `Kernel died: ${p.detail}` });
   });
   const pythons = await invoke<string[]>("detect_pythons");
-  const envPython = await invoke<string | null>("dev_env", { name: "PIDE_PYTHON" });
+  const overrides = await invoke<{ python: string | null; cwd: string | null }>("launch_overrides").catch(() => ({ python: null, cwd: null }));
+  const envPython = overrides.python;
   if (envPython) { set({ remote: null, connectionFile: null }); localStorage.setItem("pide.remote", "null"); }
   const saved = envPython ?? localStorage.getItem("pide.python");
   set({ pythons: saved && !pythons.includes(saved) ? [saved, ...pythons] : pythons, python: saved ?? pythons[0] ?? "python3" });
-  const cwdOverride = await invoke<string | null>("dev_env", { name: "PIDE_CWD" });
+  const cwdOverride = overrides.cwd;
   if (cwdOverride) set({ cwd: cwdOverride });
   else if (!get().cwd) set({ cwd: localStorage.getItem("pide.cwd") ?? (await invoke<string>("home_dir")) });
 }
@@ -185,12 +186,13 @@ async function startKernelInner() {
     // Make matplotlib figures appear inline (routed to the Figures panel).
     await runSilent("try:\n import matplotlib\n matplotlib.use('module://matplotlib_inline.backend_inline')\nexcept Exception: pass");
     await refreshWorkspace();
-    // Dev helper: PIDE_AUTORUN="code" executes code once the kernel is up.
-    const auto = await invoke<string | null>("dev_autorun");
-    if (auto && !autorunDone) {
+    // Dev helpers (debug builds only): PIDE_AUTORUN runs Python once the kernel
+    // is up, PIDE_DEV_SCRIPT runs JS for scripted UI checks.
+    if (import.meta.env.DEV && !autorunDone) {
       autorunDone = true;
-      await execute(auto);
-      const script = await invoke<string | null>("dev_script");
+      const auto = await invoke<string | null>("dev_autorun").catch(() => null);
+      if (auto) await execute(auto);
+      const script = await invoke<string | null>("dev_script").catch(() => null);
       if (script) new Function(script)();
     }
   } catch (e) {

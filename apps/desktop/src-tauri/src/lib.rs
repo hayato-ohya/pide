@@ -47,6 +47,7 @@ fn emit_status(app: &AppHandle, state: &str, python: Option<String>, cwd: Option
 
 /// Directory holding the `pide_kernel` helper package.
 fn helper_dir(app: &AppHandle) -> PathBuf {
+    #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var("PIDE_HELPER_DIR") {
         return PathBuf::from(p);
     }
@@ -103,6 +104,7 @@ async fn start_kernel(
     };
     let launched = if let Some(mut r) = remote {
         // Remote kernel over SSH: ship the helper package with it.
+        #[cfg(debug_assertions)]
         if r.ssh.is_none() { r.ssh = std::env::var("PIDE_SSH").ok(); }
         let helper_src = std::fs::read_to_string(helper.join("pide_kernel/__init__.py")).map_err(|e| format!("helper source: {e}"))?;
         Kernel::launch_remote(r, &helper_src).await
@@ -356,19 +358,27 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn dev_autorun() -> Option<String> {
-    std::env::var("PIDE_AUTORUN").ok()
+/// Launch-time overrides (safe to ship): interpreter and working folder.
+#[derive(Serialize)]
+struct LaunchOverrides {
+    python: Option<String>,
+    cwd: Option<String>,
 }
 
 #[tauri::command]
-fn dev_env(name: String) -> Option<String> {
-    std::env::var(name).ok()
+fn launch_overrides() -> LaunchOverrides {
+    LaunchOverrides { python: std::env::var("PIDE_PYTHON").ok(), cwd: std::env::var("PIDE_CWD").ok() }
+}
+
+/// Dev-only hooks for scripted UI checks. Always return None in release builds.
+#[tauri::command]
+fn dev_autorun() -> Option<String> {
+    if cfg!(debug_assertions) { std::env::var("PIDE_AUTORUN").ok() } else { None }
 }
 
 #[tauri::command]
 fn dev_script() -> Option<String> {
-    std::env::var("PIDE_DEV_SCRIPT").ok()
+    if cfg!(debug_assertions) { std::env::var("PIDE_DEV_SCRIPT").ok() } else { None }
 }
 
 #[tauri::command]
@@ -450,9 +460,9 @@ pub fn run() {
             write_text_file,
             write_binary_file,
             home_dir,
+            launch_overrides,
             dev_autorun,
             dev_script,
-            dev_env,
             detect_pythons,
             lsp::detect_lsp,
             lsp::lsp_start,

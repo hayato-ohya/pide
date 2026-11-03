@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import Plotly from "plotly.js-dist-min";
 import { pushConsole, set, useStore } from "../store";
 import { plotlyTheme } from "../theme";
+import { safeHtml } from "../sanitize";
 import { dockApi } from "../layout";
 import { save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -35,8 +36,8 @@ export function Big({ f, logx, logy }: { f: Figure; logx?: boolean; logy?: boole
   }, [f, logx, logy, theme]);
   (Big as any).lastEl = ref;
   if (f.kind === "png") return <img className="fig-img" src={`data:image/png;base64,${f.data}`} />;
-  if (f.kind === "svg") return <div className="fig-img" dangerouslySetInnerHTML={{ __html: String(f.data) }} />;
-  if (f.kind === "html") return <div className="fig-img" dangerouslySetInnerHTML={{ __html: String(f.data) }} />;
+  if (f.kind === "svg") return <div className="fig-img" dangerouslySetInnerHTML={safeHtml(f.data)} />;
+  if (f.kind === "html") return <div className="fig-img" dangerouslySetInnerHTML={safeHtml(f.data)} />;
   return <div className="fig-plotly" ref={ref} />;
 }
 

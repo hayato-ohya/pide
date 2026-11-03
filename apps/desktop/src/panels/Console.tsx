@@ -3,14 +3,15 @@ import { AnsiUp } from "ansi_up";
 import { complete, execute, interrupt, isComplete, replyInput } from "../kernel";
 import { useStore } from "../store";
 import type { ConsoleItem, Mime } from "../types";
+import { safeHtml } from "../sanitize";
 
 export const ansi = new AnsiUp();
 ansi.use_classes = false;
 
 export function Output({ data }: { data: Mime }) {
-  if (data["text/html"]) return <div className="out-html" dangerouslySetInnerHTML={{ __html: String(data["text/html"]) }} />;
+  if (data["text/html"]) return <div className="out-html" dangerouslySetInnerHTML={safeHtml(data["text/html"])} />;
   if (data["image/png"]) return <img className="out-img" src={`data:image/png;base64,${data["image/png"]}`} />;
-  if (data["image/svg+xml"]) return <div className="out-img" dangerouslySetInnerHTML={{ __html: String(data["image/svg+xml"]) }} />;
+  if (data["image/svg+xml"]) return <div className="out-img" dangerouslySetInnerHTML={safeHtml(data["image/svg+xml"])} />;
   if (data["application/vnd.plotly.v1+json"]) return <div className="out-note">[interactive figure → Figures panel]</div>;
   if (data["text/plain"]) return <pre className="out-text">{String(data["text/plain"])}</pre>;
   return null;

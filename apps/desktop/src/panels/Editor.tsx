@@ -124,7 +124,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
 
   const onMount: OnMount = (editor, m) => {
     ed.current = editor;
-    (window as any).pide && ((window as any).pide.editor = editor);
+    if (import.meta.env.DEV && (window as any).pide) (window as any).pide.editor = editor;
     editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.Enter, () => editors.get(id)?.runCell());
     editor.addCommand(m.KeyCode.F5, () => editors.get(id)?.run());
     editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, () => editors.get(id)?.save());
