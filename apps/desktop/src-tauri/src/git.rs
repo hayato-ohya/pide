@@ -312,3 +312,77 @@ pub fn git_create_branch(cwd: String, name: String) -> Result<(), String> {
 pub fn git_init(cwd: String) -> Result<(), String> {
     Repository::init(&cwd).map(|_| ()).map_err(|e| e.message().to_string())
 }
+
+// ------------------------------------------------------------ network ----
+// fetch / pull / push go through the git CLI so the user's SSH agent and
+// credential helpers work unchanged (libgit2 would need its own callbacks).
+
+#[derive(Serialize)]
+pub struct CmdResult {
+    ok: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+async fn run_git(cwd: &str, args: &[&str]) -> Result<CmdResult, String> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0") // never hang on a password prompt
+            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+            .output(),
+    )
+    .await
+    .map_err(|_| "git timed out after 300 s".to_string())?
+    .map_err(|e| format!("git: {e}"))?;
+    Ok(CmdResult {
+        ok: out.status.success(),
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn git_fetch(cwd: String) -> Result<CmdResult, String> {
+    run_git(&cwd, &["fetch", "--all", "--prune"]).await
+}
+
+#[tauri::command]
+pub async fn git_pull(cwd: String, rebase: bool) -> Result<CmdResult, String> {
+    let mode = if rebase { "--rebase" } else { "--ff-only" };
+    run_git(&cwd, &["pull", mode]).await
+}
+
+#[tauri::command]
+pub async fn git_push(cwd: String, set_upstream: Option<String>, force: bool) -> Result<CmdResult, String> {
+    let mut args = vec!["push"];
+    if force {
+        args.push("--force-with-lease");
+    }
+    let branch;
+    if let Some(b) = set_upstream {
+        branch = b;
+        args.extend(["-u", "origin", branch.as_str()]);
+    }
+    run_git(&cwd, &args).await
+}
+
+#[derive(Serialize)]
+pub struct Remote { name: String, url: String }
+
+#[tauri::command]
+pub fn git_remotes(cwd: String) -> Result<Vec<Remote>, String> {
+    let repo = open(&cwd)?;
+    let names = repo.remotes().map_err(|e| e.message().to_string())?;
+    Ok(names.iter().flatten().filter_map(|n| repo.find_remote(n).ok().map(|r| Remote { name: n.to_string(), url: r.url().unwrap_or("").to_string() })).collect())
+}
+
+#[tauri::command]
+pub fn git_add_remote(cwd: String, name: String, url: String) -> Result<(), String> {
+    let repo = open(&cwd)?;
+    repo.remote(&name, &url).map(|_| ()).map_err(|e| e.message().to_string())
+}

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useStore } from "../store";
+import { pushConsole, useStore } from "../store";
 import { gitCall, layoutGraph, refreshGit, type Commit, type FileDiff, type StatusEntry } from "../git";
 import { openDiff } from "../layout";
 
@@ -43,6 +43,32 @@ export default function Git() {
   const [files, setFiles] = useState<FileDiff[]>([]);
   const [tab, setTab] = useState<"changes" | "history">("changes");
   const [branches, setBranches] = useState<{ name: string; remote: boolean; current: boolean }[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [remotes, setRemotes] = useState<{ name: string; url: string }[] | null>(null);
+
+  /** Run a network operation and report its outcome in the console. */
+  const net = async (label: string, cmd: string, args: Record<string, unknown> = {}) => {
+    if (busy) return;
+    setBusy(label);
+    try {
+      const r = await invoke<{ ok: boolean; stdout: string; stderr: string }>(cmd, { cwd, ...args });
+      const text = (r.stdout + "\n" + r.stderr).trim();
+      pushConsole({ kind: "info", text: `git ${label}: ${r.ok ? "ok" : "failed"}${text ? "\n" + text : ""}` });
+      if (!r.ok && /could not read Username|Permission denied|publickey|Authentication failed/i.test(r.stderr)) pushConsole({ kind: "info", text: "Hint: Pide never prompts for credentials. Set up an SSH key / ssh-agent or a git credential helper, then retry." });
+    } catch (e) {
+      pushConsole({ kind: "info", text: `git ${label}: ${e}` });
+    } finally {
+      setBusy(null);
+      refreshGit();
+    }
+  };
+  const addRemote = async () => {
+    const url = prompt("Remote URL (origin)", "git@github.com:user/repo.git");
+    if (!url) return;
+    await gitCall("git_add_remote", { name: "origin", url });
+    setRemotes(await invoke<any[]>("git_remotes", { cwd }).catch(() => []));
+  };
+  useEffect(() => { if (cwd && !git.error) invoke<any[]>("git_remotes", { cwd }).then(setRemotes).catch(() => setRemotes([])); }, [cwd, git.status?.root, git.error]);
 
   useEffect(() => { refreshGit(); }, [cwd]);
 
@@ -91,7 +117,23 @@ export default function Git() {
           {branches.filter((b) => b.name !== st?.branch).map((b) => <option key={b.name} value={b.name}>{b.remote ? "☁ " : ""}{b.name}</option>)}
           <option value="__new__">＋ new branch…</option>
         </select>
-        {st && (st.ahead > 0 || st.behind > 0) && <span className="muted">↑{st.ahead} ↓{st.behind}</span>}
+        {st && (st.ahead > 0 || st.behind > 0) && <span className="muted" title={`${st.ahead} to push, ${st.behind} to pull`}>↑{st.ahead} ↓{st.behind}</span>}
+        <span className="git-net">
+          {remotes && remotes.length === 0 ? (
+            <button onClick={addRemote} title="No remote configured">＋ remote</button>
+          ) : (
+            <>
+              <button disabled={!!busy} onClick={() => net("fetch", "git_fetch")} title="git fetch --all --prune">{busy === "fetch" ? "…" : "⇣ Fetch"}</button>
+              <button disabled={!!busy || !st?.upstream} onClick={() => net("pull", "git_pull", { rebase: false })} title={st?.upstream ? "git pull --ff-only (Shift-click: --rebase)" : "No upstream branch"}
+                onContextMenu={(e) => { e.preventDefault(); net("pull --rebase", "git_pull", { rebase: true }); }}>{busy?.startsWith("pull") ? "…" : `⇩ Pull${st?.behind ? ` ${st.behind}` : ""}`}</button>
+              <button disabled={!!busy} onClick={() => net(st?.upstream ? "push" : "push -u", "git_push", { setUpstream: st?.upstream ? null : st?.branch, force: false })}
+                title={st?.upstream ? "git push (right-click: --force-with-lease)" : `Publish ${st?.branch} to origin`}
+                onContextMenu={(e) => { e.preventDefault(); if (confirm("Force push (--force-with-lease)?")) net("push --force-with-lease", "git_push", { setUpstream: null, force: true }); }}>
+                {busy?.startsWith("push") ? "…" : st?.upstream ? `⇧ Push${st?.ahead ? ` ${st.ahead}` : ""}` : "⇧ Publish"}
+              </button>
+            </>
+          )}
+        </span>
         <span className="git-tabs">
           <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>Changes {st?.entries.length ? `(${st.entries.length})` : ""}</button>
           <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>History</button>

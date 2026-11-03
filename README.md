@@ -64,11 +64,12 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 
 ## 実装済み(第 4 段階: Git)
 
-- Rust 側は git2(libgit2)で実装(`apps/desktop/src-tauri/src/git.rs`)。ネットワーク操作(fetch / push)は未実装
+- Rust 側は git2(libgit2)で実装(`apps/desktop/src-tauri/src/git.rs`)。fetch / pull / push だけは `git` コマンドを呼び出す(ユーザーの ssh-agent や credential helper をそのまま使うため)。プロンプトは出さない設定(`GIT_TERMINAL_PROMPT=0`、`BatchMode=yes`)なので、認証が必要なら事前に鍵や helper を設定しておく
 - Git パネル(Current Folder の隣のタブ、VIEW タブからも開ける)
   - Changes: Staged / Changes / Untracked / Conflicts を分けて表示。行ホバーで stage / unstage / discard、見出しで一括。コミットメッセージ(Cmd+Enter)、amend
   - History: 全ブランチの履歴グラフ(マージの車線表示)、HEAD / ローカル / リモートのラベル、コミット選択でその変更ファイル一覧(+/−行数)
   - ブランチの切替と新規作成(ヘッダのセレクタ)、リポジトリでなければ `git init` ボタン
+  - Fetch(--all --prune)/ Pull(--ff-only、右クリックで --rebase)/ Push(上流がなければ Publish で `-u origin <branch>`、右クリックで --force-with-lease)。↑↓ で ahead / behind を表示。リモートがなければ「＋ remote」で origin を登録
 - 差分ビューワー: ファイルをダブルクリックで Monaco の左右差分(作業ツリー / インデックス / 任意コミット)
 - ipynb のセル単位差分: cell id(なければソースの LCS)でセルを対応付け、変更セルはインライン差分、追加 / 削除セルは色分け。出力は無視し、出力数の変化だけ注記
 - Current Folder にファイルの状態バッジ(M / A / D / ? と、配下に変更があるフォルダの •)
@@ -109,7 +110,7 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 
 ## 今後の候補
 
-- Git の fetch / push / pull、コンフリクト解決の支援
+- Git のコンフリクト解決の支援
 - 条件付きブレークポイント、例外で停止
 - リモートファイルのブラウズ(現状 Current Folder はローカルのみ)
 - 配布ビルド(`npm run tauri build`)とコード署名

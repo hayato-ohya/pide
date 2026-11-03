@@ -330,3 +330,8 @@ select option { background: var(--panel); color: var(--text); }
 .nb-md-tools { position: absolute; right: 4px; top: -22px; display: flex; gap: 2px; }
 .nb-md-tools button { border: 1px solid var(--border); background: var(--panel-alt); border-radius: 3px; cursor: pointer; font-size: 11px; padding: 0 6px; }
 .nb-cell.markdown { padding-top: 10px; }
+
+.git-net { display: flex; gap: 2px; }
+.git-net button { font-size: 11px; padding: 2px 7px; border: 1px solid var(--border); background: var(--panel-alt); border-radius: 3px; cursor: pointer; white-space: nowrap; }
+.git-net button:disabled { opacity: 0.45; cursor: default; }
+.git-head { flex-wrap: wrap; }
