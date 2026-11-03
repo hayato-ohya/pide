@@ -8,6 +8,7 @@ import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 
 (self as any).MonacoEnvironment = { getWorker: () => new editorWorker() };
 initTheme();
+import("monaco-editor").then((m) => ((window as any).monaco = m)); // dev hook
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <App />,

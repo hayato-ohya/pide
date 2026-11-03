@@ -60,6 +60,14 @@ export function openFile(path: string, line?: number) {
 /** Open (or focus) the editor for a path/uri and move the cursor to a line. */
 export function revealInEditor(uri: string, line: number) {
   if (!api) return;
+  if (uri.startsWith("vscode-notebook-cell:")) {
+    const u = new URL(uri);
+    const nbPath = decodeURIComponent(u.pathname);
+    const cellId = u.hash.slice(1);
+    const p = api.getPanel(`nb:${nbPath}`);
+    if (p) { p.api.setActive(); p.api.updateParameters({ ...p.params, reveal: { cellId, line, tick: Date.now() } }); }
+    return;
+  }
   if (uri.startsWith("untitled:")) {
     const p = api.panels.find((p) => p.id.startsWith("editor:") && (p.params as any)?.uri === uri);
     if (p) { p.api.setActive(); p.api.updateParameters({ ...p.params, reveal: line, revealTick: Date.now() }); }

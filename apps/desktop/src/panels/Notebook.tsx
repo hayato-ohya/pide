@@ -8,6 +8,8 @@ import { marked } from "marked";
 import { execute, interrupt, type OutputItem } from "../kernel";
 import { pushConsole, useStore } from "../store";
 import { Output, ansi } from "./Console";
+import { changeNotebookCell, closeNotebookDoc, openNotebookDoc, syncNotebookStructure } from "../lsp";
+import { debugCell, editorPathFor, toggleBreakpoint } from "../debug";
 
 // ------------------------------------------------------------ nbformat --
 
@@ -99,19 +101,43 @@ function CellOutputs({ outputs }: { outputs: NbOutput[] }) {
 }
 
 const LINE_H = 19;
-function CodeEditor({ value, theme, onChange, onMount, focused }: { value: string; theme: string; onChange: (v: string) => void; onMount: (e: monaco.editor.IStandaloneCodeEditor) => void; focused: boolean }) {
+function CodeEditor({ uri, value, theme, onChange, onMount, focused }: { uri: string; value: string; theme: string; onChange: (v: string) => void; onMount: (e: monaco.editor.IStandaloneCodeEditor) => void; focused: boolean }) {
   const [h, setH] = useState(Math.max(2, value.split("\n").length) * LINE_H + 12);
-  const mount: OnMount = (editor) => {
+  const ed = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+  const bpLines = useStore((s) => s.debug.breakpoints[uri]);
+  const debug = useStore((s) => s.debug);
+  const bpDec = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
+  const curDec = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
+  useEffect(() => {
+    const e = ed.current;
+    if (!e) return;
+    bpDec.current ??= e.createDecorationsCollection();
+    bpDec.current.set((bpLines ?? []).map((l) => ({ range: new monaco.Range(l, 1, l, 1), options: { glyphMarginClassName: "bp-glyph" } })));
+  }, [bpLines, h]);
+  useEffect(() => {
+    const e = ed.current;
+    if (!e) return;
+    curDec.current ??= e.createDecorationsCollection();
+    const f = debug.frames.find((x) => x.id === debug.frameId) ?? debug.frames[0];
+    const m = debug.stopped && f ? editorPathFor(f.path) : null;
+    if (m && m.uri === uri) curDec.current.set([{ range: new monaco.Range(m.line(f!.line), 1, m.line(f!.line), 1), options: { isWholeLine: true, className: "debug-line", glyphMarginClassName: "debug-arrow" } }]);
+    else curDec.current.set([]);
+  }, [debug.stopped, debug.frameId, debug.frames, h]);
+  const mount: OnMount = (editor, m) => {
+    ed.current = editor;
     const resize = () => setH(Math.max(2 * LINE_H, editor.getContentHeight()) + 12);
     editor.onDidContentSizeChange(resize);
     resize();
+    editor.onMouseDown((ev) => {
+      if (ev.target.type === m.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && ev.target.position) toggleBreakpoint(uri, ev.target.position.lineNumber);
+    });
     onMount(editor);
     if (focused) editor.focus();
   };
   return (
     <div style={{ height: h }}>
-      <MonacoEditor language="python" theme={theme} value={value} onChange={(v) => onChange(v ?? "")} onMount={mount}
-        options={{ fontSize: 13, minimap: { enabled: false }, lineNumbers: "off", glyphMargin: false, folding: false, scrollBeyondLastLine: false, scrollbar: { vertical: "hidden", horizontal: "auto", alwaysConsumeMouseWheel: false }, overviewRulerLanes: 0, renderLineHighlight: "none", automaticLayout: true, lineDecorationsWidth: 8, lineNumbersMinChars: 0, tabSize: 4, quickSuggestions: { other: true, comments: false, strings: false }, wordWrap: "on" }} />
+      <MonacoEditor path={uri} language="python" theme={theme} value={value} onChange={(v) => onChange(v ?? "")} onMount={mount}
+        options={{ fontSize: 13, minimap: { enabled: false }, lineNumbers: "off", glyphMargin: true, folding: false, scrollBeyondLastLine: false, scrollbar: { vertical: "hidden", horizontal: "auto", alwaysConsumeMouseWheel: false }, overviewRulerLanes: 0, renderLineHighlight: "none", automaticLayout: true, lineDecorationsWidth: 8, lineNumbersMinChars: 0, tabSize: 4, quickSuggestions: { other: true, comments: false, strings: false }, wordWrap: "on" }} />
     </div>
   );
 }
@@ -128,6 +154,29 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const editors = useRef(new Map<string, monaco.editor.IStandaloneCodeEditor>());
   const nbRef = useRef<Notebook | null>(null);
   nbRef.current = nb;
+  // Stable notebook URI for the LSP; cells get vscode-notebook-cell:<path>#<id> like VS Code.
+  const nbUriRef = useRef<string>(path ? monaco.Uri.file(path).toString() : `untitled:Untitled-${Date.now()}.ipynb`);
+  const nbUri = nbUriRef.current;
+  const cellUri = (id: string) => `vscode-notebook-cell:${nbUri.replace(/^file:\/\//, "").replace(/^untitled:/, "/")}#${id}`;
+
+  // LSP: open once loaded, re-sync structure when cells change, close on unmount.
+  const codeCells = (n: Notebook) => n.cells.filter((c) => c.cell_type === "code").map((c) => ({ uri: cellUri(c.id), text: c.source }));
+  useEffect(() => { if (nb) openNotebookDoc(nbUri, codeCells(nb)); return () => closeNotebookDoc(nbUri); }, [nb === null]);
+  const structureKey = nb ? nb.cells.map((c) => c.cell_type[0] + c.id).join(",") : "";
+  useEffect(() => { if (nb) syncNotebookStructure(nbUri, codeCells(nb)); }, [structureKey]);
+
+  // Debugger / go-to: reveal a cell line when asked.
+  useEffect(() => {
+    const d = props.api.onDidParametersChange((p: any) => {
+      const r = p?.reveal;
+      if (!r?.cellId) return;
+      setSel(r.cellId);
+      const e = editors.current.get(r.cellId);
+      if (e) { e.revealLineInCenter(r.line); e.setPosition({ lineNumber: r.line, column: 1 }); }
+      document.getElementById(`cell-${r.cellId}`)?.scrollIntoView({ block: "center" });
+    });
+    return () => d.dispose();
+  }, []);
 
   useEffect(() => {
     if (path) invoke<string>("read_text_file", { path }).then((t) => setNb(parseNotebook(t))).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setNb(parseNotebook("")); });
@@ -172,6 +221,20 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
       patchCell(id, { running: false }, false);
     }
   };
+  const debugThisCell = async (id: string) => {
+    const cell = nbRef.current?.cells.find((c) => c.id === id);
+    if (!cell || cell.cell_type !== "code") return;
+    const code = editors.current.get(id)?.getValue() ?? cell.source;
+    patchCell(id, { source: code, outputs: [], running: true, execution_count: null });
+    try {
+      await debugCell(code, cellUri(id), 1, (it) => {
+        if (it.kind === "count") patchCell(id, { execution_count: it.count, running: false }, false);
+        else setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, outputs: applyOutput(c.outputs ?? [], it) } : c)) } : n));
+      });
+    } finally {
+      patchCell(id, { running: false }, false);
+    }
+  };
   const runAll = async () => { for (const c of nbRef.current?.cells ?? []) await runCell(c.id); };
   const runAbove = async (id: string) => { for (const c of nbRef.current?.cells ?? []) { if (c.id === id) break; await runCell(c.id); } };
 
@@ -210,6 +273,8 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
 
   const onEditorMount = (id: string) => (editor: monaco.editor.IStandaloneCodeEditor) => {
     editors.current.set(id, editor);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    editor.onDidChangeModelContent(() => { if (timer) clearTimeout(timer); timer = setTimeout(() => changeNotebookCell(nbUri, cellUri(id), editor.getValue()), 150); });
     editor.onDidFocusEditorText(() => setSel(id));
     editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => runCell(id, true));
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCell(id, false));
@@ -231,6 +296,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
         <button onClick={runAll}>▶▶ Run All</button>
         <button onClick={() => sel && runAbove(sel)}>Run Above</button>
         <button onClick={interrupt} disabled={kernel !== "busy"}>⏹</button>
+        <button onClick={() => sel && debugThisCell(sel)} title="Run this cell under the debugger (set breakpoints in the cell gutter)">🐞 Debug</button>
         <span className="sep" />
         <button onClick={() => sel && moveCell(sel, -1)} title="Move up">↑</button>
         <button onClick={() => sel && moveCell(sel, 1)} title="Move down">↓</button>
@@ -245,14 +311,14 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
       </div>
       <div className="nb-cells">
         {nb.cells.map((c) => (
-          <div key={c.id} className={`nb-cell ${c.cell_type} ${sel === c.id ? "selected" : ""} ${c.running ? "running" : ""}`} onClick={() => setSel(c.id)}>
+          <div key={c.id} id={`cell-${c.id}`} className={`nb-cell ${c.cell_type} ${sel === c.id ? "selected" : ""} ${c.running ? "running" : ""}`} onClick={() => setSel(c.id)}>
             <div className="nb-gutter">
               {c.cell_type === "code" ? <span className="nb-prompt">{c.running ? "[*]" : `[${c.execution_count ?? " "}]`}</span> : <span className="nb-prompt muted">{c.cell_type === "markdown" ? "md" : "raw"}</span>}
               {c.cell_type === "code" && <button className="nb-run" title="Run cell" onClick={(e) => { e.stopPropagation(); runCell(c.id); }}>▶</button>}
             </div>
             <div className="nb-body">
               {c.cell_type === "code" ? (
-                <CodeEditor value={c.source} theme={monacoTheme} focused={sel === c.id} onChange={(v) => patchCell(c.id, { source: v })} onMount={onEditorMount(c.id)} />
+                <CodeEditor uri={cellUri(c.id)} value={c.source} theme={monacoTheme} focused={sel === c.id} onChange={(v) => patchCell(c.id, { source: v })} onMount={onEditorMount(c.id)} />
               ) : c.editing || !c.source.trim() ? (
                 <textarea className="nb-md-edit" value={c.source} autoFocus placeholder={c.cell_type === "markdown" ? "Markdown… (Shift+Enter to render)" : "Raw cell"} rows={Math.max(2, c.source.split("\n").length)}
                   onChange={(e) => patchCell(c.id, { source: e.target.value })}

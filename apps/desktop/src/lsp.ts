@@ -53,6 +53,7 @@ class LspClient {
           publishDiagnostics: { relatedInformation: false },
           formatting: {},
         },
+        notebookDocument: { synchronization: { dynamicRegistration: false, executionSummarySupport: false } },
         workspace: { configuration: true, workspaceFolders: true, didChangeConfiguration: { dynamicRegistration: false } },
       },
     }).then((r) => {
@@ -64,6 +65,7 @@ class LspClient {
       this.state = "running";
       publishStatus();
       for (const d of docs.values()) this.notify("textDocument/didOpen", { textDocument: { uri: d.uri, languageId: d.languageId, version: d.version, text: d.text } });
+      for (const nb of notebooks.values()) this.notify("notebookDocument/didOpen", notebookOpenParams(nb));
     }).catch((e) => {
       this.state = "failed";
       publishStatus();
@@ -188,6 +190,56 @@ export function closeDocument(uri: string) {
   for (const c of clients.values()) if (c.state === "running") c.notify("textDocument/didClose", { textDocument: { uri } });
   const m = monacoRef?.editor.getModel(monacoRef.Uri.parse(uri));
   if (m && monacoRef) for (const owner of ["pyright", "ruff"]) monacoRef.editor.setModelMarkers(m, owner, []);
+}
+
+// -------------------------------------------------------------- notebooks --
+
+interface NbCell { uri: string; text: string; version: number }
+interface NbDoc { uri: string; version: number; cells: NbCell[] }
+const notebooks = new Map<string, NbDoc>();
+
+function notebookOpenParams(nb: NbDoc) {
+  return {
+    notebookDocument: { uri: nb.uri, notebookType: "jupyter-notebook", version: nb.version, cells: nb.cells.map((c) => ({ kind: 2, document: c.uri })) },
+    cellTextDocuments: nb.cells.map((c) => ({ uri: c.uri, languageId: "python", version: c.version, text: c.text })),
+  };
+}
+const running = () => [...clients.values()].filter((c) => c.state === "running");
+
+/** Open (or fully re-open) a notebook with its code cells. */
+export function openNotebookDoc(uri: string, cells: { uri: string; text: string }[]) {
+  const prev = notebooks.get(uri);
+  if (prev) closeNotebookDoc(uri);
+  const nb: NbDoc = { uri, version: (prev?.version ?? 0) + 1, cells: cells.map((c) => ({ ...c, version: 1 })) };
+  notebooks.set(uri, nb);
+  for (const c of running()) c.notify("notebookDocument/didOpen", notebookOpenParams(nb));
+}
+
+/** Structure changed (cells added/removed/moved/retyped): simplest correct sync is close + open. */
+export function syncNotebookStructure(uri: string, cells: { uri: string; text: string }[]) {
+  const nb = notebooks.get(uri);
+  if (!nb) return openNotebookDoc(uri, cells);
+  const same = nb.cells.length === cells.length && nb.cells.every((c, i) => c.uri === cells[i].uri);
+  if (same) return;
+  openNotebookDoc(uri, cells);
+}
+
+export function changeNotebookCell(uri: string, cellUri: string, text: string) {
+  const nb = notebooks.get(uri);
+  const cell = nb?.cells.find((c) => c.uri === cellUri);
+  if (!nb || !cell) return;
+  cell.text = text;
+  cell.version++;
+  nb.version++;
+  for (const c of running()) c.notify("notebookDocument/didChange", { notebookDocument: { uri, version: nb.version }, change: { cells: { textContent: [{ document: { uri: cellUri, version: cell.version }, changes: [{ text }] }] } } });
+}
+
+export function closeNotebookDoc(uri: string) {
+  const nb = notebooks.get(uri);
+  if (!nb) return;
+  notebooks.delete(uri);
+  for (const c of running()) c.notify("notebookDocument/didClose", { notebookDocument: { uri }, cellTextDocuments: nb.cells.map((x) => ({ uri: x.uri })) });
+  if (monacoRef) for (const x of nb.cells) { const m = monacoRef.editor.getModel(monacoRef.Uri.parse(x.uri)); if (m) for (const owner of ["pyright", "ruff"]) monacoRef.editor.setModelMarkers(m, owner, []); }
 }
 
 // ------------------------------------------------------------ diagnostics --

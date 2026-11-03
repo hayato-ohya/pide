@@ -7,7 +7,7 @@ import * as monaco from "monaco-editor";
 /** Editor URI (file:///...) → filesystem path for debugpy; untitled buffers have none. */
 export function uriToPath(uri: string): string | null {
   if (uri.startsWith("file://")) return monaco.Uri.parse(uri).fsPath;
-  if (uri.startsWith("untitled:")) return null;
+  if (uri.startsWith("untitled:") || uri.startsWith("vscode-notebook-cell:")) return null;
   return uri;
 }
 export function pathToUri(path: string): string {
@@ -51,7 +51,7 @@ export async function startDebugger() {
   try {
     await dap("initialize", { clientID: "pide", clientName: "Pide", adapterID: "python", pathFormat: "path", linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: "en" });
     await dap("attach", {});
-    for (const [path, lines] of Object.entries(get().debug.breakpoints)) if (lines.length && !path.startsWith("untitled:")) await pushBreakpoints(path, lines);
+    for (const [path, lines] of Object.entries(get().debug.breakpoints)) if (lines.length && !path.startsWith("untitled:") && !path.startsWith("vscode-notebook-cell:")) await pushBreakpoints(path, lines);
     await dap("configurationDone");
     patch({ active: true });
     pushConsole({ kind: "info", text: "Debugger attached." });
@@ -83,11 +83,11 @@ export function toggleBreakpoint(editorPath: string, line: number) {
   if (!bp[editorPath].length) delete bp[editorPath];
   patch({ breakpoints: bp });
   localStorage.setItem("pide.breakpoints", JSON.stringify(bp));
-  if (get().debug.active && !editorPath.startsWith("untitled:")) pushBreakpoints(editorPath, bp[editorPath] ?? []).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
+  if (get().debug.active && !editorPath.startsWith("untitled:") && !editorPath.startsWith("vscode-notebook-cell:")) pushBreakpoints(editorPath, bp[editorPath] ?? []).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
 }
 
 export function clearBreakpoints() {
-  for (const p of Object.keys(get().debug.breakpoints)) if (get().debug.active && !p.startsWith("untitled:")) pushBreakpoints(p, []).catch(() => {});
+  for (const p of Object.keys(get().debug.breakpoints)) if (get().debug.active && !p.startsWith("untitled:") && !p.startsWith("vscode-notebook-cell:")) pushBreakpoints(p, []).catch(() => {});
   patch({ breakpoints: {} });
   localStorage.setItem("pide.breakpoints", "{}");
 }
@@ -101,14 +101,14 @@ export async function debugFile(path: string) {
 }
 
 /** Run a cell / selection under the debugger: dumpCell gives the temp path debugpy will see. */
-export async function debugCell(code: string, editorPath: string, startLine: number) {
+export async function debugCell(code: string, editorPath: string, startLine: number, sink?: (item: import("./kernel").OutputItem) => void) {
   await startDebugger();
   if (!get().debug.active) return;
   const { sourcePath } = await dap("dumpCell", { code });
   const lines = (get().debug.breakpoints[editorPath] ?? []).filter((l) => l >= startLine && l < startLine + code.split("\n").length).map((l) => l - startLine + 1);
-  patch({ cellFiles: { ...get().debug.cellFiles, [sourcePath]: { uri: editorPath, path: editorPath.startsWith("untitled:") ? null : editorPath, startLine } } });
+  patch({ cellFiles: { ...get().debug.cellFiles, [sourcePath]: { uri: editorPath, path: uriToPath(editorPath), startLine } } });
   await pushBreakpoints(sourcePath, lines);
-  await execute(code);
+  await execute(code, sink ? { echo: false, history: false, sink } : {});
 }
 
 export const cont = () => get().debug.threadId != null && dap("continue", { threadId: get().debug.threadId }).catch(() => {});
@@ -128,7 +128,10 @@ export function editorPathFor(path: string | null): { uri: string; line: (l: num
 export function frameLabel(path: string | null, line: number): string {
   if (!path) return `?:${line}`;
   const cell = get().debug.cellFiles[path];
-  if (cell) return `${(cell.path ?? cell.uri).split("/").pop()} (cell):${line + cell.startLine - 1}`;
+  if (cell) {
+    if (cell.uri.startsWith("vscode-notebook-cell:")) return `${decodeURIComponent(new URL(cell.uri).pathname).split("/").pop()} cell:${line}`;
+    return `${(cell.path ?? cell.uri).split("/").pop()} (cell):${line + cell.startLine - 1}`;
+  }
   return `${path.split("/").pop()}:${line}`;
 }
 
