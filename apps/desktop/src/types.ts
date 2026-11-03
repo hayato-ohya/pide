@@ -53,6 +53,7 @@ export interface Figure {
   kind: "png" | "svg" | "html" | "plotly";
   data: unknown;
   layout?: unknown;
+  displayId?: string;
 }
 
 export type KernelState = "stopped" | "starting" | "idle" | "busy" | "dead";

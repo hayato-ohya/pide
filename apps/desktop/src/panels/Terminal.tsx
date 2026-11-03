@@ -45,10 +45,13 @@ function TermView({ tab, onExit, onTitle }: { tab: Tab; onExit: () => void; onTi
       for (let i = 0; i < 20 && !get().cwd && !get().remote; i++) await new Promise((r) => setTimeout(r, 150));
       const remote = get().remote;
       // Remote kernel selected → open an SSH session to that host instead of a local shell.
-      const command = remote ? ["ssh", "-t", ...(remote.port ? ["-p", String(remote.port)] : []), remote.host, remote.cwd ? `cd ${JSON.stringify(remote.cwd)}; exec $SHELL -l` : "exec $SHELL -l"] : null;
+      const sq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
+      const cdCmd = remote?.cwd ? (remote.cwd.startsWith("~/") ? `cd ~/${sq(remote.cwd.slice(2))}` : remote.cwd === "~" ? "cd ~" : `cd ${sq(remote.cwd)}`) : null;
+      const command = remote ? ["ssh", "-t", ...(remote.port ? ["-p", String(remote.port)] : []), "--", remote.host, cdCmd ? `${cdCmd}; exec $SHELL -l` : "exec $SHELL -l"] : null;
       unlistenData = await listen<{ id: number; data: string }>("pty-data", (e) => { if (e.payload.id === ptyRef.current) term.write(decode(e.payload.data)); });
+      if (disposed) { unlistenData(); return; }
       unlistenExit = await listen<{ id: number }>("pty-exit", (e) => { if (e.payload.id === ptyRef.current) { term.write("\r\n\x1b[90m[process exited]\x1b[0m\r\n"); invoke("pty_reap").catch(() => {}); onExit(); } });
-      if (disposed) return;
+      if (disposed) { unlistenData(); unlistenExit(); return; }
       try {
         const id = await invoke<number>("pty_spawn", { cols: term.cols, rows: term.rows, cwd: remote ? null : get().cwd, command, env: { PIDE_PYTHON: get().python ?? "" } });
         ptyRef.current = id;

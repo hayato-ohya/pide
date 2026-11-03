@@ -29,9 +29,10 @@ export function Big({ f, logx, logy }: { f: Figure; logx?: boolean; logy?: boole
       const t = plotlyTheme() as any;
       const layout = { ...t, ...base, xaxis: { ...t.xaxis, ...(base.xaxis ?? {}) }, yaxis: { ...t.yaxis, ...(base.yaxis ?? {}) }, autosize: true, margin: { t: 40, r: 20, b: 50, l: 60 }, }; layout.xaxis.type = logx ? "log" : layout.xaxis.type; layout.yaxis.type = logy ? "log" : layout.yaxis.type;
       Plotly.react(ref.current, f.data as any, layout, { responsive: true, displaylogo: false });
-      const ro = new ResizeObserver(() => ref.current && Plotly.Plots.resize(ref.current));
-      ro.observe(ref.current);
-      return () => ro.disconnect();
+      const el = ref.current;
+      const ro = new ResizeObserver(() => el && Plotly.Plots.resize(el));
+      ro.observe(el);
+      return () => { ro.disconnect(); try { Plotly.purge(el); } catch { /* already gone */ } };
     }
   }, [f, logx, logy, theme]);
   (Big as any).lastEl = ref;

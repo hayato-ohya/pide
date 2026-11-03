@@ -2,7 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { addFigure, addHistory, get, pushConsole, set } from "./store";
-import type { DetailWindow, KernelEvent, VarInfo } from "./types";
+import type { DetailWindow, Figure, KernelEvent, VarInfo } from "./types";
 import { startLsp } from "./lsp";
 
 const pending = new Map<string, { resolve: (c: any) => void; reject: (e: any) => void }>();
@@ -14,12 +14,14 @@ const userExecs = new Set<string>();
 export type OutputItem =
   | { kind: "stream"; name: "stdout" | "stderr"; text: string }
   | { kind: "result"; data: Mime; count: number | null }
-  | { kind: "display"; data: Mime; displayId?: string }
+  | { kind: "display"; data: Mime; displayId?: string; update?: boolean }
   | { kind: "error"; ename: string; evalue: string; traceback: string[] }
   | { kind: "clear"; wait: boolean }
   | { kind: "count"; count: number | null };
 type Mime = Record<string, unknown>;
 const sinks = new Map<string, (item: OutputItem) => void>();
+/** Executions whose shell reply arrived; their sink is dropped on the matching iopub idle. */
+const settledReplies = new Set<string>();
 
 /** Resolve when the shell reply for `msgId` arrives. */
 export function awaitReply(msgId: string, timeoutMs = 600_000): Promise<any> {
@@ -58,7 +60,12 @@ function handleEvent(ev: KernelEvent) {
     switch (ev.msg_type) {
       case "status":
         if (c.execution_state === "busy") set({ kernel: "busy" });
-        else if (c.execution_state === "idle") set({ kernel: "idle" });
+        else if (c.execution_state === "idle") {
+          set({ kernel: "idle" });
+          // ipykernel sends idle after the last output of an execution: release that sink now.
+          const sink = ev.parent_id && sinks.get(ev.parent_id);
+          if (sink && settledReplies.has(ev.parent_id!)) { sinks.delete(ev.parent_id!); settledReplies.delete(ev.parent_id!); }
+        }
         return;
       case "execute_input":
         // Only echo code we did not print ourselves (e.g. from other clients).
@@ -79,10 +86,18 @@ function handleEvent(ev: KernelEvent) {
       }
       case "display_data":
       case "update_display_data": {
+        const displayId = c.transient?.display_id;
         const sink = ev.parent_id && sinks.get(ev.parent_id);
-        if (sink) sink({ kind: "display", data: c.data, displayId: c.transient?.display_id });
-        else pushConsole({ kind: "display", data: c.data, displayId: c.transient?.display_id });
-        routeFigure(c.data, `Figure ${get().figures.length + 1}`);
+        if (ev.msg_type === "update_display_data" && displayId) {
+          // Replace in place (progress bars, animations) instead of appending.
+          set((s) => ({ console: s.console.map((it) => (it.kind === "display" && it.displayId === displayId ? { ...it, data: c.data } : it)) }));
+          if (sink) sink({ kind: "display", data: c.data, displayId, update: true });
+          routeFigure(c.data, `Figure ${get().figures.length + 1}`, displayId);
+          return;
+        }
+        if (sink) sink({ kind: "display", data: c.data, displayId });
+        else pushConsole({ kind: "display", data: c.data, displayId });
+        routeFigure(c.data, `Figure ${get().figures.length + 1}`, displayId);
         return;
       }
       case "error": {
@@ -110,7 +125,12 @@ function handleEvent(ev: KernelEvent) {
       applyWorkspace(c.user_expressions);
       if (c.execution_count != null) set({ execCount: c.execution_count });
       const sink = ev.parent_id && sinks.get(ev.parent_id);
-      if (sink) { sink({ kind: "count", count: c.execution_count ?? null }); sinks.delete(ev.parent_id!); }
+      if (sink) {
+        sink({ kind: "count", count: c.execution_count ?? null });
+        // Keep the sink until iopub reports idle (outputs may still be in flight on the other socket).
+        settledReplies.add(ev.parent_id!);
+        setTimeout(() => { if (sinks.delete(ev.parent_id!)) settledReplies.delete(ev.parent_id!); }, 2000);
+      }
     }
     const p = ev.parent_id && pending.get(ev.parent_id);
     if (p) {
@@ -126,15 +146,19 @@ function handleEvent(ev: KernelEvent) {
 }
 
 /** Images / plotly bundles also go to the Figures panel, MATLAB style. */
-function routeFigure(data: Record<string, unknown>, title: string) {
+function routeFigure(data: Record<string, unknown>, title: string, displayId?: string) {
+  let fig: Omit<Figure, "id"> | null = null;
   if (data["application/vnd.plotly.v1+json"]) {
     const b = data["application/vnd.plotly.v1+json"] as any;
-    addFigure({ title, kind: "plotly", data: b.data, layout: b.layout });
-  } else if (data["image/png"]) {
-    addFigure({ title, kind: "png", data: data["image/png"] });
-  } else if (data["image/svg+xml"]) {
-    addFigure({ title, kind: "svg", data: data["image/svg+xml"] });
+    fig = { title, kind: "plotly", data: b.data, layout: b.layout, displayId };
+  } else if (data["image/png"]) fig = { title, kind: "png", data: data["image/png"], displayId };
+  else if (data["image/svg+xml"]) fig = { title, kind: "svg", data: data["image/svg+xml"], displayId };
+  if (!fig) return;
+  if (displayId) {
+    const existing = get().figures.find((f) => f.displayId === displayId);
+    if (existing) { set((s) => ({ figures: s.figures.map((f) => (f.id === existing.id ? { ...f, data: fig!.data, layout: fig!.layout } : f)) })); return; }
   }
+  addFigure(fig);
 }
 
 /** Reject every outstanding reply and drop output sinks (kernel died / restarted / lagged). */

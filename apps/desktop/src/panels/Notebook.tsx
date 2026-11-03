@@ -8,7 +8,7 @@ import { execute, interrupt, type OutputItem } from "../kernel";
 import { pushConsole, set as setStore, setDirtyPanel, useStore } from "../store";
 import { Output, ansi } from "./Console";
 import { safeHtml } from "../sanitize";
-import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, syncNotebookStructure } from "../lsp";
+import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, queueDocumentChange, syncNotebookStructure } from "../lsp";
 import { debugCell, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
 import { bpTitle } from "./Editor";
 import { scheduleLint } from "../tools";
@@ -89,7 +89,13 @@ function applyOutput(outputs: NbOutput[], it: OutputItem): NbOutput[] {
       return [...outputs, { output_type: "stream", name: it.name, text: it.text }];
     }
     case "result": return [...outputs, { output_type: "execute_result", data: it.data, metadata: {}, execution_count: it.count }];
-    case "display": return [...outputs, { output_type: "display_data", data: it.data, metadata: {} }];
+    case "display": {
+      if (it.update && it.displayId) {
+        const i = outputs.findIndex((o) => o.output_type === "display_data" && (o.metadata as any)?.display_id === it.displayId);
+        if (i >= 0) return outputs.map((o, j) => (j === i ? { ...o, data: it.data } : o));
+      }
+      return [...outputs, { output_type: "display_data", data: it.data, metadata: it.displayId ? { display_id: it.displayId } : {} }];
+    }
     case "error": return [...outputs, { output_type: "error", ename: it.ename, evalue: it.evalue, traceback: it.traceback }];
     default: return outputs;
   }
@@ -348,10 +354,9 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
 
   const onEditorMount = (id: string) => (editor: monaco.editor.IStandaloneCodeEditor) => {
     editors.current.set(id, editor);
-    let timer: ReturnType<typeof setTimeout> | null = null;
     const lint = () => { const model = editor.getModel(); if (model) scheduleLint(monaco, model, "cell.py"); };
     lint();
-    editor.onDidChangeModelContent(() => { if (timer) clearTimeout(timer); timer = setTimeout(() => changeNotebookCell(nbUri, cellUri(id), editor.getValue()), 150); lint(); });
+    editor.onDidChangeModelContent(() => { queueDocumentChange(cellUri(id), () => editor.getValue(), (t) => changeNotebookCell(nbUri, cellUri(id), t)); lint(); });
     editor.onDidFocusEditorText(() => setSel(id));
     editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => runCell(id, true));
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCell(id, false));

@@ -42,21 +42,26 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
   const [scroll, setScroll] = useState({ top: 0, left: 0, h: 400, w: 600 });
 
   const root = path.split(/[.\[]/)[0];
-  const generation = useMemo(() => (changedSet.has(root) ? Date.now() : 0), [changedSet, root]);
+  const rootVar = variables.find((v) => v.name === root);
+  const generation = `${rootVar?.id ?? ""}:${rootVar?.value ?? ""}:${(rootVar?.shape ?? []).join("x")}`;
+  void changedSet;
 
   // (Re)load the first block whenever the variable changes.
   useEffect(() => {
     blocks.current.clear();
     setMeta(null);
     setError(null);
+    let cancelled = false;
     fetchDetail(path, { row0: 0, row1: BLOCK_R, col0: 0, col1: BLOCK_C, index: index.length ? index : undefined })
       .then((d) => {
+        if (cancelled) return;
         if (d.error) setError(d.error);
         setMeta(d);
         blocks.current.set("0:0", d);
         bump((x) => x + 1);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => { if (!cancelled) setError(String(e)); });
+    return () => { cancelled = true; };
   }, [path, index.join(","), generation, variables.length]);
 
   const ensure = (br: number, bc: number) => {

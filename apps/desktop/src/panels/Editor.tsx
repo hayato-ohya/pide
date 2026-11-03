@@ -8,7 +8,7 @@ import { execute } from "../kernel";
 import { get, pushConsole, setDirtyPanel, useStore } from "../store";
 import { cont, debugCell, debugFile, editorPathFor, setBreakpoint, toggleBreakpoint, type Breakpoint } from "../debug";
 import { set as setStore } from "../store";
-import { changeDocument, closeDocument, initLsp, openDocument, saveDocument } from "../lsp";
+import { changeDocument, closeDocument, initLsp, openDocument, queueDocumentChange, saveDocument } from "../lsp";
 
 // Use the bundled monaco (no CDN) so the app works offline.
 loader.config({ monaco });
@@ -152,11 +152,9 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     openDocument(uri, editor.getValue());
     const lint = () => { const model = editor.getModel(); if (model) scheduleLint(m, model, path?.split("/").pop() ?? "untitled.py"); };
     lint();
-    let timer: ReturnType<typeof setTimeout> | null = null;
     editor.onDidChangeModelContent(() => {
       setDirty(true);
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => changeDocument(uri, editor.getValue()), 150);
+      queueDocumentChange(uri, () => editor.getValue(), (t) => changeDocument(uri, t));
       lint();
     });
     // Highlight `# %%` cell separators like MATLAB sections.

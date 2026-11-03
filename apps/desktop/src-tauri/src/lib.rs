@@ -18,6 +18,8 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub struct AppState {
     kernel: Mutex<Option<Arc<Kernel>>>,
+    /// Serializes start / shutdown so two overlapping restarts cannot leak a kernel.
+    lifecycle: Mutex<()>,
     python: Mutex<Option<String>>,
     cwd: Mutex<Option<String>>,
 }
@@ -81,6 +83,11 @@ fn helper_dir(app: &AppHandle) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../python")
 }
 
+/// A JSON string literal is also a valid Python string literal (Rust's `{:?}` is not).
+fn pyq(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "''".into())
+}
+
 fn ws_expr(include_hidden: bool) -> String {
     format!("__import__('pide_kernel').snapshot(include_hidden={})", if include_hidden { "True" } else { "False" })
 }
@@ -98,8 +105,10 @@ async fn start_kernel(
     remote: Option<kernel_client::launch::RemoteSpec>,
     connection_file: Option<String>,
 ) -> Result<Value, String> {
+    let _guard = state.lifecycle.lock().await;
     // Stop an existing kernel first.
-    if let Some(old) = state.kernel.lock().await.take() {
+    let old = state.kernel.lock().await.take();
+    if let Some(old) = old {
         let _ = old.shutdown(false).await;
     }
     let python = python
@@ -204,9 +213,12 @@ async fn start_kernel(
     let cwd2 = cwd.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = k2.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            }
             if !k2.is_alive().await {
-                emit_status(&app3, "dead", Some(py.clone()), cwd2.clone(), Some("kernel process exited".into()));
+                emit_status(&app3, "dead", Some(py.clone()), cwd2.clone(), Some("kernel stopped responding (process exited, tunnel dropped or heartbeat lost)".into()));
                 break;
             }
         }
@@ -280,15 +292,15 @@ async fn variable_detail(state: State<'_, AppState>, path: String, win: Window) 
         None => "None".into(),
     };
     let expr = format!(
-        "__import__('pide_kernel').detail({:?}, {}, {}, {}, {}, {})",
-        path, win.row0, win.row1.max(win.row0 + 1), win.col0, win.col1.max(win.col0 + 1), idx
+        "__import__('pide_kernel').detail({}, {}, {}, {}, {}, {})",
+        pyq(&path), win.row0, win.row1.max(win.row0 + 1), win.col0, win.col1.max(win.col0 + 1), idx
     );
     user_expr(&state, "detail", expr).await
 }
 
 #[tauri::command]
 async fn plot_data(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    user_expr(&state, "plot", format!("__import__('pide_kernel').plot_data({:?})", path)).await
+    user_expr(&state, "plot", format!("__import__('pide_kernel').plot_data({})", pyq(&path))).await
 }
 
 #[derive(Deserialize, Default)]
@@ -303,17 +315,17 @@ struct ImageOpts {
 #[tauri::command]
 async fn variable_image(state: State<'_, AppState>, path: String, opts: ImageOpts) -> Result<String, String> {
     let idx = match &opts.index { Some(v) => serde_json::to_string(v).unwrap(), None => "None".into() };
-    let f = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_else(|| "None".into());
+    let f = |v: Option<f64>| v.filter(|x| x.is_finite()).map(|x| x.to_string()).unwrap_or_else(|| "None".into());
     let expr = format!(
-        "__import__('pide_kernel').image({:?}, {}, {}, {}, {:?})",
-        path, idx, f(opts.vmin), f(opts.vmax), opts.layout.unwrap_or_else(|| "auto".into())
+        "__import__('pide_kernel').image({}, {}, {}, {}, {})",
+        pyq(&path), idx, f(opts.vmin), f(opts.vmax), pyq(&opts.layout.unwrap_or_else(|| "auto".into()))
     );
     user_expr(&state, "image", expr).await
 }
 
 #[tauri::command]
 async fn plot_expr(state: State<'_, AppState>, expr: String) -> Result<String, String> {
-    user_expr(&state, "plot", format!("__import__('pide_kernel').plot_expr({:?})", expr)).await
+    user_expr(&state, "plot", format!("__import__('pide_kernel').plot_expr({})", pyq(&expr))).await
 }
 
 /// Forward a DAP request to the kernel's debugger (ipykernel + debugpy).
@@ -355,7 +367,9 @@ async fn interrupt_kernel(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn shutdown_kernel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(k) = state.kernel.lock().await.take() {
+    let _guard = state.lifecycle.lock().await;
+    let k = state.kernel.lock().await.take();
+    if let Some(k) = k {
         k.shutdown(false).await.map_err(|e| e.to_string())?;
     }
     emit_status(&app, "stopped", None, None, None);

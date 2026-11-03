@@ -139,9 +139,10 @@ export function pushConsole(item: NewItem) {
   });
 }
 
+const MAX_FIGURES = 60;
 export function addFigure(f: Omit<Figure, "id">) {
   const id = uid();
-  set((s) => ({ figures: [...s.figures, { ...f, id }], activeFigure: id }));
+  set((s) => { const figs = [...s.figures, { ...f, id }]; return { figures: figs.length > MAX_FIGURES ? figs.slice(figs.length - MAX_FIGURES) : figs, activeFigure: id }; });
   return id;
 }
 

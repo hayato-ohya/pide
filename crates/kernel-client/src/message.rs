@@ -83,7 +83,13 @@ impl Message {
         let content = &rest[4];
         if !signer.key_empty() {
             let expected = signer.sign([header, parent, metadata, content]);
-            if expected.as_bytes() != sig.as_ref() {
+            let a = expected.as_bytes();
+            let b: &[u8] = sig.as_ref();
+            let mut diff = (a.len() ^ b.len()) as u8;
+            for i in 0..a.len().min(b.len()) {
+                diff |= a[i] ^ b[i];
+            }
+            if diff != 0 {
                 bail!("bad HMAC signature");
             }
         }

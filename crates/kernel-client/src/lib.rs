@@ -14,7 +14,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use zeromq::{DealerSendHalf, DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+use tokio_util::sync::CancellationToken;
+use zeromq::{DealerSendHalf, DealerSocket, ReqSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 pub use launch::{ConnectionInfo, LaunchSpec};
 pub use message::{Header, Message, Signer};
@@ -50,7 +51,17 @@ pub struct Kernel {
     control_tx: mpsc::Sender<ZmqMessage>,
     stdin_tx: mpsc::Sender<ZmqMessage>,
     events: broadcast::Sender<Event>,
+    /// Cancels every task spawned for this kernel (socket pumps, heartbeat).
+    cancel: CancellationToken,
+    /// Set by the heartbeat task after repeated misses.
+    hb_dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _conn_file: Option<launch::ConnFile>,
+}
+
+impl Drop for Kernel {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl Kernel {
@@ -202,18 +213,22 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         owned: bool,
         conn_file: Option<launch::ConnFile>,
     ) -> Result<Arc<Kernel>> {
+        if info.signature_scheme != "hmac-sha256" && !info.key.is_empty() {
+            anyhow::bail!("unsupported signature scheme {:?}", info.signature_scheme);
+        }
         let signer = Signer::new(&info.key);
         let session = uuid::Uuid::new_v4().to_string();
         // Large enough that a tight print loop does not drop the execute_reply.
         let (events, _) = broadcast::channel(65_536);
+        let cancel = CancellationToken::new();
 
         let ep = |port: u16| format!("tcp://{}:{}", info.ip, port);
 
         // Dealer sockets (shell / control / stdin): a send half fed by an mpsc
         // and a recv half pumped into the broadcast channel.
-        let shell_tx = dealer(&ep(info.shell_port), Channel::Shell, signer.clone(), events.clone()).await?;
-        let control_tx = dealer(&ep(info.control_port), Channel::Control, signer.clone(), events.clone()).await?;
-        let stdin_tx = dealer(&ep(info.stdin_port), Channel::Stdin, signer.clone(), events.clone()).await?;
+        let shell_tx = dealer(&ep(info.shell_port), Channel::Shell, signer.clone(), events.clone(), cancel.clone()).await?;
+        let control_tx = dealer(&ep(info.control_port), Channel::Control, signer.clone(), events.clone(), cancel.clone()).await?;
+        let stdin_tx = dealer(&ep(info.stdin_port), Channel::Stdin, signer.clone(), events.clone(), cancel.clone()).await?;
 
         // IOPub subscriber.
         let mut sub = SubSocket::new();
@@ -222,9 +237,14 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         {
             let signer = signer.clone();
             let events = events.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 loop {
-                    match sub.recv().await {
+                    let m = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        r = sub.recv() => r,
+                    };
+                    match m {
                         Ok(m) => match Message::decode(m.into_vec(), &signer) {
                             Ok(msg) => {
                                 let _ = events.send(Event { channel: Channel::IoPub, msg });
@@ -237,7 +257,64 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                         }
                     }
                 }
+                drop(sub);
             });
+        }
+
+        // Heartbeat: REQ/REP ping every 3 s; three misses mark the kernel dead.
+        let hb_dead;
+        {
+            let hb_ep = ep(info.hb_port);
+            let cancel = cancel.clone();
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag2 = flag.clone();
+            tokio::spawn(async move {
+                let mut misses = 0u32;
+                'outer: loop {
+                    let mut sock = ReqSocket::new();
+                    let connected = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        r = tokio::time::timeout(std::time::Duration::from_secs(3), sock.connect(&hb_ep)) => matches!(r, Ok(Ok(_))),
+                    };
+                    if !connected {
+                        misses += 1; // refused / unreachable counts as a missed beat
+                        tracing::debug!("heartbeat connect failed ({misses})");
+                        if misses >= 3 {
+                            tracing::warn!("kernel heartbeat lost");
+                            flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {} }
+                        continue;
+                    }
+                    loop {
+                        tokio::select! { _ = cancel.cancelled() => break 'outer, _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {} }
+                        // send() blocks while the peer is gone, so it needs a timeout as well.
+                        let sent = tokio::select! {
+                            _ = cancel.cancelled() => break 'outer,
+                            r = tokio::time::timeout(std::time::Duration::from_secs(3), sock.send(ZmqMessage::from("ping"))) => r,
+                        };
+                        if !matches!(sent, Ok(Ok(()))) {
+                            misses += 1;
+                            break;
+                        }
+                        let got = tokio::select! {
+                            _ = cancel.cancelled() => break 'outer,
+                            r = tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv()) => r,
+                        };
+                        match got {
+                            Ok(Ok(_)) => { misses = 0; flag2.store(false, std::sync::atomic::Ordering::Relaxed); }
+                            _ => { misses += 1; break; } // REQ state is now broken: rebuild the socket
+                        }
+                    }
+                    if misses >= 3 {
+                        tracing::warn!("kernel heartbeat lost");
+                        flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+            hb_dead = flag;
         }
 
         let kernel = Arc::new(Kernel {
@@ -252,6 +329,8 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             control_tx,
             stdin_tx,
             events,
+            cancel,
+            hb_dead,
             _conn_file: conn_file,
         });
 
@@ -420,15 +499,29 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             let _ = c.start_kill();
             let _ = c.wait().await;
         }
+        self.cancel.cancel();
         Ok(())
     }
 
     pub async fn is_alive(&self) -> bool {
+        if self.cancel.is_cancelled() || self.hb_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        for c in self.extra.lock().await.iter_mut() {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                return false; // ssh tunnel died
+            }
+        }
         let mut child = self.child.lock().await;
         match child.as_mut() {
             Some(c) => matches!(c.try_wait(), Ok(None)),
             None => true,
         }
+    }
+
+    /// Resolves when the kernel has been shut down or dropped.
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await
     }
 
     async fn wait_ready(&self, timeout: std::time::Duration) -> Result<()> {
@@ -475,22 +568,28 @@ async fn dealer(
     channel: Channel,
     signer: Signer,
     events: broadcast::Sender<Event>,
+    cancel: CancellationToken,
 ) -> Result<mpsc::Sender<ZmqMessage>> {
     let mut sock = DealerSocket::new();
     sock.connect(endpoint).await.with_context(|| format!("connect {channel:?} {endpoint}"))?;
     let (mut send_half, mut recv_half): (DealerSendHalf, _) = sock.split();
     let (tx, mut rx) = mpsc::channel::<ZmqMessage>(256);
+    let c1 = cancel.clone();
     tokio::spawn(async move {
-        while let Some(m) = rx.recv().await {
+        loop {
+            let m = tokio::select! { _ = c1.cancelled() => break, m = rx.recv() => m };
+            let Some(m) = m else { break };
             if let Err(e) = send_half.send(m).await {
                 tracing::warn!("{channel:?} send: {e}");
                 break;
             }
         }
+        drop(send_half);
     });
     tokio::spawn(async move {
         loop {
-            match recv_half.recv().await {
+            let r = tokio::select! { _ = cancel.cancelled() => break, r = recv_half.recv() => r };
+            match r {
                 Ok(m) => match Message::decode(m.into_vec(), &signer) {
                     Ok(msg) => {
                         let _ = events.send(Event { channel, msg });
@@ -503,6 +602,7 @@ async fn dealer(
                 }
             }
         }
+        drop(recv_half);
     });
     Ok(tx)
 }

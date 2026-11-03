@@ -75,7 +75,13 @@ class LspClient {
     return this.initialized;
   }
 
+  dispose() {
+    this.state = "off";
+    for (const [id, p] of this.pending) { this.pending.delete(id); p.reject(new Error(`${this.name} restarted`)); }
+  }
+
   request(method: string, params: Json, timeoutMs = 15000): Promise<Json> {
+    flushPendingChanges();
     const id = this.nextId++;
     const p = new Promise<Json>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -152,12 +158,19 @@ export async function initLsp(monaco: typeof Monaco) {
   registerProviders(monaco);
 }
 
-/** (Re)start servers for the current interpreter and working directory. */
-export async function startLsp() {
+/** (Re)start servers for the current interpreter and working directory (serialized). */
+let lspChain: Promise<void> = Promise.resolve();
+export function startLsp(): Promise<void> {
+  const next = lspChain.then(() => startLspInner()).catch(() => {});
+  lspChain = next;
+  return next;
+}
+
+async function startLspInner() {
   const python = get().python ?? "python3";
   const cwd = get().cwd ?? "/";
   const det = await invoke<{ pyright: string | null; ruff: string | null }>("detect_lsp", { python });
-  for (const c of clients.values()) await invoke("lsp_stop", { name: c.name }).catch(() => {});
+  for (const c of clients.values()) { c.dispose(); await invoke("lsp_stop", { name: c.name }).catch(() => {}); }
   clients.clear();
   const missing: string[] = [];
   if (det.pyright) clients.set("pyright", new LspClient("pyright", det.pyright, ["--stdio"]));
@@ -179,6 +192,20 @@ export function openDocument(uri: string, text: string, languageId = "python") {
   docs.set(uri, d);
   for (const c of clients.values()) if (c.state === "running") c.notify("textDocument/didOpen", { textDocument: d });
 }
+/** Debounced edits are queued here; any request flushes them first so servers never see stale text. */
+const pendingChanges = new Map<string, () => void>();
+export function flushPendingChanges() {
+  for (const [k, fn] of pendingChanges) { pendingChanges.delete(k); fn(); }
+}
+export function queueDocumentChange(uri: string, getText: () => string, apply: (text: string) => void, delayMs = 150) {
+  const prev = (pendingChanges.get(uri) as any)?.timer;
+  if (prev) clearTimeout(prev);
+  const fn = () => apply(getText());
+  const timer = setTimeout(() => { if (pendingChanges.delete(uri)) fn(); }, delayMs);
+  (fn as any).timer = timer;
+  pendingChanges.set(uri, fn);
+}
+
 export function changeDocument(uri: string, text: string) {
   const d = docs.get(uri);
   if (!d) return;

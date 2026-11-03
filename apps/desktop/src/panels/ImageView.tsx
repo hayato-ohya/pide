@@ -22,7 +22,7 @@ function lut(name: string): Uint8ClampedArray {
 }
 
 /** Canvas image viewer for 2-D / RGB arrays with colormap, range and zoom. */
-export default function ImageView({ path, generation }: { path: string; generation: number }) {
+export default function ImageView({ path, generation }: { path: string; generation: string | number }) {
   const [img, setImg] = useState<ImageData_ | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cmap, setCmap] = useState("viridis");
@@ -36,11 +36,13 @@ export default function ImageView({ path, generation }: { path: string; generati
 
   useEffect(() => {
     setError(null);
+    let cancelled = false;
     const vmin = range.vmin === "" ? null : Number(range.vmin);
     const vmax = range.vmax === "" ? null : Number(range.vmax);
     fetchImage(path, { index: index.length ? index : undefined, vmin, vmax, layout })
-      .then((d) => (d.error ? setError(d.error) : setImg(d)))
-      .catch((e) => setError(String(e)));
+      .then((d) => { if (!cancelled) (d.error ? setError(d.error) : setImg(d)); })
+      .catch((e) => { if (!cancelled) setError(String(e)); });
+    return () => { cancelled = true; };
   }, [path, generation, index.join(","), range.vmin, range.vmax, layout]);
 
   const bytes = useMemo(() => (img ? Uint8Array.from(atob(img.data), (c) => c.charCodeAt(0)) : null), [img]);
