@@ -504,15 +504,34 @@ fn detect_pythons() -> Vec<String> {
     found
 }
 
+fn dirs_log_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    if cfg!(target_os = "macos") { home.join("Library/Logs/Pide") }
+    else if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or(home).join("Pide/logs") }
+    else { std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("pide/logs") }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+    // Log to stderr (dev) and to a daily-rotated file in the OS log dir, so a
+    // Dock-launched app still leaves diagnostics behind. Child-process output
+    // is DEBUG; set RUST_LOG=debug to see it.
+    let log_dir = dirs_log_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file = tracing_appender::rolling::daily(&log_dir, "pide.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file);
+    std::mem::forget(guard); // keep the writer alive for the process lifetime
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse().unwrap());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
         .init();
+    tracing::info!("log directory: {}", log_dir.display());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
         .manage(lsp::LspState::default())
         .manage(term::TermState::default())

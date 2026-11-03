@@ -171,11 +171,11 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             if let Some(json) = line.strip_prefix("PIDE_CONN:") {
                 break serde_json::from_str(json).context("parsing remote connection info")?;
             }
-            tracing::info!(target: "kernel", "[remote.stdout] {line}");
+            tracing::debug!(target: "kernel", "[remote.stdout] {line}");
         };
         tokio::spawn(async move {
             while let Ok(Some(l)) = lines.next_line().await {
-                tracing::info!(target: "kernel", "[remote.stdout] {l}");
+                tracing::debug!(target: "kernel", "[remote.stdout] {l}");
             }
         });
 
@@ -636,11 +636,44 @@ async fn pipe_log<R: tokio::io::AsyncRead + Unpin>(name: &'static str, r: R) {
     use tokio::io::AsyncBufReadExt;
     let mut lines = tokio::io::BufReader::new(r).lines();
     while let Ok(Some(l)) = lines.next_line().await {
-        tracing::info!(target: "kernel", "[{name}] {l}");
+        tracing::debug!(target: "kernel", "[{name}] {l}");
     }
 }
 
 #[allow(dead_code)]
 fn _bytes(v: &[u8]) -> Bytes {
     Bytes::copy_from_slice(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_escapes_single_quotes_and_keeps_tilde() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("~"), "~");
+        assert_eq!(shell_quote("~/my project"), "~/'my project'");
+        assert_eq!(shell_quote("~/x;rm -rf ~"), "~/'x;rm -rf ~'");
+    }
+
+    #[test]
+    fn b64encode_matches_standard() {
+        assert_eq!(b64encode(b""), "");
+        assert_eq!(b64encode(b"f"), "Zg==");
+        assert_eq!(b64encode(b"fo"), "Zm8=");
+        assert_eq!(b64encode(b"foo"), "Zm9v");
+        assert_eq!(b64encode(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn connection_info_ports_are_distinct() {
+        let i = ConnectionInfo::new_local().unwrap();
+        let mut p = vec![i.shell_port, i.iopub_port, i.stdin_port, i.control_port, i.hb_port];
+        p.sort();
+        p.dedup();
+        assert_eq!(p.len(), 5);
+        assert_eq!(i.key.len(), 32);
+    }
 }

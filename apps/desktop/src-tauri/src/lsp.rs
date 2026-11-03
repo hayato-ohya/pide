@@ -151,7 +151,7 @@ pub async fn lsp_start(
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            tracing::info!(target: "lsp", "[{n3}] {l}");
+            tracing::debug!(target: "lsp", "[{n3}] {l}");
         }
     });
 

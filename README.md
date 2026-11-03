@@ -22,6 +22,20 @@ PIDE_PYTHON=~/miniconda3/envs/pide-test/bin/python npm run tauri dev   # この�
 
 Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy、pandas(category / datetime / NaN 含む)、polars DataFrame / Series、torch Tensor(CPU / MPS / requires_grad / float16 / bool)、torch.nn.Module(パラメータ一覧、`model.0.weight` のように掘れる)、jax Array、xarray DataArray、PIL Image、scikit-learn 推定器(属性一覧)。
 
+## 対応プラットフォーム
+
+現状は macOS と Linux を対象にしています。Windows はパス区切りやシェル起動の差異が未対応です。
+
+## ログ
+
+アプリのログは標準エラー出力に加え、macOS では `~/Library/Logs/Pide/`、Linux では `~/.local/state/pide/logs/` に日次ローテーションで書き出します。カーネルや言語サーバーの出力は DEBUG レベルなので、必要なら `RUST_LOG=debug` で起動してください。
+
+## テストと CI
+
+- Rust: `cargo test -p kernel-client`(HMAC 署名の往復・改ざん検出、シェル引用、接続情報)
+- Python: `python -m pytest python/tests -q`(ヘルパーのスナップショット、パス解決、統計、プロット、ファイル操作)
+- GitHub Actions(`.github/workflows/ci.yml`)が push / PR ごとに macOS と Linux で上記とフロントエンドのビルドを実行します
+
 ## 開発環境
 
 - Rust(rustup)、Node 18+、Python 3.10+ と `ipykernel`(カーネル側に `numpy` / `pandas` / `matplotlib` があると便利)
@@ -90,7 +104,7 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 ### リモートカーネル
 - ENVIRONMENT のセレクタから「Remote kernel (SSH)…」(または ⇄ ボタン)。ホスト、ポート、リモートの python、作業フォルダをプロファイルとして保存できる
 - 仕組み: ヘルパーパッケージを `~/.pide` に転送 → リモートでブートストラップ(空きポート確保、接続情報出力、ipykernel を exec)→ 別の ssh セッションで 5 ポートを `-L` 転送 → ローカルと同じ経路で接続。割り込みは control チャネルの `interrupt_request`
-- 鍵認証が必要(BatchMode)。ssh コマンドは `PIDE_SSH` で差し替え可能(テストでは `fake_ssh.py` シムを使用)
+- 鍵認証が必要(BatchMode)。初回接続先は事前に Terminal タブから `ssh user@host` でホスト鍵を受け入れておく。ssh コマンドはデバッグビルドでのみ `PIDE_SSH` で差し替え可能
 - 「Connection file…」で起動済みカーネルの接続ファイルを指定して接続できる(ポートを公開したコンテナなど。リモート側に `pide_kernel` が import できる必要あり)
 - Docker 専用の起動は未実装(SSH でコンテナに入るか、接続ファイル方式を使う)
 - リモートファイルの閲覧: リモートカーネル使用中は Current Folder、エディタ、ノートブックがカーネル側のファイルを扱う(カーネル内の `pide_kernel.fs_*` 経由、追加の SSH セッション不要)。接続後は作業フォルダがリモートの cwd になり、Current Folder にホスト名バッジが付く。「名前を付けて保存」はパス入力。Git パネルはリモート中は無効。LSP はローカルの環境で解析するため、リモートにしかないパッケージは未解決と出ることがある

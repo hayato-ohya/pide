@@ -14,8 +14,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
-tauri-plugin-shell = "2"
 kernel-client = { path = "../../../crates/kernel-client" }
 tokio.workspace = true
 serde.workspace = true
@@ -25,4 +23,5 @@ tracing.workspace = true
 base64 = "0.22"
 git2 = { version = "0.20", default-features = false }
 portable-pty = "0.9"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -126,3 +126,56 @@ impl Signer {
         hex::encode(mac.finalize().into_bytes())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg() -> Message {
+        Message {
+            header: Header::new("execute_request", "sess"),
+            parent_header: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            content: serde_json::json!({"code": "print(1)"}),
+            buffers: vec![],
+        }
+    }
+
+    #[test]
+    fn sign_verify_round_trip() {
+        let signer = Signer::new("secret-key");
+        let frames = msg().encode(&signer).into_vec();
+        let decoded = Message::decode(frames, &signer).unwrap();
+        assert_eq!(decoded.header.msg_type, "execute_request");
+        assert_eq!(decoded.content["code"], "print(1)");
+    }
+
+    #[test]
+    fn tampered_content_is_rejected() {
+        let signer = Signer::new("secret-key");
+        let mut frames = msg().encode(&signer).into_vec();
+        let last = frames.len() - 1;
+        frames[last] = Bytes::from_static(br#"{"code":"import os"}"#);
+        assert!(Message::decode(frames, &signer).is_err());
+    }
+
+    #[test]
+    fn wrong_key_is_rejected() {
+        let frames = msg().encode(&Signer::new("a")).into_vec();
+        assert!(Message::decode(frames, &Signer::new("b")).is_err());
+    }
+
+    #[test]
+    fn empty_key_disables_auth() {
+        let frames = msg().encode(&Signer::new("")).into_vec();
+        assert!(Message::decode(frames, &Signer::new("")).is_ok());
+    }
+
+    #[test]
+    fn identities_before_delimiter_are_skipped() {
+        let signer = Signer::new("k");
+        let mut frames = vec![Bytes::from_static(b"router-id")];
+        frames.extend(msg().encode(&signer).into_vec());
+        assert!(Message::decode(frames, &signer).is_ok());
+    }
+}
