@@ -101,3 +101,7 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 - 条件付きブレークポイント、例外で停止
 - リモートファイルのブラウズ(現状 Current Folder はローカルのみ)
 - 配布ビルド(`npm run tauri build`)とコード署名
+
+## ライセンス
+
+MIT License。詳細は `LICENSE` を参照。

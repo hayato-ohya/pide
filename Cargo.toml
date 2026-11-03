@@ -5,6 +5,7 @@ members = ["crates/kernel-client", "apps/desktop/src-tauri"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
