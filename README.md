@@ -79,7 +79,9 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 ### デバッガ
 - ipykernel 内蔵のデバッガ(debugpy)を Jupyter の `debug_request`(control チャネル)経由で使う。カーネルの名前空間を保ったまま止められる。リモートカーネルでもそのまま使える
 - DEBUG タブ: Debug File(保存してから実ファイル名で実行)、Debug Cell(`# %%` セルまたは選択範囲。`dumpCell` で一時ファイルに対応付け)、Continue / Step / Step In / Step Out / Quit(F5 / F10 / F11 / Shift+F11 / Shift+F5)
-- エディタの左余白クリックでブレークポイント(永続化)。停止行は矢印と黄色の帯で表示し、別ファイルなら開いてジャンプ
+- エディタの左余白クリックでブレークポイント(永続化)。右クリック(または Alt+クリック)で条件式、ヒット回数(`5`、`>= 3`、`% 10`)、ログポイント(`{式}` を埋め込んで出力、停止しない。書式指定は不可)を設定。条件付きは黄色、ログポイントは青で表示
+- 例外停止: DEBUG タブと Debugger パネルの「Uncaught」「Raised」。ipykernel 内では例外が最終的にカーネルに捕捉されるため、Uncaught は debugpy の `userUnhandled` フィルタで実現。停止時は例外の種類・メッセージ・トレースを Debugger パネルに表示
+- 停止行は矢印と黄色の帯で表示し、別ファイルなら開いてジャンプ
 - 停止中は Workspace がそのフレームの変数一覧(K>> 表示、フレーム切替、ツリー展開、「→ ws」でカーネルのグローバルへコピー)に切り替わる。Command Window のプロンプトは `K>>`
 - Debugger パネル: コールスタック(ダブルクリックでジャンプ)とブレークポイント一覧
 - HOME の Run(F5)も `pide_kernel.run_file` で実ファイル名実行に変更(トレースバックにファイル名が出る)
@@ -111,7 +113,6 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 ## 今後の候補
 
 - Git のコンフリクト解決の支援
-- 条件付きブレークポイント、例外で停止
 - リモートファイルのブラウズ(現状 Current Folder はローカルのみ)
 - 配布ビルド(`npm run tauri build`)とコード署名
 

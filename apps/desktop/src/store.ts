@@ -27,6 +27,8 @@ export interface State {
   themePref: "light" | "dark" | "system";
   theme: "light" | "dark";
   debug: import("./debug").DebugState;
+  /** Breakpoint being edited in the dialog. */
+  bpEdit: { uri: string; line: number } | null;
   git: { status: import("./git").GitStatus | null; log: import("./git").Commit[]; error: string | null };
 }
 
@@ -54,7 +56,8 @@ let state: State = {
   themePref: "system",
   theme: "light",
   git: { status: null, log: [], error: null },
-  debug: { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: JSON.parse(localStorage.getItem("pide.breakpoints") ?? "{}"), cellFiles: {}, scopes: [], variables: [] },
+  bpEdit: null,
+  debug: { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: {}, exceptions: { uncaught: true, raised: false }, exceptionInfo: null, cellFiles: {}, scopes: [], variables: [] },
 };
 
 const listeners = new Set<() => void>();

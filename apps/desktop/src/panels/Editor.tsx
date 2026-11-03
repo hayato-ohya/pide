@@ -6,7 +6,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { execute } from "../kernel";
 import { pushConsole, useStore } from "../store";
-import { debugCell, debugFile, editorPathFor, toggleBreakpoint } from "../debug";
+import { debugCell, debugFile, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
+import { set as setStore } from "../store";
 import { changeDocument, closeDocument, initLsp, openDocument, saveDocument } from "../lsp";
 
 // Use the bundled monaco (no CDN) so the app works offline.
@@ -19,6 +20,13 @@ type Editor = Parameters<OnMount>[0];
 export const editors = new Map<string, { run: () => void; runCell: () => void; save: () => Promise<void>; format: () => void; debug: () => void; debugCell: () => void; path: string | null }>();
 export let activeEditorId: string | null = null;
 let untitledCounter = 0;
+export function bpTitle(b: Breakpoint) {
+  const parts = [`Breakpoint line ${b.line}`];
+  if (b.condition) parts.push(`when ${b.condition}`);
+  if (b.hitCondition) parts.push(`hit ${b.hitCondition}`);
+  if (b.logMessage) parts.push(`log: ${b.logMessage}`);
+  return parts.join(" · ") + "  (right-click to edit)";
+}
 
 /** Split code into `# %%` cells and return the one containing `line` (1-based). */
 function cellAt(code: string, line: number): { code: string; start: number } {
@@ -143,7 +151,9 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     editor.onDidChangeModelContent(refresh);
     refresh();
     editor.onMouseDown((ev) => {
-      if (ev.target.type === m.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && ev.target.position) toggleBreakpoint(uri, ev.target.position.lineNumber);
+      if (ev.target.type !== m.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || !ev.target.position) return;
+      if (ev.event.rightButton || ev.event.altKey) setStore({ bpEdit: { uri, line: ev.target.position.lineNumber } });
+      else toggleBreakpoint(uri, ev.target.position.lineNumber);
     });
     reveal(props.params.reveal);
   };
@@ -158,7 +168,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     const e = ed.current;
     if (!e) return;
     bpDec.current ??= e.createDecorationsCollection();
-    bpDec.current.set((bpLines ?? []).map((l) => ({ range: new monaco.Range(l, 1, l, 1), options: { glyphMarginClassName: "bp-glyph", glyphMarginHoverMessage: { value: `Breakpoint line ${l}` } } })));
+    bpDec.current.set((bpLines ?? []).map((b: Breakpoint) => ({ range: new monaco.Range(b.line, 1, b.line, 1), options: { glyphMarginClassName: b.logMessage ? "bp-glyph log" : b.condition || b.hitCondition ? "bp-glyph cond" : "bp-glyph", glyphMarginHoverMessage: { value: bpTitle(b) } } })));
   }, [bpLines, content]);
   useEffect(() => {
     const e = ed.current;

@@ -14,6 +14,27 @@ export function pathToUri(path: string): string {
   return monaco.Uri.file(path).toString();
 }
 
+export interface Breakpoint {
+  line: number;
+  /** Python expression; stop only when truthy. */
+  condition?: string;
+  /** e.g. ">= 3" or "5": stop on the Nth hit. */
+  hitCondition?: string;
+  /** Logpoint: print this (with {expr} interpolation) instead of stopping. */
+  logMessage?: string;
+}
+
+/** Migrate the old `number[]` storage format and read saved breakpoints. */
+export function loadBreakpoints(): Record<string, Breakpoint[]> {
+  try {
+    const raw = JSON.parse(localStorage.getItem("pide.breakpoints") ?? "{}");
+    const out: Record<string, Breakpoint[]> = {};
+    for (const [k, v] of Object.entries(raw)) out[k] = (v as any[]).map((x) => (typeof x === "number" ? { line: x } : x));
+    return out;
+  } catch { return {}; }
+}
+export const bpLines = (bps: Breakpoint[] | undefined) => (bps ?? []).map((b) => b.line);
+
 export interface Frame { id: number; name: string; path: string | null; line: number; column: number }
 export interface DapVar { name: string; value: string; type?: string; variablesReference: number; evaluateName?: string }
 export interface DebugState {
@@ -23,14 +44,18 @@ export interface DebugState {
   reason: string | null;
   frames: Frame[];
   frameId: number | null;
-  /** editor path → sorted 1-based lines */
-  breakpoints: Record<string, number[]>;
+  /** editor path → breakpoints sorted by line */
+  breakpoints: Record<string, Breakpoint[]>;
+  /** Exception filters sent to debugpy. */
+  exceptions: { uncaught: boolean; raised: boolean };
+  /** Details when stopped on an exception. */
+  exceptionInfo: { id: string; description: string; details?: string } | null;
   /** DAP temp file (dumpCell) → { uri, startLine } so stops map back to the editor */
   cellFiles: Record<string, { uri: string; path: string | null; startLine: number }>;
   scopes: { name: string; variablesReference: number }[];
   variables: DapVar[];
 }
-export const initialDebug: DebugState = { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: JSON.parse(localStorage.getItem("pide.breakpoints") ?? "{}"), cellFiles: {}, scopes: [], variables: [] };
+export const initialDebug: DebugState = { active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, breakpoints: loadBreakpoints(), exceptions: JSON.parse(localStorage.getItem("pide.exceptions") ?? '{"uncaught":true,"raised":false}'), exceptionInfo: null, cellFiles: {}, scopes: [], variables: [] };
 
 let seq = 0;
 function patch(p: Partial<DebugState>) {
@@ -51,7 +76,8 @@ export async function startDebugger() {
   try {
     await dap("initialize", { clientID: "pide", clientName: "Pide", adapterID: "python", pathFormat: "path", linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: "en" });
     await dap("attach", {});
-    for (const [path, lines] of Object.entries(get().debug.breakpoints)) if (lines.length && !path.startsWith("untitled:") && !path.startsWith("vscode-notebook-cell:")) await pushBreakpoints(path, lines);
+    for (const [path, bps] of Object.entries(get().debug.breakpoints)) if (bps.length && !path.startsWith("untitled:") && !path.startsWith("vscode-notebook-cell:")) await pushBreakpoints(path, bps);
+    await pushExceptionFilters();
     await dap("configurationDone");
     patch({ active: true });
     pushConsole({ kind: "info", text: "Debugger attached." });
@@ -66,24 +92,51 @@ export async function stopDebugger() {
     if (get().debug.stopped && get().debug.threadId != null) await dap("continue", { threadId: get().debug.threadId }).catch(() => {});
     await dap("disconnect", { restart: false, terminateDebuggee: false });
   } catch { /* kernel may be gone */ }
-  patch({ active: false, stopped: false, frames: [], frameId: null, variables: [], scopes: [], cellFiles: {} });
+  patch({ active: false, stopped: false, frames: [], frameId: null, variables: [], scopes: [], cellFiles: {}, exceptionInfo: null });
 }
 
-async function pushBreakpoints(pathOrUri: string, lines: number[]) {
+async function pushBreakpoints(pathOrUri: string, bps: Breakpoint[]) {
   const path = pathOrUri.startsWith("/") || /^[A-Za-z]:\\/.test(pathOrUri) ? pathOrUri : uriToPath(pathOrUri);
   if (!path) return;
-  return dap("setBreakpoints", { source: { path }, breakpoints: lines.map((line) => ({ line })), sourceModified: false });
+  return dap("setBreakpoints", { source: { path }, breakpoints: bps.map((b) => ({ line: b.line, condition: b.condition || undefined, hitCondition: b.hitCondition || undefined, logMessage: b.logMessage || undefined })), sourceModified: false });
 }
 
-export function toggleBreakpoint(editorPath: string, line: number) {
+async function pushExceptionFilters() {
+  const ex = get().debug.exceptions;
+  // Inside ipykernel every exception is eventually caught by the kernel, so
+  // debugpy's "uncaught" never fires; "userUnhandled" is the notebook equivalent.
+  const filters = [...(ex.raised ? ["raised"] : []), ...(ex.uncaught ? ["userUnhandled"] : [])];
+  await dap("setExceptionBreakpoints", { filters }).catch((e) => pushConsole({ kind: "info", text: `exception breakpoints: ${e}` }));
+}
+
+export function setExceptionFilters(ex: { uncaught: boolean; raised: boolean }) {
+  patch({ exceptions: ex });
+  localStorage.setItem("pide.exceptions", JSON.stringify(ex));
+  if (get().debug.active) pushExceptionFilters();
+}
+
+function saveBreakpoints(editorPath: string, list: Breakpoint[]) {
   const bp = { ...get().debug.breakpoints };
-  const lines = new Set(bp[editorPath] ?? []);
-  if (lines.has(line)) lines.delete(line); else lines.add(line);
-  bp[editorPath] = [...lines].sort((a, b) => a - b);
-  if (!bp[editorPath].length) delete bp[editorPath];
+  if (list.length) bp[editorPath] = [...list].sort((a, b) => a.line - b.line); else delete bp[editorPath];
   patch({ breakpoints: bp });
   localStorage.setItem("pide.breakpoints", JSON.stringify(bp));
   if (get().debug.active && !editorPath.startsWith("untitled:") && !editorPath.startsWith("vscode-notebook-cell:")) pushBreakpoints(editorPath, bp[editorPath] ?? []).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
+}
+
+export function toggleBreakpoint(editorPath: string, line: number) {
+  const list = get().debug.breakpoints[editorPath] ?? [];
+  saveBreakpoints(editorPath, list.some((b) => b.line === line) ? list.filter((b) => b.line !== line) : [...list, { line }]);
+}
+
+/** Create or update a breakpoint with condition / hit count / log message. */
+export function setBreakpoint(editorPath: string, line: number, props: Omit<Breakpoint, "line">) {
+  const list = get().debug.breakpoints[editorPath] ?? [];
+  const clean = Object.fromEntries(Object.entries(props).filter(([, v]) => v && String(v).trim())) as Omit<Breakpoint, "line">;
+  saveBreakpoints(editorPath, [...list.filter((b) => b.line !== line), { line, ...clean }]);
+}
+
+export function getBreakpoint(editorPath: string, line: number): Breakpoint | undefined {
+  return get().debug.breakpoints[editorPath]?.find((b) => b.line === line);
 }
 
 export function clearBreakpoints() {
@@ -105,9 +158,9 @@ export async function debugCell(code: string, editorPath: string, startLine: num
   await startDebugger();
   if (!get().debug.active) return;
   const { sourcePath } = await dap("dumpCell", { code });
-  const lines = (get().debug.breakpoints[editorPath] ?? []).filter((l) => l >= startLine && l < startLine + code.split("\n").length).map((l) => l - startLine + 1);
+  const bps = (get().debug.breakpoints[editorPath] ?? []).filter((b) => b.line >= startLine && b.line < startLine + code.split("\n").length).map((b) => ({ ...b, line: b.line - startLine + 1 }));
   patch({ cellFiles: { ...get().debug.cellFiles, [sourcePath]: { uri: editorPath, path: uriToPath(editorPath), startLine } } });
-  await pushBreakpoints(sourcePath, lines);
+  await pushBreakpoints(sourcePath, bps);
   await execute(code, sink ? { echo: false, history: false, sink } : {});
 }
 
@@ -161,7 +214,13 @@ export async function onDebugEvent(ev: { event: string; body: any }) {
       try {
         const { stackFrames } = await dap("stackTrace", { threadId });
         const frames: Frame[] = (stackFrames as any[]).map((f) => ({ id: f.id, name: f.name, path: f.source?.path ?? null, line: f.line, column: f.column }));
-        patch({ stopped: true, threadId, reason: ev.body.reason, frames });
+        let exceptionInfo: DebugState["exceptionInfo"] = null;
+        if (ev.body.reason === "exception") {
+          const info = await dap("exceptionInfo", { threadId }).catch(() => null);
+          if (info) exceptionInfo = { id: (info.details?.typeName ?? info.exceptionId ?? "Exception").split(" ")[0], description: info.description ?? "", details: info.details?.stackTrace };
+          pushConsole({ kind: "info", text: `Stopped on exception: ${exceptionInfo?.id ?? ""} ${exceptionInfo?.description ?? ""}`.trim() });
+        }
+        patch({ stopped: true, threadId, reason: ev.body.reason, frames, exceptionInfo });
         if (frames[0]) {
           await selectFrame(frames[0].id);
           const m = editorPathFor(frames[0].path);
@@ -172,8 +231,15 @@ export async function onDebugEvent(ev: { event: string; body: any }) {
       }
       return;
     }
+    case "output": {
+      // Logpoints and debugpy messages arrive here, not on stdout.
+      const cat = ev.body?.category ?? "stdout";
+      if (cat === "telemetry" || !ev.body?.output) return;
+      pushConsole({ kind: "stream", name: cat === "stderr" ? "stderr" : "stdout", text: ev.body.output });
+      return;
+    }
     case "continued":
-      patch({ stopped: false, frames: [], frameId: null, variables: [] });
+      patch({ stopped: false, frames: [], frameId: null, variables: [], exceptionInfo: null });
       return;
     case "terminated":
     case "exited":

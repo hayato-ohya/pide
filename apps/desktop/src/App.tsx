@@ -13,6 +13,8 @@ import DiffView from "./panels/DiffView";
 import Debugger from "./panels/Debugger";
 import RemoteDialog from "./panels/RemoteDialog";
 import NotebookPanel from "./panels/Notebook";
+import BreakpointDialog from "./panels/BreakpointDialog";
+import { setExceptionFilters } from "./debug";
 import { cont, stepIn, stepOut, stepOver, stopDebugger } from "./debug";
 import EditorPanel, { activeEditorId, editors } from "./panels/Editor";
 import { complete, initKernelBridge, interrupt, restartKernel, setPython, startKernel } from "./kernel";
@@ -35,7 +37,7 @@ const components = {
 };
 
 // Dev handle for scripted UI checks (PIDE_DEV_SCRIPT).
-(window as any).pide = { formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
+(window as any).pide = { setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
 
 const STATE_LABEL: Record<string, string> = { stopped: "Kernel stopped", starting: "Starting kernel…", idle: "Ready", busy: "Busy", dead: "Kernel died" };
 
@@ -163,7 +165,11 @@ export default function App() {
             <>
               <div className="ts-group"><div className="ts-row"><button className="primary" onClick={() => active()?.debug()} title="Save and run the file under the debugger">🐞 Debug File</button><button onClick={() => active()?.debugCell()}>Debug Cell</button></div><div className="ts-label">RUN</div></div>
               <div className="ts-group"><div className="ts-row"><button disabled={!debug.stopped} onClick={cont} title="F5">▶ Continue</button><button disabled={!debug.stopped} onClick={stepOver} title="F10">⤼ Step</button><button disabled={!debug.stopped} onClick={stepIn} title="F11">⤵ Step In</button><button disabled={!debug.stopped} onClick={stepOut} title="Shift+F11">⤴ Step Out</button><button disabled={!debug.active} onClick={stopDebugger}>■ Quit Debugging</button></div><div className="ts-label">{debug.active ? (debug.stopped ? `STOPPED · ${debug.reason}` : "DEBUGGING") : "DEBUG"}</div></div>
-              <div className="ts-group"><div className="ts-row"><button onClick={() => showPanel("debugger", "debugger", "Debugger")}>Call Stack / Breakpoints</button><span className="muted">Click the editor gutter to set breakpoints</span></div><div className="ts-label">VIEW</div></div>
+              <div className="ts-group"><div className="ts-row">
+                <label className="ts-check"><input type="checkbox" checked={debug.exceptions.uncaught} onChange={(e) => setExceptionFilters({ ...debug.exceptions, uncaught: e.target.checked })} /> Uncaught</label>
+                <label className="ts-check"><input type="checkbox" checked={debug.exceptions.raised} onChange={(e) => setExceptionFilters({ ...debug.exceptions, raised: e.target.checked })} /> Raised</label>
+              </div><div className="ts-label">BREAK ON EXCEPTION</div></div>
+              <div className="ts-group"><div className="ts-row"><button onClick={() => showPanel("debugger", "debugger", "Debugger")}>Call Stack / Breakpoints</button><span className="muted">Click the gutter for a breakpoint, right-click for a condition / logpoint</span></div><div className="ts-label">VIEW</div></div>
             </>
           )}
           {tab === "view" && (
@@ -186,6 +192,7 @@ export default function App() {
         </div>
       </div>
       {remoteDlg && <RemoteDialog onClose={() => setRemoteDlg(false)} />}
+      <BreakpointDialog />
       <div className="dock">
         <DockviewReact components={components} onReady={onReady} theme={theme === "dark" ? themeDark : themeLight} />
       </div>

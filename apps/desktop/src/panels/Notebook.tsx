@@ -6,10 +6,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { marked } from "marked";
 import { execute, interrupt, type OutputItem } from "../kernel";
-import { pushConsole, useStore } from "../store";
+import { pushConsole, set as setStore, useStore } from "../store";
 import { Output, ansi } from "./Console";
 import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, syncNotebookStructure } from "../lsp";
-import { debugCell, editorPathFor, toggleBreakpoint } from "../debug";
+import { debugCell, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
+import { bpTitle } from "./Editor";
 
 // ------------------------------------------------------------ nbformat --
 
@@ -132,7 +133,7 @@ function CodeEditor({ uri, value, theme, onChange, onMount, focused }: { uri: st
     const e = ed.current;
     if (!e) return;
     bpDec.current ??= e.createDecorationsCollection();
-    bpDec.current.set((bpLines ?? []).map((l) => ({ range: new monaco.Range(l, 1, l, 1), options: { glyphMarginClassName: "bp-glyph" } })));
+    bpDec.current.set((bpLines ?? []).map((b: Breakpoint) => ({ range: new monaco.Range(b.line, 1, b.line, 1), options: { glyphMarginClassName: b.logMessage ? "bp-glyph log" : b.condition || b.hitCondition ? "bp-glyph cond" : "bp-glyph", glyphMarginHoverMessage: { value: bpTitle(b) } } })));
   }, [bpLines, h]);
   useEffect(() => {
     const e = ed.current;
@@ -149,7 +150,9 @@ function CodeEditor({ uri, value, theme, onChange, onMount, focused }: { uri: st
     editor.onDidContentSizeChange(resize);
     resize();
     editor.onMouseDown((ev) => {
-      if (ev.target.type === m.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && ev.target.position) toggleBreakpoint(uri, ev.target.position.lineNumber);
+      if (ev.target.type !== m.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || !ev.target.position) return;
+      if (ev.event.rightButton || ev.event.altKey) setStore({ bpEdit: { uri, line: ev.target.position.lineNumber } });
+      else toggleBreakpoint(uri, ev.target.position.lineNumber);
     });
     onMount(editor);
     if (focused) editor.focus();

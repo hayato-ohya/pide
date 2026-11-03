@@ -335,3 +335,14 @@ select option { background: var(--panel); color: var(--text); }
 .git-net button { font-size: 11px; padding: 2px 7px; border: 1px solid var(--border); background: var(--panel-alt); border-radius: 3px; cursor: pointer; white-space: nowrap; }
 .git-net button:disabled { opacity: 0.45; cursor: default; }
 .git-head { flex-wrap: wrap; }
+
+/* conditional breakpoints / exceptions */
+.bp-glyph.cond, .bp-dot.cond { background: #e0a800; }
+.bp-glyph.log, .bp-dot.log { background: #2b9bd1; border-radius: 2px; }
+.bp-meta { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%; }
+.dbg-ex { display: flex; flex-direction: column; gap: 2px; padding: 4px 8px; }
+.dbg-exinfo { margin: 4px 8px; padding: 6px 8px; border-left: 3px solid var(--error); background: var(--removed-bg); font-family: var(--mono); font-size: 12px; }
+.dbg-exid { font-weight: 700; color: var(--error); }
+.dbg-exinfo pre { margin: 4px 0 0; white-space: pre-wrap; max-height: 160px; overflow: auto; font-size: 11px; }
+.ts-check { display: flex; align-items: center; gap: 4px; padding: 0 4px; }
+.modal button.danger { color: var(--error); }
