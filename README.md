@@ -51,6 +51,7 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 - 言語サーバーの Rust ホスト(`apps/desktop/src-tauri/src/lsp.rs`): stdio の JSON-RPC を中継する汎用実装
 - basedpyright: 補完(resolve 付き)、ホバー、シグネチャヘルプ、定義ジャンプ(別ファイルは新しいタブで開く)、診断
 - ruff: lint 診断、整形(Shift+Alt+F または EDITOR タブの Format)
+- linter / formatter の切替(EDITOR タブまたは VIEW タブの「⚙ Linter / Formatter…」): linter は ruff / flake8 / pylint / none、formatter は ruff / black / autopep8 / none。追加引数と行長も指定できる。ruff 以外は LSP を話さないので、インタープリタの環境(なければ PATH)のコマンドを標準入力で実行して結果を取り込む(入力後 0.6 秒で再 lint)。ノートブックのセルにも適用。pyright の型診断は常に有効
 - サーバーはカーネルのインタープリタと同じ環境から探す(`pip install basedpyright ruff`)。見つからなければコンソールに案内を出す。ステータスバー右端に稼働状態を表示
 - ホームディレクトリやルートが作業フォルダのときはワークスペースなしで起動(全ファイル走査を避ける)
 - Command Window の Tab 補完(カーネルの `complete_request`。候補が複数なら選択ポップアップ)

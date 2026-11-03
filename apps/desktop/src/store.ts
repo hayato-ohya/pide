@@ -24,6 +24,7 @@ export interface State {
   inputRequest: { parent: any; prompt: string; password: boolean } | null;
   execCount: number;
   lsp: Record<string, string>;
+  tools: import("./tools").ToolSettings;
   themePref: "light" | "dark" | "system";
   theme: "light" | "dark";
   debug: import("./debug").DebugState;
@@ -53,6 +54,7 @@ let state: State = {
   inputRequest: null,
   execCount: 0,
   lsp: {},
+  tools: (() => { try { return { linter: "ruff", formatter: "ruff", linterArgs: "", formatterArgs: "", lineLength: 88, ...JSON.parse(localStorage.getItem("pide.tools") ?? "{}") }; } catch { return { linter: "ruff", formatter: "ruff", linterArgs: "", formatterArgs: "", lineLength: 88 }; } })(),
   themePref: "system",
   theme: "light",
   git: { status: null, log: [], error: null },

@@ -3,6 +3,7 @@ import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import type { IDockviewPanelProps } from "dockview";
 import { readText, savePath, writeText } from "../fs";
+import { scheduleLint } from "../tools";
 import { execute } from "../kernel";
 import { pushConsole, useStore } from "../store";
 import { debugCell, debugFile, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
@@ -130,11 +131,14 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     editor.addCommand(m.KeyCode.F9, () => editors.get(id)?.runCell());
     editor.addCommand(m.KeyMod.Shift | m.KeyMod.Alt | m.KeyCode.KeyF, () => editors.get(id)?.format());
     openDocument(uri, editor.getValue());
+    const lint = () => { const model = editor.getModel(); if (model) scheduleLint(m, model, path?.split("/").pop() ?? "untitled.py"); };
+    lint();
     let timer: ReturnType<typeof setTimeout> | null = null;
     editor.onDidChangeModelContent(() => {
       setDirty(true);
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => changeDocument(uri, editor.getValue()), 150);
+      lint();
     });
     // Highlight `# %%` cell separators like MATLAB sections.
     const dec = editor.createDecorationsCollection();

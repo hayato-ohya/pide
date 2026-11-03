@@ -10,6 +10,7 @@ import { Output, ansi } from "./Console";
 import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, syncNotebookStructure } from "../lsp";
 import { debugCell, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
 import { bpTitle } from "./Editor";
+import { scheduleLint } from "../tools";
 
 // ------------------------------------------------------------ nbformat --
 
@@ -344,7 +345,9 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const onEditorMount = (id: string) => (editor: monaco.editor.IStandaloneCodeEditor) => {
     editors.current.set(id, editor);
     let timer: ReturnType<typeof setTimeout> | null = null;
-    editor.onDidChangeModelContent(() => { if (timer) clearTimeout(timer); timer = setTimeout(() => changeNotebookCell(nbUri, cellUri(id), editor.getValue()), 150); });
+    const lint = () => { const model = editor.getModel(); if (model) scheduleLint(monaco, model, "cell.py"); };
+    lint();
+    editor.onDidChangeModelContent(() => { if (timer) clearTimeout(timer); timer = setTimeout(() => changeNotebookCell(nbUri, cellUri(id), editor.getValue()), 150); lint(); });
     editor.onDidFocusEditorText(() => setSel(id));
     editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => runCell(id, true));
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCell(id, false));

@@ -457,6 +457,7 @@ pub fn run() {
             lsp::lsp_send,
             lsp::lsp_stop,
             lsp::lsp_check,
+            lsp::run_tool,
             git::git_status,
             git::git_log,
             git::git_diff,

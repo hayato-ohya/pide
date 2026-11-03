@@ -14,6 +14,7 @@ import Debugger from "./panels/Debugger";
 import RemoteDialog from "./panels/RemoteDialog";
 import NotebookPanel from "./panels/Notebook";
 import BreakpointDialog from "./panels/BreakpointDialog";
+import ToolsDialog from "./panels/ToolsDialog";
 import { setExceptionFilters } from "./debug";
 import { cont, stepIn, stepOut, stepOver, stopDebugger } from "./debug";
 import EditorPanel, { activeEditorId, editors } from "./panels/Editor";
@@ -37,7 +38,7 @@ const components = {
 };
 
 // Dev handle for scripted UI checks (PIDE_DEV_SCRIPT).
-(window as any).pide = { setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
+(window as any).pide = { saveToolSettings: (t: any) => import("./tools").then((m) => m.saveToolSettings(t)), startLsp: () => import("./lsp").then((l) => l.startLsp()), setBreakpoint: (u: string, l: number, p: any) => import("./debug").then((d) => d.setBreakpoint(u, l, p)), formatDocument: (u: string, t: string) => import("./lsp").then((l) => l.formatDocument(u, t)), execute: (c: string) => import("./kernel").then((k) => k.execute(c)), setRemote: (r: any) => import("./kernel").then((k) => k.setRemote(r)), restartKernel, openFile, openVariable, plotVariable, dockApi, set, complete, pushConsole, isStopped: () => get().debug.stopped, state: () => get(), debug: () => import("./debug"), plotExprs: (e: string[], k: PlotKind) => import("./plots").then((p) => p.plotExprs(e, k)) };
 
 const STATE_LABEL: Record<string, string> = { stopped: "Kernel stopped", starting: "Starting kernel…", idle: "Ready", busy: "Busy", dead: "Kernel died" };
 
@@ -58,6 +59,8 @@ export default function App() {
   const themePref = useStore((s) => s.themePref);
   const connectionFile = useStore((s) => s.connectionFile);
   const [remoteDlg, setRemoteDlg] = useState(false);
+  const [toolsDlg, setToolsDlg] = useState(false);
+  const tools = useStore((s) => s.tools);
   const apiRef = useRef<DockviewApi | null>(null);
 
   useEffect(() => {
@@ -159,7 +162,10 @@ export default function App() {
             </>
           )}
           {tab === "editor" && (
-            <div className="ts-group"><div className="ts-row"><button onClick={() => active()?.run()}>▶ Run (F5)</button><button onClick={() => active()?.runCell()}>Run Section (Ctrl+Enter)</button><button onClick={() => active()?.save()}>Save (Ctrl+S)</button><button onClick={() => active()?.format()} title="ruff format">Format (Shift+Alt+F)</button></div><div className="ts-label">EDITOR</div></div>
+            <>
+            <div className="ts-group"><div className="ts-row"><button onClick={() => active()?.run()}>▶ Run (F5)</button><button onClick={() => active()?.runCell()}>Run Section (Ctrl+Enter)</button><button onClick={() => active()?.save()}>Save (Ctrl+S)</button><button onClick={() => active()?.format()} title={`format with ${tools.formatter}`}>Format (Shift+Alt+F)</button></div><div className="ts-label">EDITOR</div></div>
+            <div className="ts-group"><div className="ts-row"><button onClick={() => setToolsDlg(true)}>⚙ Linter / Formatter…</button><span className="muted">{tools.linter} · {tools.formatter}</span></div><div className="ts-label">TOOLS</div></div>
+            </>
           )}
           {tab === "debug" && (
             <>
@@ -184,6 +190,7 @@ export default function App() {
                 <button onClick={() => showPanel("figures", "figures", "Figures")}>Figures</button>
               </div><div className="ts-label">PANELS</div></div>
               <div className="ts-group"><div className="ts-row"><button onClick={() => apiRef.current && buildDefaultLayout(apiRef.current)}>Default Layout</button></div><div className="ts-label">LAYOUT</div></div>
+              <div className="ts-group"><div className="ts-row"><button onClick={() => setToolsDlg(true)}>⚙ Linter / Formatter…</button></div><div className="ts-label">TOOLS</div></div>
               <div className="ts-group"><div className="ts-row">
                 {(["light", "dark", "system"] as const).map((t) => <button key={t} className={themePref === t ? "primary" : ""} onClick={() => applyTheme(t)}>{t === "light" ? "☀ Light" : t === "dark" ? "☾ Dark" : "⟳ System"}</button>)}
               </div><div className="ts-label">THEME</div></div>
@@ -193,6 +200,7 @@ export default function App() {
       </div>
       {remoteDlg && <RemoteDialog onClose={() => setRemoteDlg(false)} />}
       <BreakpointDialog />
+      {toolsDlg && <ToolsDialog onClose={() => setToolsDlg(false)} />}
       <div className="dock">
         <DockviewReact components={components} onReady={onReady} theme={theme === "dark" ? themeDark : themeLight} />
       </div>

@@ -195,3 +195,37 @@ pub async fn lsp_check(app: AppHandle, state: tauri::State<'_, LspState>) -> Res
     }
     Ok(dead)
 }
+
+
+/// Run a CLI tool (flake8, black, ...) found next to the interpreter or on
+/// PATH, feeding `stdin`; used for linters/formatters that do not speak LSP.
+#[derive(Serialize)]
+pub struct ToolResult {
+    pub found: bool,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[tauri::command]
+pub async fn run_tool(python: String, tool: String, args: Vec<String>, stdin: String, cwd: Option<String>) -> Result<ToolResult, String> {
+    use tokio::io::AsyncWriteExt;
+    let Some(bin) = find_near(&python, &[tool.as_str()]) else {
+        return Ok(ToolResult { found: false, code: None, stdout: String::new(), stderr: format!("{tool} not found for {python}") });
+    };
+    let mut c = Command::new(&bin);
+    c.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+        c.current_dir(d);
+    }
+    let mut child = c.spawn().map_err(|e| format!("{tool}: {e}"))?;
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(stdin.as_bytes()).await;
+        drop(si);
+    }
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+        .await
+        .map_err(|_| format!("{tool} timed out"))?
+        .map_err(|e| e.to_string())?;
+    Ok(ToolResult { found: true, code: out.status.code(), stdout: String::from_utf8_lossy(&out.stdout).into(), stderr: String::from_utf8_lossy(&out.stderr).into() })
+}

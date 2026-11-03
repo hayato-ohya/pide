@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type * as Monaco from "monaco-editor";
 import { get, pushConsole, set } from "./store";
+import { formatWithTool, toolSettings } from "./tools";
 
 type Json = any;
 export type ServerName = "pyright" | "ruff";
@@ -161,7 +162,10 @@ export async function startLsp() {
   const missing: string[] = [];
   if (det.pyright) clients.set("pyright", new LspClient("pyright", det.pyright, ["--stdio"]));
   else missing.push("basedpyright");
-  if (det.ruff) clients.set("ruff", new LspClient("ruff", det.ruff, ["server"]));
+  const t = toolSettings();
+  const needRuff = t.linter === "ruff" || t.formatter === "ruff";
+  if (!needRuff) { /* ruff not selected */ }
+  else if (det.ruff) clients.set("ruff", new LspClient("ruff", det.ruff, ["server"]));
   else missing.push("ruff");
   if (missing.length) pushConsole({ kind: "info", text: `Language tools not found for ${python}: ${missing.join(", ")}. Install with: pip install ${missing.join(" ")}` });
   publishStatus();
@@ -244,8 +248,11 @@ export function closeNotebookDoc(uri: string) {
 
 /** Format one document (file or notebook cell) with ruff; returns the new text or null. */
 export async function formatDocument(uri: string, text: string): Promise<string | null> {
+  const fmt = toolSettings().formatter;
+  if (fmt === "none") return null;
+  if (fmt !== "ruff") return formatWithTool(text, uri.split("/").pop()?.split("#")[0] || "cell.py");
   const c = clients.get("ruff");
-  if (!c || c.state !== "running") return null;
+  if (!c || c.state !== "running") { pushConsole({ kind: "info", text: "ruff server is not running (install ruff in the kernel's environment)." }); return null; }
   const edits = await c.request("textDocument/formatting", { textDocument: { uri }, options: { tabSize: 4, insertSpaces: true } }).catch(() => null);
   if (!edits || !Array.isArray(edits) || !edits.length) return null;
   // Apply LSP text edits (line/character offsets) to the string, last edit first.
@@ -262,6 +269,7 @@ export async function formatDocument(uri: string, text: string): Promise<string 
 function setDiagnostics(owner: string, uri: string, diags: Json[]) {
   const monaco = monacoRef;
   if (!monaco) return;
+  if (owner === "ruff" && toolSettings().linter !== "ruff") diags = []; // ruff kept only for formatting
   const model = monaco.editor.getModel(monaco.Uri.parse(uri));
   if (!model) return;
   const sev: Record<number, Monaco.MarkerSeverity> = { 1: monaco.MarkerSeverity.Error, 2: monaco.MarkerSeverity.Warning, 3: monaco.MarkerSeverity.Info, 4: monaco.MarkerSeverity.Hint };
@@ -383,6 +391,12 @@ function registerProviders(monaco: typeof Monaco) {
 
   monaco.languages.registerDocumentFormattingEditProvider("python", {
     async provideDocumentFormattingEdits(model) {
+      const fmt = toolSettings().formatter;
+      if (fmt !== "ruff") {
+        if (fmt === "none") return [];
+        const out = await formatWithTool(model.getValue(), model.uri.path.split("/").pop() || "file.py");
+        return out === null ? [] : [{ range: model.getFullModelRange(), text: out }];
+      }
       const c = ruff();
       if (!c) return [];
       const r = await c.request("textDocument/formatting", { textDocument: { uri: model.uri.toString() }, options: { tabSize: 4, insertSpaces: true } }).catch(() => null);
