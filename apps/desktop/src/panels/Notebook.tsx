@@ -162,6 +162,34 @@ function CodeEditor({ uri, value, theme, onChange, onMount, focused }: { uri: st
   );
 }
 
+/** Markdown cell in edit mode: Monaco on the left, live preview on the right. */
+function MarkdownEditor({ value, theme, onChange, onDone, onMount, render }: { value: string; theme: string; onChange: (v: string) => void; onDone: () => void; onMount: (e: monaco.editor.IStandaloneCodeEditor) => void; render: (src: string) => { __html: string } }) {
+  const [h, setH] = useState(Math.max(3, value.split("\n").length) * LINE_H + 12);
+  const [split, setSplit] = useState<boolean>(() => localStorage.getItem("pide.nb.mdsplit") !== "0");
+  const mount: OnMount = (editor, m) => {
+    const resize = () => setH(Math.max(3 * LINE_H, editor.getContentHeight()) + 12);
+    editor.onDidContentSizeChange(resize);
+    resize();
+    editor.addCommand(m.KeyMod.Shift | m.KeyCode.Enter, onDone);
+    editor.addCommand(m.KeyCode.Escape, onDone);
+    onMount(editor);
+    editor.focus();
+  };
+  return (
+    <div className={`nb-md-split ${split ? "" : "single"}`}>
+      <div className="nb-md-pane" style={{ height: h }}>
+        <MonacoEditor language="markdown" theme={theme} value={value} onChange={(v) => onChange(v ?? "")} onMount={mount}
+          options={{ fontSize: 13, minimap: { enabled: false }, lineNumbers: "off", glyphMargin: false, folding: false, scrollBeyondLastLine: false, scrollbar: { vertical: "hidden", horizontal: "auto", alwaysConsumeMouseWheel: false }, overviewRulerLanes: 0, renderLineHighlight: "none", automaticLayout: true, lineDecorationsWidth: 8, lineNumbersMinChars: 0, wordWrap: "on", quickSuggestions: false }} />
+      </div>
+      {split && <div className="nb-md nb-md-preview" dangerouslySetInnerHTML={render(value || "*(empty)*")} />}
+      <div className="nb-md-tools">
+        <button title={split ? "Hide preview" : "Show preview"} onClick={() => { setSplit(!split); localStorage.setItem("pide.nb.mdsplit", split ? "0" : "1"); }}>{split ? "◧" : "▭"}</button>
+        <button title="Done (Shift+Enter / Esc)" onClick={onDone}>✓</button>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------- panel --
 
 export default function NotebookPanel(props: IDockviewPanelProps<{ path: string | null }>) {
@@ -228,7 +256,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const runCell = async (id: string, advance = false) => {
     const cell = nbRef.current?.cells.find((c) => c.id === id);
     if (!cell) return;
-    if (cell.cell_type === "markdown") { patchCell(id, { editing: false }, false); if (advance) selectNext(id); return; }
+    if (cell.cell_type === "markdown") { patchCell(id, { source: editors.current.get(id)?.getValue() ?? cell.source, editing: false }, false); if (advance) selectNext(id); return; }
     const code = editors.current.get(id)?.getValue() ?? cell.source;
     patchCell(id, { source: code, outputs: [], running: true, execution_count: null });
     if (advance) selectNext(id, true);
@@ -365,8 +393,13 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
             <div className="nb-body">
               {c.cell_type === "code" ? (
                 <CodeEditor uri={cellUri(c.id)} value={c.source} theme={monacoTheme} focused={sel === c.id} onChange={(v) => patchCell(c.id, { source: v })} onMount={onEditorMount(c.id)} />
+              ) : c.cell_type === "markdown" && (c.editing || !c.source.trim()) ? (
+                <MarkdownEditor value={c.source} theme={monacoTheme} render={md}
+                  onChange={(v) => patchCell(c.id, { source: v })}
+                  onMount={(e) => editors.current.set(c.id, e)}
+                  onDone={() => { patchCell(c.id, { editing: false }, false); if (nbRef.current?.cells.find((x) => x.id === c.id)?.source.trim()) selectNext(c.id, true); }} />
               ) : c.editing || !c.source.trim() ? (
-                <textarea className="nb-md-edit" value={c.source} autoFocus placeholder={c.cell_type === "markdown" ? "Markdown… (Shift+Enter to render)" : "Raw cell"} rows={Math.max(2, c.source.split("\n").length)}
+                <textarea className="nb-md-edit" value={c.source} autoFocus placeholder="Raw cell" rows={Math.max(2, c.source.split("\n").length)}
                   onChange={(e) => patchCell(c.id, { source: e.target.value })}
                   onKeyDown={(e) => { if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); patchCell(c.id, { editing: false }, false); selectNext(c.id, true); } }} />
               ) : (

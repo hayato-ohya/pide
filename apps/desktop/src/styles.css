@@ -321,3 +321,12 @@ select option { background: var(--panel); color: var(--text); }
 .nb-collapsed:hover { background: var(--hover); }
 .nb-long { max-height: 320px; overflow: auto; }
 .nb-long-note { position: sticky; top: 0; z-index: 1; background: var(--header); color: var(--muted); font-size: 11px; padding: 2px 6px; cursor: pointer; border-bottom: 1px solid var(--border-soft); }
+
+/* markdown split editor */
+.nb-md-split { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; position: relative; }
+.nb-md-split.single { grid-template-columns: 1fr; }
+.nb-md-pane .monaco-editor { border: 1px solid var(--border-soft); }
+.nb-md-preview { border: 1px dashed var(--border-soft); min-height: 40px; overflow: auto; }
+.nb-md-tools { position: absolute; right: 4px; top: -22px; display: flex; gap: 2px; }
+.nb-md-tools button { border: 1px solid var(--border); background: var(--panel-alt); border-radius: 3px; cursor: pointer; font-size: 11px; padding: 0 6px; }
+.nb-cell.markdown { padding-top: 10px; }

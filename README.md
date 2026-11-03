@@ -93,7 +93,7 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 ## ノートブック(.ipynb)
 
 - Current Folder や Open… から .ipynb を開くとノートブックパネルになる。HOME の「New Notebook」で新規作成
-- コードセルは Monaco(高さ自動)、Markdown セルはレンダリング表示(ダブルクリックで編集、Shift+Enter で確定)
+- コードセルは Monaco(高さ自動)。Markdown セルはレンダリング表示で、ダブルクリックすると左に Monaco(Markdown)、右にライブプレビューの分割編集になる(◧ でプレビュー切替、Shift+Enter / Esc / ✓ で確定)
 - Shift+Enter(実行して次へ、末尾なら新規セル)、Cmd+Enter(実行)、Alt+Enter(実行して下に挿入)、Cmd+S(保存)。ツールバーに Run All / Run Above / 移動 / 削除 / 種別変更 / Clear Outputs
 - 出力はセルに表示し、画像は Figures パネルにも流す。実行後は Workspace も更新される
 - nbformat 4 で保存(cell id、出力、実行番号を保持)。Git パネルのセル単位差分と組み合わせて使える
@@ -111,7 +111,6 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 
 - Git の fetch / push / pull、コンフリクト解決の支援
 - 条件付きブレークポイント、例外で停止
-- ノートブック: Markdown のプレビュー同時編集
 - リモートファイルのブラウズ(現状 Current Folder はローカルのみ)
 - 配布ビルド(`npm run tauri build`)とコード署名
 
