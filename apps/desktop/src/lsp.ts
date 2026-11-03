@@ -242,6 +242,21 @@ export function closeNotebookDoc(uri: string) {
   if (monacoRef) for (const x of nb.cells) { const m = monacoRef.editor.getModel(monacoRef.Uri.parse(x.uri)); if (m) for (const owner of ["pyright", "ruff"]) monacoRef.editor.setModelMarkers(m, owner, []); }
 }
 
+/** Format one document (file or notebook cell) with ruff; returns the new text or null. */
+export async function formatDocument(uri: string, text: string): Promise<string | null> {
+  const c = clients.get("ruff");
+  if (!c || c.state !== "running") return null;
+  const edits = await c.request("textDocument/formatting", { textDocument: { uri }, options: { tabSize: 4, insertSpaces: true } }).catch(() => null);
+  if (!edits || !Array.isArray(edits) || !edits.length) return null;
+  // Apply LSP text edits (line/character offsets) to the string, last edit first.
+  const lines = text.split("\n");
+  const offset = (p: { line: number; character: number }) => lines.slice(0, p.line).reduce((n, l) => n + l.length + 1, 0) + p.character;
+  const sorted = [...edits].sort((a, b) => offset(b.range.start) - offset(a.range.start));
+  let out = text;
+  for (const e of sorted) out = out.slice(0, offset(e.range.start)) + e.newText + out.slice(offset(e.range.end));
+  return out;
+}
+
 // ------------------------------------------------------------ diagnostics --
 
 function setDiagnostics(owner: string, uri: string, diags: Json[]) {

@@ -99,6 +99,8 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 - nbformat 4 で保存(cell id、出力、実行番号を保持)。Git パネルのセル単位差分と組み合わせて使える
 - LSP: `notebookDocument` 同期でセルを 1 つの名前空間として扱う(別セルで定義した変数の補完、ホバー、診断)。セルの URI は VS Code 互換の `vscode-notebook-cell:<path>#<cellId>`
 - デバッグ: セルの左余白でブレークポイント、ツールバーの 🐞 Debug でそのセルをデバッガ下で実行。停止行の表示、ステップ、Workspace のフレーム変数は .py と同じ
+- 整形: ツールバーの Format(選択セル、Shift+Alt+F)/ Format All で ruff 整形
+- 出力の折りたたみ: 出力左上の ▾ か Cmd+O でセルごとに折りたたみ、⇕ Outputs で一括。40 行を超える出力は自動的に高さ制限(クリックで全表示)。折りたたみ状態は `metadata.collapsed` / `jupyter.outputs_hidden` として保存(Jupyter 互換)
 - 実行 ID はフロントエンドで生成し、出力ハンドラを登録してから送信する(出力の取りこぼし防止)
 
 ## テーマ
@@ -109,7 +111,7 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 
 - Git の fetch / push / pull、コンフリクト解決の支援
 - 条件付きブレークポイント、例外で停止
-- ノートブック: セル単位の ruff 整形、出力の折りたたみ、Markdown のプレビュー同時編集
+- ノートブック: Markdown のプレビュー同時編集
 - リモートファイルのブラウズ(現状 Current Folder はローカルのみ)
 - 配布ビルド(`npm run tauri build`)とコード署名
 

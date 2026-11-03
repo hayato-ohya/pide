@@ -313,3 +313,11 @@ select option { background: var(--panel); color: var(--text); }
 .nb-raw pre { margin: 0; padding: 6px; font: 12.5px var(--mono); color: var(--muted); }
 .nb-add { text-align: center; color: var(--muted); padding: 8px; cursor: pointer; border: 1px dashed var(--border-soft); margin-top: 8px; }
 .nb-add:hover { background: var(--hover); }
+
+.nb-outputs { position: relative; }
+.nb-collapse { position: absolute; left: -22px; top: 4px; border: none; background: none; color: var(--muted); cursor: pointer; font-size: 11px; opacity: 0; }
+.nb-cell:hover .nb-collapse, .nb-cell.selected .nb-collapse { opacity: 1; }
+.nb-collapsed { color: var(--muted); font-style: italic; cursor: pointer; padding: 3px 6px; }
+.nb-collapsed:hover { background: var(--hover); }
+.nb-long { max-height: 320px; overflow: auto; }
+.nb-long-note { position: sticky; top: 0; z-index: 1; background: var(--header); color: var(--muted); font-size: 11px; padding: 2px 6px; cursor: pointer; border-bottom: 1px solid var(--border-soft); }

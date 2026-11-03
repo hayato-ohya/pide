@@ -8,7 +8,7 @@ import { marked } from "marked";
 import { execute, interrupt, type OutputItem } from "../kernel";
 import { pushConsole, useStore } from "../store";
 import { Output, ansi } from "./Console";
-import { changeNotebookCell, closeNotebookDoc, openNotebookDoc, syncNotebookStructure } from "../lsp";
+import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, syncNotebookStructure } from "../lsp";
 import { debugCell, editorPathFor, toggleBreakpoint } from "../debug";
 
 // ------------------------------------------------------------ nbformat --
@@ -30,6 +30,8 @@ interface Cell {
   /** UI only */
   editing?: boolean;
   running?: boolean;
+  /** Output collapsed (persisted as metadata.collapsed + jupyter.outputs_hidden). */
+  collapsed?: boolean;
 }
 
 interface Notebook { cells: Cell[]; metadata: Mime; nbformat: number; nbformat_minor: number }
@@ -46,6 +48,7 @@ function parseNotebook(text: string): Notebook {
     source: joinSrc(c.source),
     metadata: c.metadata ?? {},
     execution_count: c.execution_count ?? null,
+    collapsed: !!(c.metadata?.collapsed || c.metadata?.jupyter?.outputs_hidden),
     outputs: (c.outputs ?? []).map((o: any) => (o.output_type === "stream" ? { ...o, text: joinSrc(o.text) } : o.output_type === "error" ? o : { ...o, data: Object.fromEntries(Object.entries(o.data ?? {}).map(([k, v]) => [k, k.startsWith("image/") || k === "application/json" ? (Array.isArray(v) ? v.join("") : v) : joinSrc(v)])) })),
   }));
   if (!cells.length) cells.push({ id: uid(), cell_type: "code", source: "", metadata: {}, execution_count: null, outputs: [] });
@@ -54,7 +57,12 @@ function parseNotebook(text: string): Notebook {
 
 function serializeNotebook(nb: Notebook): string {
   const cells = nb.cells.map((c) => {
-    const base: any = { cell_type: c.cell_type, id: c.id, metadata: c.metadata, source: splitSrc(c.source) };
+    const metadata: any = { ...c.metadata };
+    if (c.cell_type === "code") {
+      if (c.collapsed) { metadata.collapsed = true; metadata.jupyter = { ...(metadata.jupyter ?? {}), outputs_hidden: true }; }
+      else { delete metadata.collapsed; if (metadata.jupyter) { delete metadata.jupyter.outputs_hidden; if (!Object.keys(metadata.jupyter).length) delete metadata.jupyter; } }
+    }
+    const base: any = { cell_type: c.cell_type, id: c.id, metadata, source: splitSrc(c.source) };
     if (c.cell_type === "code") {
       base.execution_count = c.execution_count ?? null;
       base.outputs = (c.outputs ?? []).map((o) => {
@@ -87,10 +95,22 @@ function applyOutput(outputs: NbOutput[], it: OutputItem): NbOutput[] {
 
 // --------------------------------------------------------------- cells --
 
-function CellOutputs({ outputs }: { outputs: NbOutput[] }) {
+const AUTO_COLLAPSE_LINES = 40;
+function outputLines(outputs: NbOutput[]) {
+  return outputs.reduce((n, o) => n + (o.output_type === "stream" ? o.text.split("\n").length : o.output_type === "error" ? o.traceback.length : 1), 0);
+}
+
+function CellOutputs({ outputs, collapsed, onToggle }: { outputs: NbOutput[]; collapsed: boolean; onToggle: () => void }) {
+  const [expandedLong, setExpandedLong] = useState(false);
+  const lines = useMemo(() => outputLines(outputs), [outputs]);
   if (!outputs.length) return null;
+  const long = lines > AUTO_COLLAPSE_LINES && !expandedLong;
+  const summary = outputs.map((o) => (o.output_type === "stream" ? o.name : o.output_type === "error" ? `error: ${o.ename}` : o.output_type === "execute_result" ? "result" : Object.keys(o.data).some((k) => k.startsWith("image/")) ? "image" : "display")).join(", ");
+  if (collapsed) return <div className="nb-outputs nb-collapsed" onClick={onToggle} title="Click to expand outputs">▸ {outputs.length} output{outputs.length > 1 ? "s" : ""} hidden ({summary})</div>;
   return (
-    <div className="nb-outputs">
+    <div className={`nb-outputs ${long ? "nb-long" : ""}`}>
+      <button className="nb-collapse" onClick={onToggle} title="Collapse outputs">▾</button>
+      {long && <div className="nb-long-note" onClick={() => setExpandedLong(true)}>{lines} lines · click to show all</div>}
       {outputs.map((o, i) => {
         if (o.output_type === "stream") return <pre key={i} className={`c-stream ${o.name}`} dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(o.text) }} />;
         if (o.output_type === "error") return <pre key={i} className="c-error" dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(o.traceback.join("\n") || `${o.ename}: ${o.evalue}`) }} />;
@@ -235,6 +255,26 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
       patchCell(id, { running: false }, false);
     }
   };
+  const formatCellById = async (id: string) => {
+    const cell = nbRef.current?.cells.find((c) => c.id === id);
+    if (!cell || cell.cell_type !== "code") return false;
+    const editor = editors.current.get(id);
+    const text = editor?.getValue() ?? cell.source;
+    const out = await formatDocument(cellUri(id), text);
+    if (out === null || out === text) return false;
+    // Keep the cell's trailing newline policy consistent (ruff emits one).
+    const next = out.replace(/\n$/, "");
+    if (editor) { const m = editor.getModel()!; editor.executeEdits("ruff", [{ range: m.getFullModelRange(), text: next }]); editor.pushUndoStop(); }
+    patchCell(id, { source: next });
+    return true;
+  };
+  const formatAll = async () => {
+    let n = 0;
+    for (const c of nbRef.current?.cells ?? []) if (await formatCellById(c.id)) n++;
+    pushConsole({ kind: "info", text: n ? `ruff: formatted ${n} cell${n > 1 ? "s" : ""}` : "ruff: nothing to change" });
+  };
+  const toggleAllOutputs = () => { const anyOpen = (nbRef.current?.cells ?? []).some((c) => c.cell_type === "code" && (c.outputs?.length ?? 0) > 0 && !c.collapsed); update((n) => ({ ...n, cells: n.cells.map((c) => (c.cell_type === "code" ? { ...c, collapsed: anyOpen } : c)) })); };
+
   const runAll = async () => { for (const c of nbRef.current?.cells ?? []) await runCell(c.id); };
   const runAbove = async (id: string) => { for (const c of nbRef.current?.cells ?? []) { if (c.id === id) break; await runCell(c.id); } };
 
@@ -280,6 +320,8 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCell(id, false));
     editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.Enter, () => { runCell(id, false); addCell("code", id, "below"); });
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => doSave());
+    editor.addCommand(monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF, () => formatCellById(id));
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, () => { const c = nbRef.current?.cells.find((x) => x.id === id); if (c) patchCell(id, { collapsed: !c.collapsed }); });
   };
 
   const md = useMemo(() => (src: string) => ({ __html: marked.parse(src, { async: false }) as string }), []);
@@ -305,6 +347,10 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
           <option value="code">Code</option><option value="markdown">Markdown</option><option value="raw">Raw</option>
         </select>
         <span className="sep" />
+        <button onClick={() => sel && formatCellById(sel)} title="ruff format this cell (Shift+Alt+F)">Format</button>
+        <button onClick={formatAll} title="ruff format every code cell">Format All</button>
+        <span className="sep" />
+        <button onClick={toggleAllOutputs} title="Collapse / expand all outputs (Cmd+O toggles the current cell)">⇕ Outputs</button>
         <button onClick={clearAll}>Clear Outputs</button>
         <button onClick={doSave} title="Cmd+S">Save</button>
         <span className="muted nb-count">{nb.cells.length} cells</span>
@@ -326,7 +372,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
               ) : (
                 <div className={c.cell_type === "markdown" ? "nb-md" : "nb-raw"} onDoubleClick={() => patchCell(c.id, { editing: true }, false)} dangerouslySetInnerHTML={c.cell_type === "markdown" ? md(c.source) : { __html: `<pre>${c.source.replace(/</g, "&lt;")}</pre>` }} />
               )}
-              {c.cell_type === "code" && <CellOutputs outputs={c.outputs ?? []} />}
+              {c.cell_type === "code" && <CellOutputs outputs={c.outputs ?? []} collapsed={!!c.collapsed} onToggle={() => patchCell(c.id, { collapsed: !c.collapsed })} />}
             </div>
           </div>
         ))}
