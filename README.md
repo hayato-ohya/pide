@@ -92,6 +92,7 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 - 鍵認証が必要(BatchMode)。ssh コマンドは `PIDE_SSH` で差し替え可能(テストでは `fake_ssh.py` シムを使用)
 - 「Connection file…」で起動済みカーネルの接続ファイルを指定して接続できる(ポートを公開したコンテナなど。リモート側に `pide_kernel` が import できる必要あり)
 - Docker 専用の起動は未実装(SSH でコンテナに入るか、接続ファイル方式を使う)
+- リモートファイルの閲覧: リモートカーネル使用中は Current Folder、エディタ、ノートブックがカーネル側のファイルを扱う(カーネル内の `pide_kernel.fs_*` 経由、追加の SSH セッション不要)。接続後は作業フォルダがリモートの cwd になり、Current Folder にホスト名バッジが付く。「名前を付けて保存」はパス入力。Git パネルはリモート中は無効。LSP はローカルの環境で解析するため、リモートにしかないパッケージは未解決と出ることがある
 
 ## ノートブック(.ipynb)
 
@@ -113,7 +114,6 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 ## 今後の候補
 
 - Git のコンフリクト解決の支援
-- リモートファイルのブラウズ(現状 Current Folder はローカルのみ)
 - 配布ビルド(`npm run tauri build`)とコード署名
 
 ## ライセンス

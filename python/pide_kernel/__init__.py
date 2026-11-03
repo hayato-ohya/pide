@@ -672,3 +672,57 @@ def run_file(path, argv=None):
             ns.pop("__file__", None)
         else:
             ns["__file__"] = old_file
+
+
+# ----------------------------------------------------------------------------
+# file system access (used when the kernel runs on another machine)
+# ----------------------------------------------------------------------------
+
+def fs_list(path):
+    import os
+    path = os.path.expanduser(path or "~")
+    out = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    st = e.stat(follow_symlinks=True)
+                    is_dir = e.is_dir(follow_symlinks=True)
+                except OSError:
+                    continue
+                out.append({"name": e.name, "path": os.path.join(path, e.name), "is_dir": is_dir,
+                            "size": int(st.st_size), "modified": int(st.st_mtime)})
+    except OSError as e:
+        return _Payload({"path": path, "error": str(e)})
+    out.sort(key=lambda d: (not d["is_dir"], d["name"].lower()))
+    return _Payload({"path": os.path.abspath(path), "entries": out})
+
+
+def fs_read(path):
+    import os
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as f:
+            return _Payload({"path": path, "text": f.read()})
+    except OSError as e:
+        return _Payload({"path": path, "error": str(e)})
+
+
+def fs_write(path, b64):
+    import base64
+    import os
+    try:
+        p = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(base64.b64decode(b64))
+        return _Payload({"path": path, "ok": True})
+    except OSError as e:
+        return _Payload({"path": path, "error": str(e)})
+
+
+def fs_info():
+    import os
+    import socket
+    return _Payload({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "host": socket.gethostname(), "sep": os.sep})

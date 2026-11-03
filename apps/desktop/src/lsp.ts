@@ -36,7 +36,7 @@ class LspClient {
     // A home directory or / as workspace makes pyright enumerate everything;
     // in that case run without a workspace folder (open files still work).
     const home = await invoke<string>("home_dir");
-    const useRoot = cwd !== "/" && cwd.replace(/\/$/, "") !== home.replace(/\/$/, "");
+    const useRoot = cwd !== "/" && cwd.replace(/\/$/, "") !== home.replace(/\/$/, "") && !get().remote && !get().connectionFile;
     const rootUri = useRoot ? "file://" + cwd : null;
     this.initialized = this.request("initialize", {
       processId: null,

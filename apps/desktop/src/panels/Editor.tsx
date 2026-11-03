@@ -2,8 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import type { IDockviewPanelProps } from "dockview";
-import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { readText, savePath, writeText } from "../fs";
 import { execute } from "../kernel";
 import { pushConsole, useStore } from "../store";
 import { debugCell, debugFile, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
@@ -50,7 +49,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const uri = uriRef.current;
 
   useEffect(() => {
-    if (path) invoke<string>("read_text_file", { path }).then(setContent).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setContent(""); });
+    if (path) readText(path).then(setContent).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setContent(""); });
   }, []);
 
   useEffect(() => {
@@ -73,12 +72,12 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const doSave = async () => {
     let p = path;
     if (!p) {
-      p = await save({ defaultPath: "untitled.py", filters: [{ name: "Python", extensions: ["py"] }] });
+      p = await savePath("untitled.py", [{ name: "Python", extensions: ["py"] }]);
       if (!p) return;
       setPath(p);
     }
     const text = ed.current?.getValue() ?? content ?? "";
-    await invoke("write_text_file", { path: p, content: text });
+    await writeText(p, text);
     setDirty(false);
     saveDocument(uri);
     pushConsole({ kind: "info", text: `Saved ${p}` });

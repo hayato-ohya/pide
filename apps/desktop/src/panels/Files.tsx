@@ -1,11 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 import { setCwd } from "../kernel";
 import { useStore } from "../store";
 import { openFile } from "../layout";
 import { statusMap } from "../git";
+import { isRemote, listDir } from "../fs";
 
-interface Entry { name: string; path: string; is_dir: boolean; size: number; modified: number | null }
+import type { Entry } from "../fs";
 
 function fmtSize(n: number) {
   if (n < 1024) return `${n} B`;
@@ -15,6 +15,9 @@ function fmtSize(n: number) {
 
 export default function Files() {
   const cwd = useStore((s) => s.cwd);
+  const kernel = useStore((s) => s.kernel);
+  const remote = useStore((s) => s.remote);
+  const connectionFile = useStore((s) => s.connectionFile);
   const git = useStore((s) => s.git);
   const badges = statusMap();
   const root = git.status?.root;
@@ -30,8 +33,9 @@ export default function Files() {
 
   const load = async () => {
     if (!cwd) return;
+    if (isRemote() && kernel !== "idle") return; // remote listing needs the kernel
     try {
-      setEntries(await invoke<Entry[]>("list_dir", { path: cwd }));
+      setEntries(await listDir(cwd));
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -39,15 +43,16 @@ export default function Files() {
   };
   useEffect(() => {
     load();
-    const t = setInterval(load, 3000);
+    const t = setInterval(load, isRemote() ? 8000 : 3000);
     return () => clearInterval(t);
-  }, [cwd]);
+  }, [cwd, kernel, remote, connectionFile]);
 
   const up = () => cwd && setCwd(cwd.replace(/\/[^/]+\/?$/, "") || "/");
 
   return (
     <div className="files">
       <div className="files-path">
+        {(remote || connectionFile) && <span className="files-remote" title="Browsing the kernel's machine">{remote?.host ?? "remote"}</span>}
         <button onClick={up} title="Up one level">↑</button>
         <input value={cwd ?? ""} onChange={(e) => setCwd(e.target.value)} spellCheck={false} />
       </div>

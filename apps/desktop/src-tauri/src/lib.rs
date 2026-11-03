@@ -272,6 +272,12 @@ async fn debug_request(state: State<'_, AppState>, content: Value) -> Result<Str
     kernel(&state).await?.control("debug_request", content).await.map_err(|e| e.to_string())
 }
 
+/// Evaluate a `pide_kernel` helper call; the result comes back under user_expressions["eval"].
+#[tauri::command]
+async fn kernel_eval(state: State<'_, AppState>, expr: String) -> Result<String, String> {
+    user_expr(&state, "eval", format!("__import__('pide_kernel').{expr}")).await
+}
+
 #[tauri::command]
 async fn complete(state: State<'_, AppState>, code: String, cursor: usize) -> Result<String, String> {
     kernel(&state).await?.complete(&code, cursor).await.map_err(|e| e.to_string())
@@ -431,6 +437,7 @@ pub fn run() {
             plot_expr,
             complete,
             debug_request,
+            kernel_eval,
             inspect,
             is_complete,
             input_reply,

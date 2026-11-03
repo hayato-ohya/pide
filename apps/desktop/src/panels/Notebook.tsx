@@ -2,8 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MonacoEditor, { type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import type { IDockviewPanelProps } from "dockview";
-import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { readText, savePath, writeText } from "../fs";
 import { marked } from "marked";
 import { execute, interrupt, type OutputItem } from "../kernel";
 import { pushConsole, set as setStore, useStore } from "../store";
@@ -230,7 +229,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   }, []);
 
   useEffect(() => {
-    if (path) invoke<string>("read_text_file", { path }).then((t) => setNb(parseNotebook(t))).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setNb(parseNotebook("")); });
+    if (path) readText(path).then((t) => setNb(parseNotebook(t))).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setNb(parseNotebook("")); });
     else setNb(parseNotebook(""));
   }, []);
   useEffect(() => { props.api.setTitle((path ? path.split("/").pop()! : "untitled.ipynb") + (dirty ? " *" : "")); }, [path, dirty]);
@@ -247,11 +246,11 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
     if (!cur) return;
     let p = path;
     if (!p) {
-      p = await save({ defaultPath: "untitled.ipynb", filters: [{ name: "Notebook", extensions: ["ipynb"] }] });
+      p = await savePath("untitled.ipynb", [{ name: "Notebook", extensions: ["ipynb"] }]);
       if (!p) return;
       setPath(p);
     }
-    await invoke("write_text_file", { path: p, content: serializeNotebook(cur) });
+    await writeText(p, serializeNotebook(cur));
     setDirty(false);
     pushConsole({ kind: "info", text: `Saved ${p}` });
   };

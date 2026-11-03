@@ -9,7 +9,7 @@ export interface FileDiff { path: string; old_path: string | null; code: string;
 
 export async function refreshGit() {
   const cwd = get().cwd;
-  if (!cwd) return;
+  if (!cwd || get().remote || get().connectionFile) { if (get().git.status) set({ git: { status: null, log: [], error: null } }); return; }
   try {
     const status = await invoke<GitStatus>("git_status", { cwd });
     const log = await invoke<Commit[]>("git_log", { cwd, limit: 300, all: true });

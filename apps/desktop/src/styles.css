@@ -346,3 +346,5 @@ select option { background: var(--panel); color: var(--text); }
 .dbg-exinfo pre { margin: 4px 0 0; white-space: pre-wrap; max-height: 160px; overflow: auto; font-size: 11px; }
 .ts-check { display: flex; align-items: center; gap: 4px; padding: 0 4px; }
 .modal button.danger { color: var(--error); }
+
+.files-remote { font-size: 10.5px; padding: 1px 6px; border-radius: 3px; background: var(--accent); color: var(--accent-text); white-space: nowrap; }

@@ -164,12 +164,23 @@ export function startKernel() {
 }
 
 async function startKernelInner() {
-  const { python, cwd, remote, connectionFile } = get();
+  let { python, cwd, remote, connectionFile } = get();
+  if (!remote && !connectionFile && cwd) {
+    // A cwd left over from a remote session may not exist here.
+    const ok = await invoke("list_dir", { path: cwd }).then(() => true).catch(() => false);
+    if (!ok) { cwd = await invoke<string>("home_dir"); set({ cwd }); localStorage.setItem("pide.cwd", cwd); }
+  }
   set({ console: [...get().console], inputRequest: null });
   pushConsole({ kind: "info", text: remote ? `Starting remote kernel on ${remote.host}: ${remote.python}` : connectionFile ? `Connecting to kernel: ${connectionFile}` : `Starting kernel: ${python}` });
   try {
     await invoke("start_kernel", { python, cwd, remote: remote ? { host: remote.host, port: remote.port ?? null, python: remote.python, cwd: remote.cwd || null } : null, connectionFile });
     pushConsole({ kind: "info", text: "Kernel ready." });
+    if (remote || connectionFile) {
+      // Browse the machine the kernel runs on.
+      const { kernelInfo } = await import("./fs");
+      const info = await kernelInfo().catch(() => null);
+      if (info) { set({ cwd: info.cwd }); pushConsole({ kind: "info", text: `Remote files: ${info.host}:${info.cwd}` }); }
+    }
     startLsp().catch((e) => pushConsole({ kind: "info", text: `LSP: ${e}` }));
     // Make matplotlib figures appear inline (routed to the Figures panel).
     await runSilent("try:\n import matplotlib\n matplotlib.use('module://matplotlib_inline.backend_inline')\nexcept Exception: pass");
@@ -279,7 +290,7 @@ export async function replyInput(value: string) {
 }
 
 export async function setCwd(path: string) {
-  localStorage.setItem("pide.cwd", path);
+  if (!get().remote && !get().connectionFile) localStorage.setItem("pide.cwd", path);
   set({ cwd: path });
   if (get().kernel === "idle") await runSilent(`import os as _os; _os.chdir(${JSON.stringify(path)})`);
 }

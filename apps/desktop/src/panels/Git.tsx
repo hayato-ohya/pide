@@ -96,6 +96,8 @@ export default function Git() {
   };
   const loadBranches = async () => setBranches((await invoke<any[]>("git_branches", { cwd }).catch(() => [])) ?? []);
 
+  const remoteKernel = useStore((s) => !!(s.remote || s.connectionFile));
+  if (remoteKernel) return <div className="git"><div className="center muted">Git is not available while a remote kernel is selected (the Current Folder shows the remote machine).</div></div>;
   if (git.error) {
     return (
       <div className="git">
