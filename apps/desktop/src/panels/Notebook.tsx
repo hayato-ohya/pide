@@ -117,7 +117,7 @@ function CellOutputs({ outputs, collapsed, onToggle }: { outputs: NbOutput[]; co
   if (collapsed) return <div className="nb-outputs nb-collapsed" onClick={onToggle} title="Click to expand outputs">▸ {outputs.length} output{outputs.length > 1 ? "s" : ""} hidden ({summary})</div>;
   return (
     <div className={`nb-outputs ${long ? "nb-long" : ""}`}>
-      <button className="nb-collapse" onClick={onToggle} title="Collapse outputs">▾</button>
+      <button className="nb-collapse" onClick={onToggle} title="Collapse outputs" aria-label="Collapse outputs">▾</button>
       {long && <div className="nb-long-note" onClick={() => setExpandedLong(true)}>{lines} lines · click to show all</div>}
       {outputs.map((o, i) => {
         if (o.output_type === "stream") return <pre key={i} className={`c-stream ${o.name}`} dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(o.text) }} />;
@@ -194,7 +194,7 @@ function MarkdownEditor({ value, theme, onChange, onDone, onMount, render }: { v
       {split && <div className="nb-md nb-md-preview" dangerouslySetInnerHTML={render(value || "*(empty)*")} />}
       <div className="nb-md-tools">
         <button title={split ? "Hide preview" : "Show preview"} onClick={() => { setSplit(!split); localStorage.setItem("pide.nb.mdsplit", split ? "0" : "1"); }}>{split ? "◧" : "▭"}</button>
-        <button title="Done (Shift+Enter / Esc)" onClick={onDone}>✓</button>
+        <button title="Done (Shift+Enter / Esc)" aria-label="Done (Shift+Enter / Esc)" onClick={onDone}>✓</button>
       </div>
     </div>
   );
@@ -385,9 +385,9 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
         <button onClick={interrupt} disabled={kernel !== "busy"}>⏹</button>
         <button onClick={() => sel && debugThisCell(sel)} title="Run this cell under the debugger (set breakpoints in the cell gutter)">🐞 Debug</button>
         <span className="sep" />
-        <button onClick={() => sel && moveCell(sel, -1)} title="Move up">↑</button>
-        <button onClick={() => sel && moveCell(sel, 1)} title="Move down">↓</button>
-        <button onClick={() => sel && deleteCell(sel)} title="Delete cell">🗑</button>
+        <button onClick={() => sel && moveCell(sel, -1)} title="Move up" aria-label="Move up">↑</button>
+        <button onClick={() => sel && moveCell(sel, 1)} title="Move down" aria-label="Move down">↓</button>
+        <button onClick={() => sel && deleteCell(sel)} title="Delete cell" aria-label="Delete cell">🗑</button>
         <select value={nb.cells.find((c) => c.id === sel)?.cell_type ?? "code"} onChange={(e) => sel && setType(sel, e.target.value as Cell["cell_type"])}>
           <option value="code">Code</option><option value="markdown">Markdown</option><option value="raw">Raw</option>
         </select>
@@ -405,7 +405,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
           <div key={c.id} id={`cell-${c.id}`} className={`nb-cell ${c.cell_type} ${sel === c.id ? "selected" : ""} ${c.running ? "running" : ""}`} onClick={() => setSel(c.id)}>
             <div className="nb-gutter">
               {c.cell_type === "code" ? <span className="nb-prompt">{c.running ? "[*]" : `[${c.execution_count ?? " "}]`}</span> : <span className="nb-prompt muted">{c.cell_type === "markdown" ? "md" : "raw"}</span>}
-              {c.cell_type === "code" && <button className="nb-run" title="Run cell" onClick={(e) => { e.stopPropagation(); runCell(c.id); }}>▶</button>}
+              {c.cell_type === "code" && <button className="nb-run" title="Run cell" aria-label="Run cell" onClick={(e) => { e.stopPropagation(); runCell(c.id); }}>▶</button>}
             </div>
             <div className="nb-body">
               {c.cell_type === "code" ? (

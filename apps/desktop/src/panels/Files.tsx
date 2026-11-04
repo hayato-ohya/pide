@@ -32,6 +32,7 @@ export default function Files(props: IDockviewPanelProps) {
     return null;
   };
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [cursor, setCursor] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
@@ -57,20 +58,28 @@ export default function Files(props: IDockviewPanelProps) {
     <div className="files">
       <div className="files-path">
         {(remote || connectionFile) && <span className="files-remote" title="Browsing the kernel's machine">{remote?.host ?? "remote"}</span>}
-        <button onClick={up} title="Up one level">↑</button>
-        <input value={cwd ?? ""} onChange={(e) => setCwd(e.target.value)} spellCheck={false} />
+        <button onClick={up} title="Up one level" aria-label="Up one level">↑</button>
+        <input aria-label="Current folder" value={cwd ?? ""} onChange={(e) => setCwd(e.target.value)} spellCheck={false} />
       </div>
       {error && <div className="c-info">{error}</div>}
-      <table className="grid">
+      <table className="grid" aria-label="Files" onKeyDown={(e) => {
+        if (!entries.length) return;
+        const table = e.currentTarget;
+        const go = (j: number) => { const n = Math.max(0, Math.min(entries.length - 1, j)); setCursor(n); requestAnimationFrame(() => table.querySelectorAll<HTMLElement>("tbody tr")[n]?.focus()); };
+        if (e.key === "ArrowDown") { e.preventDefault(); go(cursor + 1); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); go(cursor - 1); }
+        else if (e.key === "Enter") { e.preventDefault(); const x = entries[cursor]; if (x) x.is_dir ? setCwd(x.path) : openFile(x.path); }
+        else if (e.key === "Backspace") { e.preventDefault(); up(); }
+      }}>
         <thead>
           <tr>
-            <th>Name</th>
-            <th>Size</th>
+            <th scope="col">Name</th>
+            <th scope="col">Size</th>
           </tr>
         </thead>
         <tbody>
-          {entries.map((e) => (
-            <tr key={e.path} onDoubleClick={() => (e.is_dir ? setCwd(e.path) : openFile(e.path))}>
+          {entries.map((e, i) => (
+            <tr key={e.path} tabIndex={i === cursor ? 0 : -1} className={i === cursor ? "cursor" : ""} onFocus={() => setCursor(i)} onClick={() => setCursor(i)} onDoubleClick={() => (e.is_dir ? setCwd(e.path) : openFile(e.path))}>
               <td className={e.is_dir ? "dir" : "file"}>
                 {e.is_dir ? "📁 " : e.name.endsWith(".py") ? "🐍 " : e.name.endsWith(".ipynb") ? "📓 " : "📄 "}
                 {e.name}

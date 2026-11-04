@@ -23,11 +23,11 @@ function Section({ title, entries, actions, onOpen }: { title: string; entries: 
   return (
     <div className="git-section">
       <div className="git-section-h" onClick={() => setOpen(!open)}>
-        <span>{open ? "▾" : "▸"} {title} <span className="muted">({entries.length})</span></span>
+        <span role="button" tabIndex={0} aria-expanded={open} onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); setOpen(!open); } }}>{open ? "▾" : "▸"} {title} <span className="muted">({entries.length})</span></span>
         <span className="git-actions">{actions.map((a) => <button key={a.label} className={a.danger ? "danger" : ""} onClick={(ev) => { ev.stopPropagation(); a.fn(entries.map((e) => e.path)); }}>{a.label} all</button>)}</span>
       </div>
       {open && entries.map((e) => (
-        <div key={e.area + e.path} className="git-file" onDoubleClick={() => onOpen(e)}>
+        <div key={e.area + e.path} className="git-file" tabIndex={0} onDoubleClick={() => onOpen(e)} onKeyDown={(ev) => { if (ev.key === "Enter") onOpen(e); }}>
           <span className={`git-code c-${e.code[0]}`}>{e.code}</span>
           <span className="git-path" title={e.path}>{e.path}</span>
           <span className="git-actions">{actions.map((a) => <button key={a.label} className={a.danger ? "danger" : ""} onClick={() => a.fn([e.path])}>{a.label}</button>)}</span>
@@ -136,7 +136,7 @@ export default function Git(props: IDockviewPanelProps) {
   return (
     <div className="git">
       <div className="panel-toolbar git-head">
-        <select className="branch" value={st?.branch ?? ""} onFocus={loadBranches} onChange={async (e) => {
+        <select className="branch" aria-label="Branch" value={st?.branch ?? ""} onFocus={loadBranches} onChange={async (e) => {
           if (e.target.value === "__new__") { const n = await promptAsync("New branch name"); if (n) await gitCall("git_create_branch", { name: n }); }
           else await gitCall("git_checkout", { name: e.target.value });
         }} title={st?.upstream ? `upstream ${st.upstream}` : "no upstream"}>
@@ -166,7 +166,7 @@ export default function Git(props: IDockviewPanelProps) {
           <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>Changes {st?.entries.length ? `(${st.entries.length})` : ""}</button>
           <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>History</button>
         </span>
-        <button onClick={refreshGit} title="Refresh">⟳</button>
+        <button onClick={refreshGit} title="Refresh" aria-label="Refresh">⟳</button>
       </div>
       {st && st.state !== "clean" && (
         <div className="git-banner" role="status">
@@ -181,7 +181,7 @@ export default function Git(props: IDockviewPanelProps) {
       {tab === "changes" && (
         <div className="git-body">
           <div className="git-commit">
-            <textarea placeholder="Commit message (Cmd+Enter to commit)" value={msg} onChange={(e) => setMsg(e.target.value)} rows={3}
+            <textarea aria-label="Commit message" placeholder="Commit message (Cmd+Enter to commit)" value={msg} onChange={(e) => setMsg(e.target.value)} rows={3}
               onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) commit(); }} />
             <div className="git-commit-row">
               <label><input type="checkbox" checked={amend} onChange={(e) => setAmend(e.target.checked)} /> amend</label>
@@ -210,7 +210,7 @@ export default function Git(props: IDockviewPanelProps) {
               const W = 14, H = 24;
               const maxLane = Math.max(row.lane, ...row.lanes.map((_, j) => j), ...row.links.map((l) => Math.max(l.from, l.to)));
               return (
-                <div key={c.id} className={`git-row ${sel === c.id ? "selected" : ""}`} onClick={() => selectCommit(c)}>
+                <div key={c.id} className={`git-row ${sel === c.id ? "selected" : ""}`} tabIndex={0} aria-selected={sel === c.id} onClick={() => selectCommit(c)} onKeyDown={(e) => { if (e.key === "Enter") selectCommit(c); }}>
                   <svg width={(maxLane + 1) * W + 4} height={H} className="git-graph">
                     {row.lanes.map((id, j) => id && <line key={"v" + j} x1={j * W + W / 2} y1={0} x2={j * W + W / 2} y2={H} stroke={COLORS[j % COLORS.length]} strokeWidth={2} />)}
                     {row.links.map((l, k) => <path key={"l" + k} d={`M ${l.from * W + W / 2} ${H / 2} C ${l.from * W + W / 2} ${H}, ${l.to * W + W / 2} ${H / 2}, ${l.to * W + W / 2} ${H}`} stroke={COLORS[l.color % COLORS.length]} strokeWidth={2} fill="none" />)}

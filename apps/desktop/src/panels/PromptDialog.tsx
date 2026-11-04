@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { set, useStore } from "../store";
+import Modal from "./Modal";
 
 export default function PromptDialog() {
   const req = useStore((s) => s.promptReq);
@@ -8,13 +9,9 @@ export default function PromptDialog() {
   if (!req) return null;
   const done = (val: string | null) => { set({ promptReq: null }); req.resolve(val); };
   return (
-    <div className="modal-bg" onClick={() => done(null)}>
-      <div className="modal" style={{ width: 460 }} onClick={(e) => e.stopPropagation()}>
-        <h3>{req.message}</h3>
-        <div className="row"><input autoFocus value={v} placeholder={req.placeholder} onChange={(e) => setV(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") done(v.trim() || null); if (e.key === "Escape") done(null); }} /></div>
-        <div className="row buttons"><button className="primary" onClick={() => done(v.trim() || null)}>OK</button><button onClick={() => done(null)}>Cancel</button></div>
-      </div>
-    </div>
+    <Modal title={req.message} width={460} onClose={() => done(null)} onEnter={() => done(v.trim() || null)}>
+      <div className="row"><input aria-label={req.message} value={v} placeholder={req.placeholder} onChange={(e) => setV(e.target.value)} /></div>
+      <div className="row buttons"><button className="primary" onClick={() => done(v.trim() || null)}>OK</button><button onClick={() => done(null)}>Cancel</button></div>
+    </Modal>
   );
 }

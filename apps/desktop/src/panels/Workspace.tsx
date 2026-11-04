@@ -92,18 +92,29 @@ export default function Workspace() {
   return (
     <div className="workspace" onClick={() => setMenu(null)}>
       <div className="panel-toolbar">
-        <input placeholder="filter" value={filter} onChange={(e) => setFilter(e.target.value)} />
+        <input placeholder="filter" aria-label="Filter variables" value={filter} onChange={(e) => setFilter(e.target.value)} />
         <label title="Show modules, functions and classes"><input type="checkbox" checked={showCode} onChange={(e) => setShowCode(e.target.checked)} /> code</label>
         <label title="Show names starting with _"><input type="checkbox" checked={showHidden} onChange={(e) => { set({ showHidden: e.target.checked }); setTimeout(refreshWorkspace, 0); }} /> _hidden</label>
-        <button onClick={() => refreshWorkspace()} title="Refresh">⟳</button>
+        <button onClick={() => refreshWorkspace()} title="Refresh" aria-label="Refresh">⟳</button>
         <span className="count">{rows.length}</span>
       </div>
       <div className="grid-wrap">
-        <table className="grid ws-grid">
+        <table className="grid ws-grid" aria-label="Workspace variables" onKeyDown={(e) => {
+          if (!rows.length) return;
+          const i = rows.findIndex((r) => r.name === selected);
+          const table = e.currentTarget;
+          const pick = (j: number) => { const v = rows[Math.max(0, Math.min(rows.length - 1, j))]; set({ selectedVar: v.name, selectedVars: [v.name], plotExpr: null }); requestAnimationFrame(() => table.querySelector<HTMLElement>("tr.selected")?.focus()); };
+          if (e.key === "ArrowDown") { e.preventDefault(); pick(i + 1); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); pick(i - 1); }
+          else if (e.key === "Home") { e.preventDefault(); pick(0); }
+          else if (e.key === "End") { e.preventDefault(); pick(rows.length - 1); }
+          else if (e.key === "Enter" && i >= 0) { e.preventDefault(); const v = rows[i]; openVariable(v.name, v.kind === "image" ? "image" : "table"); }
+          else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) { e.preventDefault(); const v = rows[i]; if (v) { const r = (e.currentTarget.querySelector("tr.selected") as HTMLElement)?.getBoundingClientRect(); setMenu({ x: r?.left ?? 0, y: r?.bottom ?? 0, v }); } }
+        }}>
           <thead>
             <tr>
               {cols.map((k) => (
-                <th key={k} onClick={() => setSort((s) => ({ key: k, dir: s.key === k ? (s.dir === 1 ? -1 : 1) : 1 }))}
+                <th key={k} scope="col" aria-sort={sort.key === k ? (sort.dir === 1 ? "ascending" : "descending") : "none"} onClick={() => setSort((s) => ({ key: k, dir: s.key === k ? (s.dir === 1 ? -1 : 1) : 1 }))}
                     onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, v: null as any }); }}>
                   {ALL_COLS.find((c) => c.key === k)!.label}{sort.key === k ? (sort.dir === 1 ? " ▲" : " ▼") : ""}
                 </th>
@@ -112,7 +123,7 @@ export default function Workspace() {
           </thead>
           <tbody>
             {rows.map((v) => (
-              <tr key={v.name}
+              <tr key={v.name} tabIndex={selected === v.name || (!selected && v === rows[0]) ? 0 : -1} aria-selected={selected === v.name || selectedVars.includes(v.name)}
                   className={`${selected === v.name || selectedVars.includes(v.name) ? "selected" : ""} ${changed.has(v.name) ? "changed" : ""} kind-${v.kind}`}
                   onClick={(e) => {
                     if (e.metaKey || e.ctrlKey) {
@@ -137,25 +148,32 @@ export default function Workspace() {
         </table>
       </div>
       {menu && (
-        <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
+        <div className="ctx-menu" role="menu" style={{ left: menu.x, top: menu.y }} ref={(el) => el?.querySelector<HTMLElement>("[role=menuitem]")?.focus()}
+             onKeyDown={(e) => {
+               const items = [...e.currentTarget.querySelectorAll<HTMLElement>("[role=menuitem]")]; const i = items.indexOf(document.activeElement as HTMLElement);
+               if (e.key === "Escape") { e.stopPropagation(); setMenu(null); }
+               else if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+               else if (e.key === "ArrowUp") { e.preventDefault(); items[(i + items.length - 1) % items.length]?.focus(); }
+               else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); (document.activeElement as HTMLElement)?.click(); }
+             }}>
           {menu.v ? (
             <>
-              <div onClick={() => openVariable(menu.v.name)}>Open in Variable Viewer</div>
+              <div role="menuitem" tabIndex={-1} onClick={() => openVariable(menu.v.name)}>Open in Variable Viewer</div>
               {["ndarray", "tensor", "jax", "xarray", "dataframe", "series", "polars", "sequence"].includes(menu.v.kind) && (
                 <>
-                  <div onClick={() => plotVariable(menu.v.name, "line")}>Plot (line)</div>
-                  <div onClick={() => plotVariable(menu.v.name, "scatter")}>Scatter</div>
-                  <div onClick={() => plotVariable(menu.v.name, "histogram")}>Histogram</div>
-                  <div onClick={() => plotVariable(menu.v.name, "heatmap")}>Heatmap</div>
+                  <div role="menuitem" tabIndex={-1} onClick={() => plotVariable(menu.v.name, "line")}>Plot (line)</div>
+                  <div role="menuitem" tabIndex={-1} onClick={() => plotVariable(menu.v.name, "scatter")}>Scatter</div>
+                  <div role="menuitem" tabIndex={-1} onClick={() => plotVariable(menu.v.name, "histogram")}>Histogram</div>
+                  <div role="menuitem" tabIndex={-1} onClick={() => plotVariable(menu.v.name, "heatmap")}>Heatmap</div>
                   {["ndarray", "tensor", "jax", "xarray", "image"].includes(menu.v.kind) && (menu.v.shape?.length ?? 0) >= 2 && <div onClick={() => openVariable(menu.v.name, "image")}>View as image</div>}
                 </>
               )}
-              <div onClick={() => execute(`print(${menu.v.name})`)}>Print</div>
-              <div onClick={() => execute(`del ${menu.v.name}`)}>Delete</div>
+              <div role="menuitem" tabIndex={-1} onClick={() => execute(`print(${menu.v.name})`)}>Print</div>
+              <div role="menuitem" tabIndex={-1} onClick={() => execute(`del ${menu.v.name}`)}>Delete</div>
             </>
           ) : (
             ALL_COLS.map((c) => (
-              <div key={c.key} onClick={(e) => { e.stopPropagation(); toggleCol(c.key); }}>
+              <div key={c.key} role="menuitemcheckbox" aria-checked={cols.includes(c.key)} tabIndex={-1} onClick={(e) => { e.stopPropagation(); toggleCol(c.key); }}>
                 {cols.includes(c.key) ? "☑" : "☐"} {c.label}
               </div>
             ))

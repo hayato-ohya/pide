@@ -377,3 +377,8 @@ select option { background: var(--panel); color: var(--text); }
 .conflict-theirs { background: rgba(92, 184, 92, 0.14); }
 .conflict-marker { background: var(--hover); font-weight: 700; }
 :root[data-theme="dark"] .git-banner, :root[data-theme="dark"] .conflict-bar { --warn-bg: #4a3a12; --warn-text: #ffd98a; }
+
+/* Keyboard focus */
+.grid tr:focus-visible, .git-file:focus-visible, .git-row:focus-visible, .ts-tab:focus-visible, [role=menuitem]:focus-visible, [role=menuitemcheckbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.files tr.cursor { background: var(--hover); }
+.modal:focus { outline: none; }

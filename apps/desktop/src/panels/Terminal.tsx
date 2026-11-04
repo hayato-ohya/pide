@@ -95,10 +95,10 @@ export default function TerminalPanel() {
       <div className="term-tabs">
         {tabs.map((t) => (
           <div key={t.id} className={`term-tab ${t.id === active ? "on" : ""} ${t.exited ? "exited" : ""}`} onClick={() => setActive(t.id)}>
-            <span>{t.title}</span><button onClick={(e) => { e.stopPropagation(); close(t.id); }} title="Close">×</button>
+            <span>{t.title}</span><button onClick={(e) => { e.stopPropagation(); close(t.id); }} title="Close" aria-label="Close">×</button>
           </div>
         ))}
-        <button className="term-add" onClick={add} title="New terminal (in the current folder, or SSH to the remote kernel's host)">＋</button>
+        <button className="term-add" onClick={add} title="New terminal (in the current folder, or SSH to the remote kernel's host)" aria-label="New terminal (in the current folder, or SSH to the remote kernel's host)">＋</button>
       </div>
       <div className="term-body">
         {tabs.map((t) => (

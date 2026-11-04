@@ -179,13 +179,17 @@ export default function App() {
   return (
     <div className="app">
       <div className="toolstrip">
-        <div className="ts-tabs">
-          {(["home", "plots", "editor", "debug", "view"] as const).map((t) => (
-            <div key={t} className={`ts-tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>{t.toUpperCase()}</div>
+        <div className="ts-tabs" role="tablist" aria-label="Ribbon">
+          {(["home", "plots", "editor", "debug", "view"] as const).map((t, i, all) => (
+            <div key={t} role="tab" aria-selected={tab === t} tabIndex={tab === t ? 0 : -1} className={`ts-tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}
+              onKeyDown={(e) => {
+                const next = e.key === "ArrowRight" ? all[(i + 1) % all.length] : e.key === "ArrowLeft" ? all[(i + all.length - 1) % all.length] : e.key === "Enter" || e.key === " " ? t : null;
+                if (next) { e.preventDefault(); setTab(next); (e.currentTarget.parentElement?.children[all.indexOf(next)] as HTMLElement)?.focus(); }
+              }}>{t.toUpperCase()}</div>
           ))}
           <div className="ts-title">Pide</div>
         </div>
-        <div className="ts-body">
+        <div className="ts-body" role="tabpanel">
           {tab === "home" && (
             <>
               <div className="ts-group"><div className="ts-row"><button onClick={newScript}>＋ New Script</button><button onClick={() => openNotebook(null)}>＋ New Notebook</button><button onClick={openDialog}>Open…</button><button onClick={() => active()?.save()}>Save</button></div><div className="ts-label">FILE</div></div>
@@ -198,7 +202,7 @@ export default function App() {
                   {!remote && <option value="__remote__">Remote kernel (SSH)…</option>}
                   {connectionFile && <option value="__file__">{connectionFile}</option>}
                 </select>
-                <button onClick={() => setRemoteDlg(true)} title="Remote kernel settings">⇄</button></div><div className="ts-label">ENVIRONMENT</div></div>
+                <button onClick={() => setRemoteDlg(true)} title="Remote kernel settings" aria-label="Remote kernel settings">⇄</button></div><div className="ts-label">ENVIRONMENT</div></div>
             </>
           )}
           {tab === "plots" && (
@@ -253,8 +257,8 @@ export default function App() {
       <div className="dock">
         <DockviewReact components={components} defaultTabComponent={GuardedTab} onReady={onReady} theme={theme === "dark" ? themeDark : themeLight} />
       </div>
-      <div className={`statusbar ${kernel}`}>
-        <span className="dot" />
+      <div className={`statusbar ${kernel}`} role="status" aria-live="polite">
+        <span className="dot" aria-hidden="true" />
         <span>{STATE_LABEL[kernel] ?? kernel}{detail ? ` (${detail})` : ""}</span>
         <span className="sep">|</span>
         <span title="interpreter">{remote ? `ssh ${remote.host} · ${remote.python}` : connectionFile ? `attached · ${connectionFile.split("/").pop()}` : python}</span>
