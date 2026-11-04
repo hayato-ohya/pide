@@ -361,3 +361,19 @@ select option { background: var(--panel); color: var(--text); }
 .term-host .xterm { height: 100%; }
 
 .console-password { flex: 1; border: none; outline: none; font: inherit; background: transparent; }
+
+/* Conflict resolution */
+.diff-labels { display: flex; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border-soft); background: var(--panel-alt); }
+.diff-labels span { flex: 1; padding: 2px 8px; }
+.diff-labels span + span { border-left: 1px solid var(--border-soft); }
+.git-banner { display: flex; gap: 8px; align-items: center; padding: 5px 8px; background: var(--warn-bg, #fff4d6); color: var(--warn-text, #6b4a00); border-bottom: 1px solid var(--border-soft); font-weight: 600; }
+.git-banner .git-actions { opacity: 1; margin-left: auto; }
+.conflict-bar { display: flex; gap: 6px; align-items: center; padding: 3px 8px; background: var(--warn-bg, #fff4d6); color: var(--warn-text, #6b4a00); border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.conflict-bar button { font-size: 11px; padding: 1px 6px; border: 1px solid var(--border); background: var(--panel); border-radius: 3px; cursor: pointer; }
+.conflict-bar .spacer { flex: 1; }
+.editor-panel.with-bar { display: flex; flex-direction: column; }
+.editor-panel.with-bar > section { flex: 1; min-height: 0; }
+.conflict-ours { background: rgba(0, 118, 168, 0.12); }
+.conflict-theirs { background: rgba(92, 184, 92, 0.14); }
+.conflict-marker { background: var(--hover); font-weight: 700; }
+:root[data-theme="dark"] .git-banner, :root[data-theme="dark"] .conflict-bar { --warn-bg: #4a3a12; --warn-text: #ffd98a; }

@@ -87,6 +87,15 @@ export function openDiff(diff: import("./git").FileDiff, label: string) {
   api.addPanel({ id, component: "diff", title: diff.path.split("/").pop(), params: { diff, label }, position: ref ? { referencePanel: ref, direction: "within" } : undefined });
 }
 
+export function openConflict(path: string) {
+  if (!api) return;
+  const id = `conflict:${path}`;
+  const existing = api.getPanel(id);
+  if (existing) { existing.api.setActive(); return; }
+  const ref = api.panels.find((p) => p.id.startsWith("diff:") || p.id.startsWith("conflict:")) ?? api.panels.find((p) => p.id.startsWith("editor:"));
+  api.addPanel({ id, component: "conflict", title: `⚠ ${path.split("/").pop()}`, params: { path }, position: ref ? { referencePanel: ref, direction: "within" } : undefined });
+}
+
 export function openVariable(path: string, mode: "table" | "image" = "table") {
   if (!api) return;
   const id = `var:${path}`;

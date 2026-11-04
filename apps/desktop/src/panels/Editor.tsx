@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import type { IDockviewPanelProps } from "dockview";
+import { parseConflicts, resolveBlockLines, type ConflictBlock, type Side } from "../conflicts";
+import { refreshGit } from "../git";
+import { invoke } from "@tauri-apps/api/core";
 import { readText, savePath, writeText } from "../fs";
 import { scheduleLint } from "../tools";
 import { execute } from "../kernel";
@@ -44,6 +47,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const [content, setContent] = useState<string | null>(props.params.path ? null : "");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [conflicts, setConflicts] = useState<ConflictBlock[]>([]);
   const ed = useRef<Editor | null>(null);
   const id = props.api.id;
   // Stable URI for the LSP: real files use file://, new buffers use untitled:.
@@ -166,6 +170,15 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
       for (let i = 1; i <= model.getLineCount(); i++) {
         if (/^\s*#\s*%%/.test(model.getLineContent(i))) ds.push({ range: new m.Range(i, 1, i, 1), options: { isWholeLine: true, className: "cell-sep" } });
       }
+      // Merge-conflict blocks: tint ours / theirs and bold the markers.
+      const blocks = parseConflicts(model.getValue());
+      for (const b of blocks) {
+        const oursEnd = (b.base ?? b.mid) - 1;
+        if (oursEnd > b.start) ds.push({ range: new m.Range(b.start + 1, 1, oursEnd, 1), options: { isWholeLine: true, className: "conflict-ours" } });
+        if (b.end - 1 > b.mid) ds.push({ range: new m.Range(b.mid + 1, 1, b.end - 1, 1), options: { isWholeLine: true, className: "conflict-theirs" } });
+        for (const l of [b.start, b.base, b.mid, b.end]) if (l) ds.push({ range: new m.Range(l, 1, l, 1), options: { isWholeLine: true, className: "conflict-marker" } });
+      }
+      setConflicts((prev) => (prev.length === 0 && blocks.length === 0 ? prev : blocks));
       dec.set(ds);
     };
     editor.onDidChangeModelContent(refresh);
@@ -203,10 +216,58 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     } else curDec.current.set([]);
   }, [debug.stopped, debug.frameId, debug.frames, content]);
 
+  /** Replace the conflict block containing the cursor (or the first one) with the chosen side. */
+  const acceptAt = (side: Side) => {
+    const e = ed.current; const model = e?.getModel();
+    if (!e || !model) return;
+    const line = e.getPosition()?.lineNumber ?? 1;
+    const b = conflicts.find((x) => line >= x.start && line <= x.end) ?? conflicts.find((x) => x.start > line) ?? conflicts[0];
+    if (!b) return;
+    const keep = resolveBlockLines(model.getLinesContent(), b, side);
+    e.executeEdits("conflict", [{ range: new monaco.Range(b.start, 1, b.end, model.getLineMaxColumn(b.end)), text: keep.join("\n") }]);
+    e.setPosition({ lineNumber: b.start, column: 1 });
+    e.focus();
+  };
+  const nextConflict = () => {
+    const e = ed.current; if (!e) return;
+    const line = e.getPosition()?.lineNumber ?? 0;
+    const b = conflicts.find((x) => x.start > line) ?? conflicts[0];
+    if (b) { e.revealLineInCenter(b.start); e.setPosition({ lineNumber: b.start, column: 1 }); e.focus(); }
+  };
+  const markResolved = async () => {
+    if (!path) return;
+    await doSave();
+    const root = get().git.status?.root;
+    if (!root || !path.startsWith(root)) return;
+    try {
+      await invoke("git_resolve", { cwd: get().cwd, path, side: "workdir", allowMarkers: false });
+      pushConsole({ kind: "info", text: `Resolved ${path}` });
+      refreshGit();
+    } catch (e) { pushConsole({ kind: "info", text: `git: ${e}` }); }
+  };
+  const gitRoot = useStore((s) => s.git.status?.root);
+  const inRepo = !!(path && gitRoot && path.startsWith(gitRoot));
+  const isConflicted = useStore((s) => !!(path && gitRoot && s.git.status?.entries.some((e) => e.area === "conflicted" && `${gitRoot}/${e.path}` === path)));
+
   if (loadError && loadError !== "retry") return <div className="vv-error">Could not open {path}: {loadError} <button onClick={() => setLoadError("retry")}>Retry</button></div>;
   if (content === null) return <div className="vv-loading">Loading…</div>;
+  const showBar = conflicts.length > 0 || isConflicted;
   return (
-    <div className="editor-panel">
+    <div className={`editor-panel${showBar ? " with-bar" : ""}`}>
+      {showBar && (
+        <div className="conflict-bar" role="toolbar" aria-label="Merge conflicts">
+          <span>{conflicts.length ? `${conflicts.length} conflict${conflicts.length > 1 ? "s" : ""}` : "No conflict markers left"}</span>
+          {conflicts.length > 0 && <>
+            <button onClick={() => acceptAt("ours")} title="Keep the current (HEAD) side of the block at the cursor">Accept ours</button>
+            <button onClick={() => acceptAt("theirs")} title="Keep the incoming side of the block at the cursor">Accept theirs</button>
+            <button onClick={() => acceptAt("both")} title="Keep both sides">Accept both</button>
+            <button onClick={nextConflict}>Next ↓</button>
+          </>}
+          <span className="spacer" />
+          {inRepo && <button onClick={markResolved} title="Save and stage this file as resolved">Mark resolved</button>}
+        </div>
+      )}
+      <section>
       <MonacoEditor
         path={uri}
         language="python"
@@ -215,6 +276,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
         onMount={onMount}
         options={{ fontSize: 13, glyphMargin: true, minimap: { enabled: false }, automaticLayout: true, scrollBeyondLastLine: false, renderLineHighlight: "all", tabSize: 4, quickSuggestions: { other: true, comments: false, strings: false }, suggestOnTriggerCharacters: true, parameterHints: { enabled: true } }}
       />
+      </section>
     </div>
   );
 }

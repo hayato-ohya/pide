@@ -11,6 +11,7 @@ const COL_W = 110;
 const IDX_W = 70;
 const BLOCK_R = 200;
 const BLOCK_C = 50;
+const MAX_BLOCKS = 48; // LRU cap on cached detail windows (~48 × 200 × 50 cells)
 
 function fmt(v: unknown): string {
   if (v === null || v === undefined) return "";
@@ -64,12 +65,27 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
     return () => { cancelled = true; };
   }, [path, index.join(","), generation, variables.length]);
 
+  // Map insertion order doubles as LRU order: touch on read, evict oldest on insert.
+  const getBlock = (key: string) => {
+    const b = blocks.current.get(key);
+    if (b) { blocks.current.delete(key); blocks.current.set(key, b); }
+    return b;
+  };
+  const putBlock = (key: string, d: DetailWindow) => {
+    blocks.current.delete(key);
+    blocks.current.set(key, d);
+    while (blocks.current.size > MAX_BLOCKS) {
+      const oldest = blocks.current.keys().next().value as string;
+      if (oldest === "0:0") { blocks.current.delete(oldest); blocks.current.set(oldest, blocks.current.get(oldest)!); continue; }
+      blocks.current.delete(oldest);
+    }
+  };
   const ensure = (br: number, bc: number) => {
     const key = `${br}:${bc}`;
     if (blocks.current.has(key) || inflight.current.has(key)) return;
     inflight.current.add(key);
     fetchDetail(path, { row0: br * BLOCK_R, row1: (br + 1) * BLOCK_R, col0: bc * BLOCK_C, col1: (bc + 1) * BLOCK_C, index: index.length ? index : undefined })
-      .then((d) => { blocks.current.set(key, d); bump((x) => x + 1); })
+      .then((d) => { putBlock(key, d); bump((x) => x + 1); })
       .catch((e) => setError(String(e)))
       .finally(() => inflight.current.delete(key));
   };
@@ -118,16 +134,16 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
     for (let bc = Math.floor(c0 / BLOCK_C); bc <= Math.floor(Math.max(0, c1 - 1) / BLOCK_C); bc++) ensure(br, bc);
 
   const cellAt = (r: number, c: number) => {
-    const b = blocks.current.get(`${Math.floor(r / BLOCK_R)}:${Math.floor(c / BLOCK_C)}`);
+    const b = getBlock(`${Math.floor(r / BLOCK_R)}:${Math.floor(c / BLOCK_C)}`);
     if (!b) return undefined;
     return b.rows[r - Math.floor(r / BLOCK_R) * BLOCK_R]?.[c - Math.floor(c / BLOCK_C) * BLOCK_C];
   };
   const colLabel = (c: number) => {
-    const b = blocks.current.get(`0:${Math.floor(c / BLOCK_C)}`) ?? blocks.current.get(`${Math.floor(r0 / BLOCK_R)}:${Math.floor(c / BLOCK_C)}`);
+    const b = getBlock(`0:${Math.floor(c / BLOCK_C)}`) ?? getBlock(`${Math.floor(r0 / BLOCK_R)}:${Math.floor(c / BLOCK_C)}`);
     return b?.columns?.[c - Math.floor(c / BLOCK_C) * BLOCK_C] ?? String(c);
   };
   const rowLabel = (r: number) => {
-    const b = blocks.current.get(`${Math.floor(r / BLOCK_R)}:0`);
+    const b = getBlock(`${Math.floor(r / BLOCK_R)}:0`);
     return b?.index_labels?.[r - Math.floor(r / BLOCK_R) * BLOCK_R] ?? String(r);
   };
   const children = meta.children;

@@ -9,9 +9,11 @@ import Workspace from "./panels/Workspace";
 import VariableViewer from "./panels/VariableViewer";
 import Figures, { FigureWindow } from "./panels/Figures";
 import Files from "./panels/Files";
+import { anyPanelVisible } from "./visibility";
 import History from "./panels/History";
 import Git from "./panels/Git";
 import DiffView from "./panels/DiffView";
+import ConflictView from "./panels/ConflictView";
 import Debugger from "./panels/Debugger";
 import RemoteDialog from "./panels/RemoteDialog";
 import NotebookPanel from "./panels/Notebook";
@@ -37,6 +39,7 @@ const components = {
   history: History,
   git: Git,
   diff: DiffView,
+  conflict: ConflictView,
   debugger: Debugger,
   notebook: NotebookPanel,
   terminal: TerminalPanel,
@@ -80,7 +83,15 @@ export default function App() {
 
   useEffect(() => {
     initKernelBridge().then(startKernel);
-    const t = setInterval(() => import("./git").then((g) => g.refreshGit()), 4000);
+    // Poll git only while the window is visible and a panel that shows git state is on screen.
+    const gitTick = () => {
+      if (document.visibilityState === "hidden") return;
+      if (!anyPanelVisible(["git", "files"])) return;
+      import("./git").then((g) => g.refreshGit());
+    };
+    const t = setInterval(gitTick, 4000);
+    const onFocus = () => import("./git").then((g) => g.refreshGit());
+    window.addEventListener("focus", onFocus);
     const unlisten = getCurrentWindow().onCloseRequested(async (ev) => {
       const dirty = [...dirtyPanels.values()];
       if (dirty.length && !(await confirmAsync(`Unsaved changes in: ${dirty.join(", ")}. Quit anyway?`))) ev.preventDefault();
@@ -93,7 +104,7 @@ export default function App() {
       else if (e.key === "F5" && e.shiftKey) { e.preventDefault(); stopDebugger(); }
     };
     window.addEventListener("keydown", onKey);
-    return () => { clearInterval(t); window.removeEventListener("keydown", onKey); unlisten.then((u) => u()); };
+    return () => { clearInterval(t); window.removeEventListener("focus", onFocus); window.removeEventListener("keydown", onKey); unlisten.then((u) => u()); };
   }, []);
 
   const onReady = (e: DockviewReadyEvent) => {
@@ -105,7 +116,7 @@ export default function App() {
       try {
         e.api.fromJSON(readJson(LAYOUT_KEY, null) as any);
         // Figures live only in memory, so their floating windows cannot be restored.
-        for (const p of [...e.api.panels]) if (p.id.startsWith("fig:") || p.id.startsWith("diff:")) e.api.removePanel(p);
+        for (const p of [...e.api.panels]) if (p.id.startsWith("fig:") || p.id.startsWith("diff:") || p.id.startsWith("conflict:")) e.api.removePanel(p);
         ok = e.api.panels.length > 0;
         // Panels introduced after the layout was saved: add them next to their siblings.
         if (ok && !e.api.getPanel("debugger")) {
@@ -132,7 +143,7 @@ export default function App() {
         try {
           const json = e.api.toJSON() as any;
           for (const [id, p] of Object.entries<any>(json.panels ?? {})) {
-            if (id.startsWith("diff:") || id.startsWith("fig:")) delete json.panels[id];
+            if (id.startsWith("diff:") || id.startsWith("fig:") || id.startsWith("conflict:")) delete json.panels[id];
             else if (p.params) { delete p.params.reveal; delete p.params.revealTick; }
           }
           localStorage.setItem(LAYOUT_KEY, JSON.stringify(json));

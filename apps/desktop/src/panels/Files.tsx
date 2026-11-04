@@ -4,6 +4,8 @@ import { useStore } from "../store";
 import { openFile } from "../layout";
 import { statusMap } from "../git";
 import { isRemote, listDir } from "../fs";
+import { usePageVisible, usePanelVisible } from "../visibility";
+import type { IDockviewPanelProps } from "dockview";
 
 import type { Entry } from "../fs";
 
@@ -13,7 +15,8 @@ function fmtSize(n: number) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-export default function Files() {
+export default function Files(props: IDockviewPanelProps) {
+  const active = usePanelVisible(props.api) && usePageVisible();
   const cwd = useStore((s) => s.cwd);
   const kernel = useStore((s) => s.kernel);
   const remote = useStore((s) => s.remote);
@@ -42,10 +45,11 @@ export default function Files() {
     }
   };
   useEffect(() => {
+    if (!active) return; // hidden panels do not poll; reload on reveal
     load();
     const t = setInterval(load, isRemote() ? 8000 : 3000);
     return () => clearInterval(t);
-  }, [cwd, kernel, remote, connectionFile]);
+  }, [cwd, kernel, remote, connectionFile, active]);
 
   const up = () => cwd && setCwd(cwd.replace(/\/[^/]+\/?$/, "") || "/");
 

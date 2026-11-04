@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { get, pushConsole, set } from "./store";
 
 export interface StatusEntry { path: string; area: "staged" | "unstaged" | "untracked" | "conflicted"; code: string }
-export interface GitStatus { root: string; branch: string | null; head: string | null; detached: boolean; ahead: number; behind: number; upstream: string | null; entries: StatusEntry[] }
+export interface GitStatus { state: "clean" | "merge" | "rebase" | "cherrypick" | "revert" | "bisect" | "other"; root: string; branch: string | null; head: string | null; detached: boolean; ahead: number; behind: number; upstream: string | null; entries: StatusEntry[] }
 export interface Commit { id: string; short: string; parents: string[]; summary: string; body: string; author: string; email: string; time: number; refs: string[] }
 export interface FileDiff { path: string; old_path: string | null; code: string; old: string | null; new: string | null; binary: boolean; additions: number; deletions: number }
 

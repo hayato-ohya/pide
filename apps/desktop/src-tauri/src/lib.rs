@@ -589,6 +589,11 @@ pub fn run() {
             git::git_push,
             git::git_remotes,
             git::git_add_remote,
+            git::git_conflict,
+            git::git_resolve,
+            git::git_merge,
+            git::git_abort,
+            git::git_continue,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

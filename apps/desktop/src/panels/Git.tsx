@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { pushConsole, useStore } from "../store";
 import { gitCall, layoutGraph, refreshGit, type Commit, type FileDiff, type StatusEntry } from "../git";
-import { openDiff } from "../layout";
+import { openConflict, openDiff } from "../layout";
+import { usePanelVisible } from "../visibility";
+import type { IDockviewPanelProps } from "dockview";
 import { confirmAsync, promptAsync } from "../dialogs";
 
 const COLORS = ["#0076a8", "#d9534f", "#5cb85c", "#f0ad4e", "#8e44ad", "#17a2b8", "#e83e8c", "#6c757d"];
@@ -35,7 +37,8 @@ function Section({ title, entries, actions, onOpen }: { title: string; entries: 
   );
 }
 
-export default function Git() {
+export default function Git(props: IDockviewPanelProps) {
+  const visible = usePanelVisible(props.api);
   const git = useStore((s) => s.git);
   const cwd = useStore((s) => s.cwd);
   const [msg, setMsg] = useState("");
@@ -71,7 +74,7 @@ export default function Git() {
   };
   useEffect(() => { if (cwd && !git.error) invoke<any[]>("git_remotes", { cwd }).then(setRemotes).catch(() => setRemotes([])); }, [cwd, git.status?.root, git.error]);
 
-  useEffect(() => { refreshGit(); }, [cwd]);
+  useEffect(() => { if (visible) refreshGit(); }, [cwd, visible]);
 
   const st = git.status;
   const abs = (p: string) => `${st?.root}/${p}`;
@@ -81,7 +84,28 @@ export default function Git() {
   const conflicted = st?.entries.filter((e) => e.area === "conflicted") ?? [];
   const graph = useMemo(() => layoutGraph(git.log), [git.log]);
 
+  const resolve = async (paths: string[], side: "ours" | "theirs" | "workdir") => {
+    for (const p of paths) {
+      try {
+        await invoke("git_resolve", { cwd, path: p, side, allowMarkers: false });
+      } catch (e) {
+        if (/conflict markers/.test(String(e))) {
+          if (!(await confirmAsync(`${p} still contains conflict markers. Mark it resolved anyway?`))) continue;
+          await invoke("git_resolve", { cwd, path: p, side, allowMarkers: true }).catch((e2) => pushConsole({ kind: "info", text: `git: ${e2}` }));
+        } else pushConsole({ kind: "info", text: `git: ${e}` });
+      }
+    }
+    refreshGit();
+  };
+  const mergeBranch = async () => {
+    await loadBranches();
+    const name = await promptAsync("Merge branch into " + (st?.branch ?? "HEAD"), "", branches.find((b) => !b.current && !b.remote)?.name ?? "");
+    if (name) net(`merge ${name}`, "git_merge", { branch: name });
+  };
+  const opLabel = { merge: "Merge", rebase: "Rebase", cherrypick: "Cherry-pick", revert: "Revert", bisect: "Bisect", other: "Operation", clean: "" }[st?.state ?? "clean"];
+
   const openEntry = async (e: StatusEntry) => {
+    if (e.area === "conflicted") { openConflict(e.path); return; }
     const diffs = await invoke<FileDiff[]>("git_diff", { cwd, staged: e.area === "staged", path: abs(e.path) }).catch(() => []);
     const d = diffs.find((x) => x.path === e.path) ?? diffs[0];
     if (d) openDiff(d, e.area === "staged" ? "index" : "working tree");
@@ -120,6 +144,7 @@ export default function Git() {
           {branches.filter((b) => b.name !== st?.branch).map((b) => <option key={b.name} value={b.name}>{b.remote ? "☁ " : ""}{b.name}</option>)}
           <option value="__new__">＋ new branch…</option>
         </select>
+        <button disabled={!!busy || st?.state !== "clean"} onClick={mergeBranch} title="Merge another branch into the current one">⑂ Merge</button>
         {st && (st.ahead > 0 || st.behind > 0) && <span className="muted" title={`${st.ahead} to push, ${st.behind} to pull`}>↑{st.ahead} ↓{st.behind}</span>}
         <span className="git-net">
           {remotes && remotes.length === 0 ? (
@@ -143,6 +168,15 @@ export default function Git() {
         </span>
         <button onClick={refreshGit} title="Refresh">⟳</button>
       </div>
+      {st && st.state !== "clean" && (
+        <div className="git-banner" role="status">
+          <span>{opLabel} in progress{conflicted.length ? ` · ${conflicted.length} conflict${conflicted.length > 1 ? "s" : ""} to resolve` : " · all conflicts resolved"}</span>
+          <span className="git-actions">
+            <button disabled={!!busy || conflicted.length > 0} onClick={() => net(`${opLabel.toLowerCase()} --continue`, "git_continue")} title="Finish the operation (requires all conflicts staged)">Continue</button>
+            <button className="danger" disabled={!!busy} onClick={async () => { if (await confirmAsync(`Abort the ${opLabel.toLowerCase()}? Your working tree returns to the state before it started.`)) net(`${opLabel.toLowerCase()} --abort`, "git_abort"); }}>Abort</button>
+          </span>
+        </div>
+      )}
 
       {tab === "changes" && (
         <div className="git-body">
@@ -155,7 +189,11 @@ export default function Git() {
             </div>
           </div>
           <div className="git-lists">
-            <Section title="Conflicts" entries={conflicted} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }]} />
+            <Section title="Conflicts" entries={conflicted} onOpen={openEntry} actions={[
+              { label: "ours", fn: (p) => resolve(p, "ours") },
+              { label: "theirs", fn: (p) => resolve(p, "theirs") },
+              { label: "resolved", fn: (p) => resolve(p, "workdir") },
+            ]} />
             <Section title="Staged" entries={staged} onOpen={openEntry} actions={[{ label: "unstage", fn: (p) => gitCall("git_unstage", { paths: p.map(abs) }) }]} />
             <Section title="Changes" entries={unstaged} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }, { label: "discard", danger: true, fn: async (p) => { if (await confirmAsync(`Discard changes in ${p.length} file(s)? This cannot be undone.`)) gitCall("git_discard", { paths: p.map(abs) }); } }]} />
             <Section title="Untracked" entries={untracked} onOpen={openEntry} actions={[{ label: "stage", fn: (p) => gitCall("git_stage", { paths: p.map(abs) }) }]} />

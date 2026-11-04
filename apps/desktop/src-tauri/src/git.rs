@@ -1,5 +1,5 @@
 //! Git integration via libgit2 (git2 crate).  Read-mostly: status, log,
-//! diffs, plus staging and committing.  No network operations yet.
+//! diffs, staging, committing, conflict resolution; network ops via the git CLI.
 
 use std::path::{Path, PathBuf};
 
@@ -33,6 +33,8 @@ pub struct StatusEntry {
 
 #[derive(Serialize)]
 pub struct GitStatus {
+    /// "clean" | "merge" | "rebase" | "cherrypick" | "revert" | "bisect" | "other"
+    state: &'static str,
     root: String,
     branch: Option<String>,
     head: Option<String>,
@@ -89,7 +91,7 @@ pub fn git_status(cwd: String) -> Result<GitStatus, String> {
             entries.push(StatusEntry { path, area: "unstaged", code: code.into() });
         }
     }
-    Ok(GitStatus { root, branch, head: head_oid, detached, ahead, behind, upstream, entries })
+    Ok(GitStatus { state: repo_state(&repo), root, branch, head: head_oid, detached, ahead, behind, upstream, entries })
 }
 
 #[derive(Serialize)]
@@ -160,6 +162,19 @@ pub struct FileDiff {
     binary: bool,
     additions: usize,
     deletions: usize,
+}
+
+fn repo_state(repo: &Repository) -> &'static str {
+    use git2::RepositoryState as S;
+    match repo.state() {
+        S::Clean => "clean",
+        S::Merge => "merge",
+        S::Rebase | S::RebaseInteractive | S::RebaseMerge => "rebase",
+        S::CherryPick | S::CherryPickSequence => "cherrypick",
+        S::Revert | S::RevertSequence => "revert",
+        S::Bisect => "bisect",
+        _ => "other",
+    }
 }
 
 fn blob_text(repo: &Repository, oid: Oid) -> Option<String> {
@@ -351,6 +366,136 @@ pub fn git_init(cwd: String) -> Result<(), String> {
     Repository::init(&cwd).map(|_| ()).map_err(|e| e.message().to_string())
 }
 
+// ---------------------------------------------------------- conflicts ----
+
+#[derive(Serialize)]
+pub struct Conflict {
+    path: String,
+    /// Common ancestor, "ours" (HEAD side), "theirs" (merged side); None when that side deleted the file or it is binary.
+    base: Option<String>,
+    ours: Option<String>,
+    theirs: Option<String>,
+    /// Current working-tree text (with conflict markers), None if missing/binary/too large.
+    workdir: Option<String>,
+    binary: bool,
+}
+
+fn conflict_entry<'a>(repo: &'a Repository, idx: &'a git2::Index, path: &Path) -> Result<git2::IndexConflict, String> {
+    let want = path.to_string_lossy().to_string();
+    for c in idx.conflicts().map_err(|e| e.message().to_string())?.flatten() {
+        let p = c.our.as_ref().or(c.their.as_ref()).or(c.ancestor.as_ref()).map(|e| String::from_utf8_lossy(&e.path).to_string());
+        if p.as_deref() == Some(want.as_str()) {
+            return Ok(c);
+        }
+    }
+    let _ = repo;
+    Err(format!("{want} has no conflict in the index"))
+}
+
+#[tauri::command(async)]
+pub fn git_conflict(cwd: String, path: String) -> Result<Conflict, String> {
+    let repo = open(&cwd)?;
+    let r = rel(&repo, &path);
+    let idx = repo.index().map_err(|e| e.message().to_string())?;
+    let c = conflict_entry(&repo, &idx, &r)?;
+    let side = |e: &Option<git2::IndexEntry>| e.as_ref().map(|e| e.id);
+    let (b, o, t) = (side(&c.ancestor), side(&c.our), side(&c.their));
+    let binary = [b, o, t].iter().flatten().any(|oid| repo.find_blob(*oid).map(|bl| bl.is_binary()).unwrap_or(false));
+    let abs = workdir(&repo)?.join(&r);
+    let workdir = match std::fs::metadata(&abs) {
+        Ok(m) if m.len() <= MAX_DIFF_TEXT => std::fs::read(&abs).ok().map(|v| String::from_utf8_lossy(&v).to_string()),
+        _ => None,
+    };
+    Ok(Conflict {
+        path: r.to_string_lossy().to_string(),
+        base: b.and_then(|o| blob_text(&repo, o)),
+        ours: o.and_then(|o| blob_text(&repo, o)),
+        theirs: t.and_then(|o| blob_text(&repo, o)),
+        workdir,
+        binary,
+    })
+}
+
+/// Resolve a conflicted path: `side` is "ours" | "theirs" (write that version to the
+/// working tree) or "workdir" (keep the file as edited).  The path is then staged,
+/// which clears its conflict stages.  Unless `allow_markers`, a working-tree file
+/// that still contains `<<<<<<<` markers is rejected.
+#[tauri::command(async)]
+pub fn git_resolve(cwd: String, path: String, side: String, allow_markers: bool) -> Result<(), String> {
+    let repo = open(&cwd)?;
+    let r = rel(&repo, &path);
+    let mut idx = repo.index().map_err(|e| e.message().to_string())?;
+    let c = conflict_entry(&repo, &idx, &r)?;
+    let abs = workdir(&repo)?.join(&r);
+    match side.as_str() {
+        "ours" | "theirs" => {
+            let e = if side == "ours" { &c.our } else { &c.their };
+            match e {
+                Some(e) => {
+                    let blob = repo.find_blob(e.id).map_err(|e| e.message().to_string())?;
+                    if let Some(parent) = abs.parent() { let _ = std::fs::create_dir_all(parent); }
+                    std::fs::write(&abs, blob.content()).map_err(|e| e.to_string())?;
+                }
+                None => { let _ = std::fs::remove_file(&abs); }
+            }
+        }
+        "workdir" => {
+            if !allow_markers && abs.exists() {
+                let bytes = std::fs::read(&abs).map_err(|e| e.to_string())?;
+                let text = String::from_utf8_lossy(&bytes);
+                if text.lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "=======") {
+                    return Err("file still contains conflict markers".into());
+                }
+            }
+        }
+        _ => return Err(format!("unknown side {side:?}")),
+    }
+    if abs.exists() { idx.add_path(&r).map_err(|e| e.message().to_string())?; } else { idx.remove_path(&r).map_err(|e| e.message().to_string())?; }
+    idx.write().map_err(|e| e.message().to_string())
+}
+
+fn valid_ref(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) || name.contains("..") {
+        return Err(format!("invalid ref name {name:?}"));
+    }
+    Ok(())
+}
+
+/// `git merge --no-edit <branch>`; a conflict leaves the repo in the "merge" state.
+#[tauri::command]
+pub async fn git_merge(cwd: String, branch: String) -> Result<CmdResult, String> {
+    valid_ref(&branch)?;
+    run_git(&cwd, &["merge", "--no-edit", "--", &branch]).await
+}
+
+/// Abort the in-progress merge / rebase / cherry-pick / revert.
+#[tauri::command]
+pub async fn git_abort(cwd: String) -> Result<CmdResult, String> {
+    let state = { let repo = open(&cwd)?; repo_state(&repo) };
+    let op = match state {
+        "merge" => "merge",
+        "rebase" => "rebase",
+        "cherrypick" => "cherry-pick",
+        "revert" => "revert",
+        other => return Err(format!("nothing to abort (state: {other})")),
+    };
+    run_git(&cwd, &[op, "--abort"]).await
+}
+
+/// Continue the in-progress operation once every conflict is staged.
+#[tauri::command]
+pub async fn git_continue(cwd: String) -> Result<CmdResult, String> {
+    let state = { let repo = open(&cwd)?; repo_state(&repo) };
+    let op = match state {
+        "merge" => "merge",
+        "rebase" => "rebase",
+        "cherrypick" => "cherry-pick",
+        "revert" => "revert",
+        other => return Err(format!("nothing to continue (state: {other})")),
+    };
+    run_git(&cwd, &[op, "--continue"]).await
+}
+
 // ------------------------------------------------------------ network ----
 // fetch / pull / push go through the git CLI so the user's SSH agent and
 // credential helpers work unchanged (libgit2 would need its own callbacks).
@@ -370,6 +515,7 @@ async fn run_git(cwd: &str, args: &[&str]) -> Result<CmdResult, String> {
             .args(args)
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0") // never hang on a password prompt
+            .env("GIT_EDITOR", "true") // merge/rebase --continue must not open an editor
             .env("GIT_SSH_COMMAND", std::env::var("GIT_SSH_COMMAND").map(|v| format!("{v} -o BatchMode=yes")).unwrap_or_else(|_| "ssh -o BatchMode=yes".into()))
             .output(),
     )
