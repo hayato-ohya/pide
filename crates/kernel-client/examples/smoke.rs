@@ -1,5 +1,5 @@
 //! Cross-platform smoke test used by CI: launch ipykernel, run code, interrupt
-//! a sleeping cell (SIGINT on Unix, the interrupt event on Windows), shut down.
+//! a busy cell (SIGINT on Unix, the interrupt event on Windows), shut down.
 //! Usage: cargo run --example smoke -- <python>
 use std::collections::HashMap;
 use std::time::Duration;
@@ -66,22 +66,10 @@ async fn main() -> anyhow::Result<()> {
     let reply = wait_reply(&mut rx, &id, 30).await?;
     anyhow::ensure!(reply["status"] == "ok", "diagnostics cell failed: {reply}");
 
-    if cfg!(windows) {
-        let id = k.execute(r#"
-import ctypes, os, threading, time
-h = int(os.environ["JPY_INTERRUPT_EVENT"])
-threading.Timer(1.0, lambda: print("in-kernel SetEvent ->", ctypes.windll.kernel32.SetEvent(h))).start()
-try:
-    time.sleep(10); print("self-test: NOT interrupted")
-except KeyboardInterrupt:
-    print("self-test: interrupted OK")
-"#, false, false, HashMap::new(), false).await?;
-        let reply = wait_reply(&mut rx, &id, 30).await?;
-        println!("self-test reply status {}", reply["status"]);
-    }
-
-    // 2. interrupt a sleeping cell
-    let id = k.execute("import time\ntime.sleep(60)", false, true, HashMap::new(), false).await?;
+    // 2. interrupt a busy cell.  A Python-level loop (not time.sleep): on Windows the
+    // interrupt event only trips the eval loop, so a blocking C call such as
+    // time.sleep() is interrupted when it returns, exactly as in Jupyter.
+    let id = k.execute("i = 0\nwhile True:\n    i += 1", false, true, HashMap::new(), false).await?;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     k.interrupt().await?;
     let reply = wait_reply(&mut rx, &id, 20).await?;

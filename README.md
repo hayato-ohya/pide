@@ -28,7 +28,7 @@ macOS、Linux、Windows に対応しています。CI は 3 OS で Rust / フロ
 
 - macOS: 実機で動作確認している環境です
 - Linux: ビルドとカーネルのスモークテストは CI で確認。WebKitGTK(`libwebkit2gtk-4.1`)が必要です
-- Windows: ビルドとスモークテストは CI で確認(GUI の実機確認は未実施)。割り込みは Win32 イベント(`JPY_INTERRUPT_EVENT`)で行い、親プロセスの監視は継承ハンドル(`JPY_PARENT_PID`)で行います。インタープリタは `python.exe`(conda の `<env>\python.exe`、PATH)を検出し、linter / LSP は `<env>\Scripts` と PATH の `.exe` / `.cmd` を探します。ターミナルは pwsh / powershell / cmd。Git 操作は `git` コマンド(Git for Windows)が必要です。フロントエンドに渡すパスは常に `/` 区切りです
+- Windows: ビルドとスモークテストは CI で確認(GUI の実機確認は未実施)。割り込みは Win32 イベント(`JPY_INTERRUPT_EVENT`)で行い(CPython の仕様で Python のループは即座に止まるが、`time.sleep()` などの C 呼び出し中はその呼び出しが戻った時点で止まる。Jupyter と同じ挙動)、親プロセスの監視は継承ハンドル(`JPY_PARENT_PID`)で行います。インタープリタは `python.exe`(conda の `<env>\python.exe`、PATH)を検出し、linter / LSP は `<env>\Scripts` と PATH の `.exe` / `.cmd` を探します。ターミナルは pwsh / powershell / cmd。Git 操作は `git` コマンド(Git for Windows)が必要です。フロントエンドに渡すパスは常に `/` 区切りです
 
 ## 注意(プロジェクト設定の信頼)
 

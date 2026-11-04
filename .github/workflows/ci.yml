@@ -55,5 +55,5 @@ jobs:
       - name: Kernel smoke test (launch, snapshot, interrupt, shutdown)
         run: cargo run -p kernel-client --example smoke -- python
         env:
-          RUST_LOG: debug
+          RUST_LOG: kernel_client=info
       - run: cargo build -p pide-desktop

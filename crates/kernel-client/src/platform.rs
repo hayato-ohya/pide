@@ -1,7 +1,10 @@
 //! OS-specific helpers: how ipykernel is told about its parent and how it is
 //! interrupted.  Unix uses SIGINT and `JPY_PARENT_PID`; Windows uses two
 //! inheritable Win32 handles passed as `JPY_INTERRUPT_EVENT` / `JPY_PARENT_PID`
-//! (ipykernel's ParentPollerWindows waits on both).
+//! (ipykernel's ParentPollerWindows waits on both).  Note that on Windows the
+//! event only trips Python's eval loop (`_thread.interrupt_main`), so a cell
+//! blocked in a C call such as `time.sleep()` stops when that call returns;
+//! this matches Jupyter's behaviour there.
 
 use tokio::process::Command;
 
@@ -77,7 +80,7 @@ impl KernelHandles {
             use windows_sys::Win32::System::Threading::SetEvent;
             let ok = unsafe { SetEvent(self.interrupt_event as _) } != 0;
             let err = unsafe { GetLastError() };
-            tracing::info!("SetEvent(interrupt event {}) -> {ok} (GetLastError {err})", self.interrupt_event);
+            tracing::debug!("SetEvent(interrupt event {}) -> {ok} (GetLastError {err})", self.interrupt_event);
             ok
         }
         #[cfg(not(any(unix, windows)))]
