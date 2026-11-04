@@ -73,8 +73,12 @@ impl KernelHandles {
             if self.interrupt_event == 0 {
                 return false;
             }
+            use windows_sys::Win32::Foundation::GetLastError;
             use windows_sys::Win32::System::Threading::SetEvent;
-            unsafe { SetEvent(self.interrupt_event as _) != 0 }
+            let ok = unsafe { SetEvent(self.interrupt_event as _) } != 0;
+            let err = unsafe { GetLastError() };
+            tracing::info!("SetEvent(interrupt event {}) -> {ok} (GetLastError {err})", self.interrupt_event);
+            ok
         }
         #[cfg(not(any(unix, windows)))]
         {

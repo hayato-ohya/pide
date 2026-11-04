@@ -66,6 +66,20 @@ async fn main() -> anyhow::Result<()> {
     let reply = wait_reply(&mut rx, &id, 30).await?;
     anyhow::ensure!(reply["status"] == "ok", "diagnostics cell failed: {reply}");
 
+    if cfg!(windows) {
+        let id = k.execute(r#"
+import ctypes, os, threading, time
+h = int(os.environ["JPY_INTERRUPT_EVENT"])
+threading.Timer(1.0, lambda: print("in-kernel SetEvent ->", ctypes.windll.kernel32.SetEvent(h))).start()
+try:
+    time.sleep(10); print("self-test: NOT interrupted")
+except KeyboardInterrupt:
+    print("self-test: interrupted OK")
+"#, false, false, HashMap::new(), false).await?;
+        let reply = wait_reply(&mut rx, &id, 30).await?;
+        println!("self-test reply status {}", reply["status"]);
+    }
+
     // 2. interrupt a sleeping cell
     let id = k.execute("import time\ntime.sleep(60)", false, true, HashMap::new(), false).await?;
     tokio::time::sleep(Duration::from_millis(1500)).await;
