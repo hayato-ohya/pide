@@ -23,7 +23,7 @@ jobs:
           - os: macos-latest
             name: macOS (Apple Silicon)
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest  # cross-built from Apple Silicon (macos-13 runners are retired)
             name: macOS (Intel)
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
