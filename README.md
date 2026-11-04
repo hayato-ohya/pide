@@ -24,7 +24,11 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 
 ## 対応プラットフォーム
 
-現状は macOS と Linux を対象にしています。Windows はパス区切りやシェル起動の差異が未対応です。
+macOS、Linux、Windows に対応しています。CI は 3 OS で Rust / フロントエンドのビルドと、カーネルの起動・変数スナップショット・割り込み・終了を通すスモークテスト(`crates/kernel-client/examples/smoke.rs`)を実行します。
+
+- macOS: 実機で動作確認している環境です
+- Linux: ビルドとカーネルのスモークテストは CI で確認。WebKitGTK(`libwebkit2gtk-4.1`)が必要です
+- Windows: ビルドとスモークテストは CI で確認(GUI の実機確認は未実施)。割り込みは Win32 イベント(`JPY_INTERRUPT_EVENT`)で行い、親プロセスの監視は継承ハンドル(`JPY_PARENT_PID`)で行います。インタープリタは `python.exe`(conda の `<env>\python.exe`、PATH)を検出し、linter / LSP は `<env>\Scripts` と PATH の `.exe` / `.cmd` を探します。ターミナルは pwsh / powershell / cmd。Git 操作は `git` コマンド(Git for Windows)が必要です。フロントエンドに渡すパスは常に `/` 区切りです
 
 ## 注意(プロジェクト設定の信頼)
 

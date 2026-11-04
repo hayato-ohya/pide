@@ -34,7 +34,18 @@ struct PtyExit {
 }
 
 fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| if cfg!(windows) { "powershell.exe".into() } else { "/bin/sh".into() })
+    if cfg!(windows) {
+        // PowerShell if present, else the command interpreter.
+        if let Some(path) = std::env::var_os("PATH") {
+            for d in std::env::split_paths(&path) {
+                for n in ["pwsh.exe", "powershell.exe"] {
+                    if d.join(n).is_file() { return n.into(); }
+                }
+            }
+        }
+        return std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+    }
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
 
 #[tauri::command(async)]
@@ -57,7 +68,9 @@ pub fn pty_spawn(
         }
         None => {
             let mut c = CommandBuilder::new(default_shell());
-            c.arg("-l"); // login shell so conda / pyenv init runs
+            if !cfg!(windows) {
+                c.arg("-l"); // login shell so conda / pyenv init runs
+            }
             c
         }
     };

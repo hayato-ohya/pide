@@ -509,16 +509,14 @@ pub struct CmdResult {
 }
 
 async fn run_git(cwd: &str, args: &[&str]) -> Result<CmdResult, String> {
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_TERMINAL_PROMPT", "0") // never hang on a password prompt
-            .env("GIT_EDITOR", "true") // merge/rebase --continue must not open an editor
-            .env("GIT_SSH_COMMAND", std::env::var("GIT_SSH_COMMAND").map(|v| format!("{v} -o BatchMode=yes")).unwrap_or_else(|_| "ssh -o BatchMode=yes".into()))
-            .output(),
-    )
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0") // never hang on a password prompt
+        .env("GIT_EDITOR", "true") // merge/rebase --continue must not open an editor
+        .env("GIT_SSH_COMMAND", std::env::var("GIT_SSH_COMMAND").map(|v| format!("{v} -o BatchMode=yes")).unwrap_or_else(|_| "ssh -o BatchMode=yes".into()));
+    kernel_client::platform::quiet(&mut cmd);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(300), cmd.output())
     .await
     .map_err(|_| "git timed out after 300 s".to_string())?
     .map_err(|e| format!("git: {e}"))?;

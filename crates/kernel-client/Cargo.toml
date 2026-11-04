@@ -20,5 +20,8 @@ rand = "0.8"
 bytes = "1"
 tokio-util = "0.7"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

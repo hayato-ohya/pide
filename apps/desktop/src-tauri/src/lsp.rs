@@ -44,21 +44,34 @@ pub struct LspDetect {
     pub ruff: Option<String>,
 }
 
+/// Executable file names a tool may have on this platform.
+fn candidates(name: &str) -> Vec<String> {
+    if cfg!(windows) {
+        // pip console scripts are .exe; npm shims are .cmd; plain names last.
+        vec![format!("{name}.exe"), format!("{name}.cmd"), format!("{name}.bat"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
 fn find_near(python: &str, names: &[&str]) -> Option<String> {
-    let bin = PathBuf::from(python).parent().map(|p| p.to_path_buf());
-    for n in names {
-        if let Some(b) = &bin {
-            let p = b.join(n);
-            if p.exists() {
-                return Some(p.to_string_lossy().into());
-            }
+    let py = PathBuf::from(python);
+    let mut dirs: Vec<PathBuf> = vec![];
+    if let Some(b) = py.parent() {
+        dirs.push(b.to_path_buf());
+        if cfg!(windows) {
+            // <env>/python.exe keeps its console scripts in <env>/Scripts.
+            dirs.push(b.join("Scripts"));
         }
     }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            for n in names {
-                let p = PathBuf::from(dir).join(n);
-                if p.exists() {
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    for d in dirs {
+        for n in names {
+            for c in candidates(n) {
+                let p = d.join(&c);
+                if p.is_file() {
                     return Some(p.to_string_lossy().into());
                 }
             }
@@ -87,6 +100,7 @@ pub async fn lsp_start(
     lsp_stop_inner(&state, &name).await;
     let mut c = Command::new(&cmd);
     c.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    kernel_client::platform::quiet(&mut c);
     if let Some(d) = &cwd {
         c.current_dir(d);
     }
@@ -222,6 +236,7 @@ pub async fn run_tool(python: String, tool: String, args: Vec<String>, stdin: St
     };
     let mut c = Command::new(&bin);
     c.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    kernel_client::platform::quiet(&mut c);
     if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
         c.current_dir(d);
     }

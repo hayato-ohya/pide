@@ -52,7 +52,12 @@ export default function Files(props: IDockviewPanelProps) {
     return () => clearInterval(t);
   }, [cwd, kernel, remote, connectionFile, active]);
 
-  const up = () => cwd && setCwd(cwd.replace(/\/[^/]+\/?$/, "") || "/");
+  const up = () => {
+    if (!cwd) return;
+    const parent = cwd.replace(/\/[^/]+\/?$/, "");
+    // "C:" → "C:/" on Windows; "" → "/" elsewhere.
+    setCwd(/^[A-Za-z]:$/.test(parent) ? parent + "/" : parent || "/");
+  };
 
   return (
     <div className="files">

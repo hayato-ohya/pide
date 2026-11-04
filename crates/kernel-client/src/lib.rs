@@ -4,6 +4,7 @@
 
 pub mod message;
 pub mod launch;
+pub mod platform;
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -56,6 +57,8 @@ pub struct Kernel {
     /// Set by the heartbeat task after repeated misses.
     hb_dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _conn_file: Option<launch::ConnFile>,
+    /// Interrupt / parent handles for a locally launched kernel.
+    handles: platform::KernelHandles,
 }
 
 impl Drop for Kernel {
@@ -77,12 +80,16 @@ impl Kernel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        platform::quiet(&mut cmd);
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
+        // Never let a user's PYTHONPATH/cwd shadow stdlib modules the kernel imports.
+        cmd.env("PYTHONSAFEPATH", "1");
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        let handles = platform::KernelHandles::prepare(&mut cmd);
         let mut child = cmd.spawn().context("spawning ipykernel")?;
         // Forward kernel stderr/stdout to tracing so they are never lost.
         if let Some(out) = child.stdout.take() {
@@ -91,13 +98,13 @@ impl Kernel {
         if let Some(err) = child.stderr.take() {
             tokio::spawn(pipe_log("kernel.stderr", err));
         }
-        Self::connect_inner(info, Some(child), vec![], false, true, Some(conn_file)).await
+        Self::connect_inner(info, Some(child), vec![], false, true, Some(conn_file), handles).await
     }
 
     /// Connect to an already running kernel described by a connection file
     /// (e.g. a kernel started by hand, or in a container with published ports).
     pub async fn connect(info: ConnectionInfo) -> Result<Arc<Kernel>> {
-        Self::connect_inner(info, None, vec![], true, false, None).await
+        Self::connect_inner(info, None, vec![], true, false, None, Default::default()).await
     }
 
     /// Start a kernel on a remote host over SSH and tunnel its ports.
@@ -124,7 +131,7 @@ impl Kernel {
         up.args(base_args(&spec)).arg("--").arg(&spec.host)
             .arg("umask 077 && mkdir -p ~/.pide/pide_kernel && chmod 700 ~/.pide && cat > ~/.pide/pide_kernel/__init__.py")
             .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-        let mut up_child = up.spawn().context("ssh (upload helper)")?;
+        let mut up_child = platform::quiet(&mut up).spawn().context("ssh (upload helper)")?;
         if let Some(mut stdin) = up_child.stdin.take() {
             stdin.write_all(helper_src.as_bytes()).await?;
             drop(stdin);
@@ -158,7 +165,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         let mut run = Command::new(&ssh);
         run.args(base_args(&spec)).arg("--").arg(&spec.host).arg(&remote_cmd)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-        let mut kernel_child = run.spawn().context("ssh (start kernel)")?;
+        let mut kernel_child = platform::quiet(&mut run).spawn().context("ssh (start kernel)")?;
         let stdout = kernel_child.stdout.take().unwrap();
         if let Some(err) = kernel_child.stderr.take() {
             tokio::spawn(pipe_log("remote.stderr", err));
@@ -194,7 +201,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             tun.arg("-L").arg(format!("127.0.0.1:{l}:127.0.0.1:{r}"));
         }
         tun.arg("--").arg(&spec.host).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
-        let mut tun_child = tun.spawn().context("ssh (tunnel)")?;
+        let mut tun_child = platform::quiet(&mut tun).spawn().context("ssh (tunnel)")?;
         if let Some(err) = tun_child.stderr.take() {
             tokio::spawn(pipe_log("tunnel.stderr", err));
         }
@@ -202,7 +209,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
         let info = ConnectionInfo { key: remote_info.key.clone(), signature_scheme: remote_info.signature_scheme.clone(), ..local };
-        Self::connect_inner(info, Some(kernel_child), vec![tun_child], true, true, None).await
+        Self::connect_inner(info, Some(kernel_child), vec![tun_child], true, true, None, Default::default()).await
     }
 
     async fn connect_inner(
@@ -212,6 +219,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         remote: bool,
         owned: bool,
         conn_file: Option<launch::ConnFile>,
+        handles: platform::KernelHandles,
     ) -> Result<Arc<Kernel>> {
         if info.signature_scheme != "hmac-sha256" && !info.key.is_empty() {
             anyhow::bail!("unsupported signature scheme {:?}", info.signature_scheme);
@@ -332,6 +340,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             cancel,
             hb_dead,
             _conn_file: conn_file,
+            handles,
         });
 
         // Wait until the kernel answers kernel_info (ipykernel needs ~1s to bind).
@@ -463,12 +472,8 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                 return Ok(());
             }
             if let Some(pid) = c.id() {
-                #[cfg(unix)]
-                unsafe {
-                    libc_kill(pid as i32, 2);
-                }
-                #[cfg(not(unix))]
-                {
+                if !self.handles.interrupt(pid) {
+                    // No signal/event available: ask the kernel over the control channel.
                     let (_, msg) = self.build("interrupt_request", json!({}));
                     self.control_tx.send(msg).await?;
                 }
@@ -553,14 +558,6 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             }
         }
     }
-}
-
-#[cfg(unix)]
-unsafe fn libc_kill(pid: i32, sig: i32) {
-    extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    kill(pid, sig);
 }
 
 async fn dealer(

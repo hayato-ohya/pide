@@ -174,9 +174,9 @@ export function frameLabel(path: string | null, line: number): string {
   const cell = get().debug.cellFiles[path];
   if (cell) {
     if (cell.uri.startsWith("vscode-notebook-cell:")) return `${decodeURIComponent(new URL(cell.uri).pathname).split("/").pop()} cell:${line}`;
-    return `${(cell.path ?? cell.uri).split("/").pop()} (cell):${line + cell.startLine - 1}`;
+    return `${(cell.path ?? cell.uri).split(/[\\/]/).pop()} (cell):${line + cell.startLine - 1}`;
   }
-  return `${path.split("/").pop()}:${line}`;
+  return `${path.split(/[\\/]/).pop()}:${line}`;
 }
 
 export async function selectFrame(frameId: number) {

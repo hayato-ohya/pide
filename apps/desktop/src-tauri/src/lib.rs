@@ -113,14 +113,15 @@ async fn start_kernel(
     }
     let python = python
         .or(state.python.lock().await.clone())
-        .unwrap_or_else(|| "python3".to_string());
+        .unwrap_or_else(|| default_python().to_string());
     let cwd = cwd.or(state.cwd.lock().await.clone());
     emit_status(&app, "starting", Some(python.clone()), cwd.clone(), None);
 
     let helper = helper_dir(&app);
     let mut pythonpath = helper.to_string_lossy().to_string();
     if let Ok(existing) = std::env::var("PYTHONPATH") {
-        pythonpath = format!("{pythonpath}:{existing}");
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        pythonpath = format!("{pythonpath}{sep}{existing}");
     }
     let spec = LaunchSpec {
         python: PathBuf::from(&python),
@@ -129,9 +130,7 @@ async fn start_kernel(
             ("PYTHONPATH".into(), pythonpath),
             ("MPLBACKEND".into(), "module://matplotlib_inline.backend_inline".into()),
             // ipykernel's parent poller exits the kernel when Pide dies (also on crash).
-            ("JPY_PARENT_PID".into(), std::process::id().to_string()),
             // Python >= 3.11: do not put the cwd first on sys.path (untrusted folders).
-            ("PYTHONSAFEPATH".into(), "1".into()),
         ],
     };
     let launched = if let Some(mut r) = remote {
@@ -399,7 +398,7 @@ fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
         }
         out.push(DirEntry {
             name,
-            path: e.path().to_string_lossy().to_string(),
+            path: fwd(&e.path()),
             is_dir: md.is_dir(),
             size: md.len(),
             modified: md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
@@ -465,39 +464,72 @@ fn write_binary_file(path: String, b64: String) -> Result<(), String> {
     write_atomic(&path, &bytes)
 }
 
-#[tauri::command]
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+/// The user's home directory (HOME on Unix, USERPROFILE on Windows).
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:/" } else { "/" }))
 }
 
-/// Candidate interpreters: PATH python3, conda base + envs, common venvs.
+/// Paths handed to the frontend always use forward slashes (Windows accepts them too).
+fn fwd(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if cfg!(windows) { s.replace('\\', "/") } else { s.into_owned() }
+}
+
+fn default_python() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
+#[tauri::command]
+fn home_dir() -> String {
+    fwd(&home())
+}
+
+/// Candidate interpreters: conda base + envs, pyenv, then every python on PATH.
 #[tauri::command(async)]
 fn detect_pythons() -> Vec<String> {
     let mut found: Vec<String> = vec![];
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    for root in ["miniconda3", "anaconda3", "miniforge3", "mambaforge", ".pyenv/versions"] {
-        let base = home.join(root);
-        if base.join("bin/python").exists() {
-            found.push(base.join("bin/python").to_string_lossy().into());
+    let mut push = |p: PathBuf| {
+        if p.exists() {
+            let s = fwd(&p);
+            if !found.contains(&s) {
+                found.push(s);
+            }
         }
-        let envs = if root == ".pyenv/versions" { base.clone() } else { base.join("envs") };
-        if let Ok(rd) = std::fs::read_dir(&envs) {
-            for e in rd.flatten() {
-                let p = e.path().join("bin/python");
-                if p.exists() {
-                    found.push(p.to_string_lossy().into());
-                }
+    };
+    let home = home();
+    // conda-style env layout: <env>/bin/python on Unix, <env>/python.exe on Windows.
+    let env_python = |env: &std::path::Path| if cfg!(windows) { env.join("python.exe") } else { env.join("bin/python") };
+    let mut roots: Vec<PathBuf> = ["miniconda3", "anaconda3", "miniforge3", "mambaforge", ".pyenv/versions"].iter().map(|r| home.join(r)).collect();
+    if cfg!(windows) {
+        for base in [std::env::var_os("LOCALAPPDATA"), std::env::var_os("PROGRAMDATA")].into_iter().flatten() {
+            for r in ["miniconda3", "anaconda3", "miniforge3", "Miniconda3", "Anaconda3"] {
+                roots.push(PathBuf::from(&base).join(r));
             }
         }
     }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            let p = PathBuf::from(dir).join("python3");
-            if p.exists() {
-                let s = p.to_string_lossy().to_string();
-                if !found.contains(&s) {
-                    found.push(s);
-                }
+    for base in roots {
+        let is_pyenv = base.ends_with("versions");
+        if !is_pyenv {
+            push(env_python(&base));
+        }
+        let envs = if is_pyenv { base.clone() } else { base.join("envs") };
+        if let Ok(rd) = std::fs::read_dir(&envs) {
+            for e in rd.flatten() {
+                push(env_python(&e.path()));
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if cfg!(windows) {
+                // Skip the Microsoft Store alias stubs, which only open the Store.
+                if dir.to_string_lossy().contains("WindowsApps") { continue; }
+                push(dir.join("python.exe"));
+            } else {
+                push(dir.join("python3"));
             }
         }
     }
@@ -505,7 +537,7 @@ fn detect_pythons() -> Vec<String> {
 }
 
 fn dirs_log_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let home = home();
     if cfg!(target_os = "macos") { home.join("Library/Logs/Pide") }
     else if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or(home).join("Pide/logs") }
     else { std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("pide/logs") }

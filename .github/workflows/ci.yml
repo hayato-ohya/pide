@@ -11,7 +11,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -26,10 +26,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Kernel for the smoke test
+        run: pip install ipykernel numpy
       - uses: Swatinem/rust-cache@v2
       - name: Linux webkit deps
         if: runner.os == 'Linux'
@@ -47,4 +52,8 @@ jobs:
         run: npm run build
         working-directory: apps/desktop
       - run: cargo test -p kernel-client
+      - name: Kernel smoke test (launch, snapshot, interrupt, shutdown)
+        run: cargo run -p kernel-client --example smoke -- python
+        env:
+          RUST_LOG: kernel_client=info
       - run: cargo build -p pide-desktop
