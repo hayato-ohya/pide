@@ -15,9 +15,9 @@ apps/desktop/           Tauri アプリ
 ## 検証用 conda 環境
 
 ```
-conda create -n pide-test python=3.12
-~/miniconda3/envs/pide-test/bin/python -m pip install ipykernel numpy pandas polars pyarrow matplotlib plotly scipy scikit-learn pillow xarray torch torchvision jax basedpyright ruff
-PIDE_PYTHON=~/miniconda3/envs/pide-test/bin/python npm run tauri dev   # この環境で起動
+conda create -n pyide-test python=3.12
+~/miniconda3/envs/pyide-test/bin/python -m pip install ipykernel numpy pandas polars pyarrow matplotlib plotly scipy scikit-learn pillow xarray torch torchvision jax basedpyright ruff
+PIDE_PYTHON=~/miniconda3/envs/pyide-test/bin/python npm run tauri dev   # この環境で起動
 ```
 
 Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy、pandas(category / datetime / NaN 含む)、polars DataFrame / Series、torch Tensor(CPU / MPS / requires_grad / float16 / bool)、torch.nn.Module(パラメータ一覧、`model.0.weight` のように掘れる)、jax Array、xarray DataArray、PIL Image、scikit-learn 推定器(属性一覧)。
@@ -25,6 +25,10 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 ## 対応プラットフォーム
 
 現状は macOS と Linux を対象にしています。Windows はパス区切りやシェル起動の差異が未対応です。
+
+## 注意(プロジェクト設定の信頼)
+
+flake8 / pylint / black / autopep8 はプロジェクトのフォルダで実行するため、そのフォルダの設定ファイル(たとえば `.pylintrc` の `init-hook`)に書かれたコードが実行される。カーネルでプロジェクトのコードを実行するのと同じ信頼レベルなので、信用できないリポジトリを開くときは linter を ruff か none にしておく。
 
 ## ログ
 
@@ -88,6 +92,14 @@ Workspace / Variable Viewer / 画像ビューワーで検証済みの型: numpy�
 - 差分ビューワー: ファイルをダブルクリックで Monaco の左右差分(作業ツリー / インデックス / 任意コミット)
 - ipynb のセル単位差分: cell id(なければソースの LCS)でセルを対応付け、変更セルはインライン差分、追加 / 削除セルは色分け。出力は無視し、出力数の変化だけ注記
 - Current Folder にファイルの状態バッジ(M / A / D / ? と、配下に変更があるフォルダの •)
+- コンフリクト解決: 「⑂ Merge」でブランチをマージ。merge / rebase / cherry-pick / revert の途中はパネル上部にバナー(Continue / Abort)。Conflicts の各ファイルは ours / theirs / resolved(作業ツリーのまま stage)をワンクリック、ダブルクリックで ours ⇄ theirs / base ⇄ ours / base ⇄ theirs / ours ⇄ 作業ツリーの比較ビュー。エディタではコンフリクト範囲を色分けし、上部バーの Accept ours / theirs / both / Next と「Mark resolved」(保存して stage)で解決できる。マーカーが残ったままの stage は確認を求める
+- Current Folder と Git パネルは表示中だけポーリングする(非表示タブや最小化中は停止、ウィンドウにフォーカスが戻ると即更新)
+
+### アクセシビリティ
+
+- ダイアログは `role="dialog"` でフォーカスを閉じ込め、Esc で閉じ、閉じた後は元の要素にフォーカスを戻す
+- アイコンだけのボタンには `aria-label`、ステータスバーはライブリージョン
+- キーボード操作: リボンのタブは ← →、Workspace / Current Folder の行は ↑ ↓ Home End、Enter で開く(Current Folder は Backspace で上へ)、Workspace の Shift+F10 でコンテキストメニュー(メニュー内は ↑ ↓ Enter Esc)、Git の行は Enter で差分 / コンフリクトビュー
 
 ## 実装済み(第 5 段階: デバッガとリモートカーネル)
 
@@ -135,7 +147,6 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 
 ## 今後の候補
 
-- Git のコンフリクト解決の支援
 - 配布ビルド(`npm run tauri build`)とコード署名
 
 ## ライセンス
