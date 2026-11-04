@@ -42,7 +42,19 @@ flake8 / pylint / black / autopep8 はプロジェクトのフォルダで実行
 
 - Rust: `cargo test -p kernel-client`(HMAC 署名の往復・改ざん検出、シェル引用、接続情報)
 - Python: `python -m pytest python/tests -q`(ヘルパーのスナップショット、パス解決、統計、プロット、ファイル操作)
-- GitHub Actions(`.github/workflows/ci.yml`)が push / PR ごとに macOS と Linux で上記とフロントエンドのビルドを実行します
+- GitHub Actions(`.github/workflows/ci.yml`)が push / PR ごとに macOS / Linux / Windows で上記とフロントエンドのビルド、カーネルのスモークテストを実行します
+
+## 配布ビルド
+
+```
+cd apps/desktop && npm run tauri build
+```
+
+成果物は `target/release/bundle/` に出ます(macOS: `macos/Pide.app` と `dmg/Pide_<version>_aarch64.dmg`、Linux: `deb/` と `appimage/`、Windows: `msi/` と `nsis/`)。Python ヘルパー(`python/pide_kernel`)はアプリのリソースとして同梱されるので、実行には Python 3.10 以上と `ipykernel`(デバッグには `debugpy`、補完には `basedpyright` / `ruff`)が入った環境だけが必要です。
+
+`v*` のタグを push すると `.github/workflows/release.yml` が 4 ターゲット(macOS Apple Silicon / Intel、Linux x86_64、Windows x86_64)のインストーラを作り、ドラフトの GitHub Release に添付します(`workflow_dispatch` で手動実行した場合は Actions のアーティファクトに残ります)。
+
+署名はしていません。macOS では初回に Finder で右クリック → 開く、または `xattr -d com.apple.quarantine /Applications/Pide.app`。Windows では SmartScreen の「詳細情報 → 実行」が必要です。Apple Developer ID / Windows のコード署名証明書を用意したら、`APPLE_CERTIFICATE` などの secrets を tauri-action に渡すだけで署名・公証できます。
 
 ## 開発環境
 
@@ -151,7 +163,8 @@ VIEW タブの THEME で Light / Dark / System を切り替えられる(保存�
 
 ## 今後の候補
 
-- 配布ビルド(`npm run tauri build`)とコード署名
+- コード署名と公証(Apple Developer ID、Windows 証明書)
+- Windows / Linux の GUI の実機確認
 
 ## ライセンス
 
