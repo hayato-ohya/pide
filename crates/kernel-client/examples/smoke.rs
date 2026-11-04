@@ -10,11 +10,37 @@ async fn wait_reply(rx: &mut tokio::sync::broadcast::Receiver<kernel_client::Eve
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let ev = tokio::time::timeout_at(deadline, rx.recv()).await??;
-        if ev.channel == Channel::Shell && ev.msg.msg_type() == "execute_reply" && ev.msg.parent_id() == Some(id) {
+        if ev.msg.parent_id() != Some(id) {
+            continue;
+        }
+        if ev.channel == Channel::IoPub && ev.msg.msg_type() == "stream" {
+            print!("  [{}] {}", ev.msg.content["name"].as_str().unwrap_or("?"), ev.msg.content["text"].as_str().unwrap_or(""));
+        }
+        if ev.channel == Channel::Shell && ev.msg.msg_type() == "execute_reply" {
             return Ok(ev.msg.content.clone());
         }
     }
 }
+
+/// What the kernel sees of the interrupt plumbing (printed for CI logs).
+const DIAG: &str = r#"
+import os, signal, sys, threading
+print("python", sys.version.split()[0], "platform", sys.platform)
+print("env JPY_INTERRUPT_EVENT", os.environ.get("JPY_INTERRUPT_EVENT"), "JPY_PARENT_PID", os.environ.get("JPY_PARENT_PID"))
+try:
+    import ipykernel; print("ipykernel", ipykernel.__version__)
+    from ipykernel.kernelapp import IPKernelApp
+    app = IPKernelApp.instance()
+    p = app.poller
+    print("poller", type(p).__name__ if p else None, "alive", p.is_alive() if p else None, "interrupt_handle", getattr(p, "interrupt_handle", None), "parent_handle", getattr(p, "parent_handle", None))
+except Exception as e:
+    print("poller error", e)
+print("sigint handler", signal.getsignal(signal.SIGINT), "main thread", threading.current_thread() is threading.main_thread())
+if sys.platform == "win32":
+    import ctypes
+    h = int(os.environ.get("JPY_INTERRUPT_EVENT") or 0)
+    print("WaitForSingleObject(event, 0) ->", ctypes.windll.kernel32.WaitForSingleObject(h, 0), "(258 = valid+unsignalled, 4294967295 = invalid handle; err", ctypes.windll.kernel32.GetLastError(), ")")
+"#;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
     let names: Vec<&str> = vars.iter().filter_map(|v| v["name"].as_str()).collect();
     anyhow::ensure!(names.contains(&"x") && names.contains(&"y"), "snapshot missing variables: {names:?}");
     println!("snapshot ok: {names:?}");
+
+    let id = k.execute(DIAG, false, false, HashMap::new(), false).await?;
+    let reply = wait_reply(&mut rx, &id, 30).await?;
+    anyhow::ensure!(reply["status"] == "ok", "diagnostics cell failed: {reply}");
 
     // 2. interrupt a sleeping cell
     let id = k.execute("import time\ntime.sleep(60)", false, true, HashMap::new(), false).await?;
