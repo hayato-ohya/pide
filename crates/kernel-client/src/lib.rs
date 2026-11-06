@@ -154,12 +154,17 @@ f=os.path.join(d,"kernel-%d.json"%os.getpid()); json.dump(info,open(f,"w"))
 print("PIDE_CONN:"+json.dumps(info),flush=True)
 os.environ["PYTHONPATH"]=os.path.expanduser("~/.pide")+os.pathsep+os.environ.get("PYTHONPATH","")
 os.environ.setdefault("MPLBACKEND","module://matplotlib_inline.backend_inline")
+# Let ipykernel's ParentPollerUnix exit the kernel as soon as its parent (the SSH session shell,
+# or the app when this bootstrap runs locally) goes away, however the parent dies.
+os.environ["JPY_PARENT_PID"]=str(os.getppid())
 os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         let b64 = b64encode(bootstrap.as_bytes());
         // cwd is handed to Python (expanduser + chdir) so no shell quoting of user paths is needed.
         let cwd_b64 = b64encode(cwd.as_bytes());
+        // `exec` replaces the login shell with Python so the kernel is a direct child of the SSH
+        // session: no intermediate `sh` survives to keep an orphaned kernel alive.
         let remote_cmd = format!(
-            "PIDE_CWD_B64={} {} -c \"import base64,os;os.chdir(os.path.expanduser(base64.b64decode(os.environ['PIDE_CWD_B64']).decode()));exec(base64.b64decode('{}'))\"",
+            "PIDE_CWD_B64={} exec {} -c \"import base64,os;os.chdir(os.path.expanduser(base64.b64decode(os.environ['PIDE_CWD_B64']).decode()));exec(base64.b64decode('{}'))\"",
             cwd_b64, shell_quote(&spec.python), b64
         );
         let mut run = Command::new(&ssh);
