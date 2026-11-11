@@ -547,7 +547,8 @@ def test_fs_crlf_roundtrip_nonutf8_and_atomic_write(tmp_path):
     f.chmod(0o640)
     assert payload(k.fs_write(str(f), base64.b64encode(text.encode()).decode()))["ok"] is True
     assert f.read_bytes() == b"a\r\nb\r\n"
-    assert stat.S_IMODE(os.stat(f).st_mode) == 0o640
+    if os.name != "nt":  # Windows has no POSIX permission bits
+        assert stat.S_IMODE(os.stat(f).st_mode) == 0o640
     assert [p.name for p in tmp_path.iterdir()] == ["crlf.txt"]  # no temp left behind
     bad = tmp_path / "latin.txt"
     bad.write_bytes(b"caf\xe9")
