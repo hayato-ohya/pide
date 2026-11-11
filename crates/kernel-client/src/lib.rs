@@ -6,8 +6,9 @@ pub mod message;
 pub mod launch;
 pub mod platform;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -16,7 +17,8 @@ use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
-use zeromq::{DealerSendHalf, DealerSocket, ReqSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+use zeromq::util::PeerIdentity;
+use zeromq::{DealerSendHalf, DealerSocket, ReqSocket, Socket, SocketOptions, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 pub use launch::{ConnectionInfo, LaunchSpec};
 pub use message::{Header, Message, Signer};
@@ -54,8 +56,11 @@ pub struct Kernel {
     events: broadcast::Sender<Event>,
     /// Cancels every task spawned for this kernel (socket pumps, heartbeat).
     cancel: CancellationToken,
-    /// Set by the heartbeat task after repeated misses.
-    hb_dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the heartbeat task after repeated misses, cleared when it answers again.
+    hb_dead: Arc<AtomicBool>,
+    /// Set when a socket pump fails: zeromq 0.7 DEALERs do not reconnect, so the
+    /// channel is gone for good and the kernel must be restarted.
+    link_dead: Arc<AtomicBool>,
     _conn_file: Option<launch::ConnFile>,
     /// Interrupt / parent handles for a locally launched kernel.
     handles: platform::KernelHandles,
@@ -93,12 +98,13 @@ impl Kernel {
         let mut child = cmd.spawn().context("spawning ipykernel")?;
         // Forward kernel stderr/stdout to tracing so they are never lost.
         if let Some(out) = child.stdout.take() {
-            tokio::spawn(pipe_log("kernel.stdout", out));
+            tokio::spawn(pipe_log("kernel.stdout", out, None));
         }
-        if let Some(err) = child.stderr.take() {
-            tokio::spawn(pipe_log("kernel.stderr", err));
-        }
-        Self::connect_inner(info, Some(child), vec![], false, true, Some(conn_file), handles).await
+        let tail = match child.stderr.take() {
+            Some(err) => StderrTail::spawn("kernel.stderr", err),
+            None => StderrTail::default(),
+        };
+        Self::connect_inner(info, Some((child, tail)), vec![], false, true, Some(conn_file), handles).await
     }
 
     /// Connect to an already running kernel described by a connection file
@@ -120,7 +126,11 @@ impl Kernel {
         }
         let ssh = spec.ssh.clone().unwrap_or_else(|| "ssh".into());
         let base_args = |s: &launch::RemoteSpec| -> Vec<String> {
-            let mut a = vec!["-o".into(), "BatchMode=yes".into(), "-o".into(), "ServerAliveInterval=15".into()];
+            let mut a = vec![
+                "-o".into(), "BatchMode=yes".into(),
+                "-o".into(), "ServerAliveInterval=15".into(),
+                "-o".into(), "ConnectTimeout=15".into(),
+            ];
             if let Some(p) = s.port { a.push("-p".into()); a.push(p.to_string()); }
             a.extend(s.ssh_args.clone());
             a
@@ -133,12 +143,14 @@ impl Kernel {
             .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut up_child = platform::quiet(&mut up).spawn().context("ssh (upload helper)")?;
         if let Some(mut stdin) = up_child.stdin.take() {
-            stdin.write_all(helper_src.as_bytes()).await?;
+            // A write error (EPIPE when ssh fails to connect) is reported below via ssh's own
+            // exit status and stderr, which say what actually went wrong.
+            let _ = stdin.write_all(helper_src.as_bytes()).await;
             drop(stdin);
         }
         let st = up_child.wait_with_output().await?;
         if !st.status.success() {
-            anyhow::bail!("ssh upload failed: {}", String::from_utf8_lossy(&st.stderr).trim());
+            anyhow::bail!("ssh upload failed ({}): {}", st.status, String::from_utf8_lossy(&st.stderr).trim());
         }
 
         // 2. remote bootstrap: free ports → connection file → exec ipykernel
@@ -172,18 +184,26 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut kernel_child = platform::quiet(&mut run).spawn().context("ssh (start kernel)")?;
         let stdout = kernel_child.stdout.take().unwrap();
-        if let Some(err) = kernel_child.stderr.take() {
-            tokio::spawn(pipe_log("remote.stderr", err));
-        }
+        let tail = match kernel_child.stderr.take() {
+            Some(err) => StderrTail::spawn("remote.stderr", err),
+            None => StderrTail::default(),
+        };
         let mut lines = tokio::io::BufReader::new(stdout).lines();
-        let remote_info: ConnectionInfo = loop {
-            let line = tokio::time::timeout(std::time::Duration::from_secs(60), lines.next_line()).await
-                .context("timeout waiting for remote kernel to start")??
-                .ok_or_else(|| anyhow::anyhow!("remote kernel exited before printing connection info"))?;
-            if let Some(json) = line.strip_prefix("PIDE_CONN:") {
-                break serde_json::from_str(json).context("parsing remote connection info")?;
+        let remote_info: Result<ConnectionInfo> = async {
+            loop {
+                let line = tokio::time::timeout(std::time::Duration::from_secs(60), lines.next_line()).await
+                    .context("timeout waiting for remote kernel to start")??
+                    .ok_or_else(|| anyhow::anyhow!("remote kernel exited before printing connection info"))?;
+                if let Some(json) = line.strip_prefix("PIDE_CONN:") {
+                    return serde_json::from_str(json).context("parsing remote connection info");
+                }
+                tracing::debug!(target: "kernel", "[remote.stdout] {line}");
             }
-            tracing::debug!(target: "kernel", "[remote.stdout] {line}");
+        }
+        .await;
+        let remote_info = match remote_info {
+            Ok(i) => i,
+            Err(e) => return Err(tail.annotate(e).await),
         };
         tokio::spawn(async move {
             while let Ok(Some(l)) = lines.next_line().await {
@@ -201,26 +221,45 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             (local.hb_port, remote_info.hb_port),
         ];
         let mut tun = Command::new(&ssh);
-        tun.args(base_args(&spec)).arg("-N");
+        // ExitOnForwardFailure: a port that cannot be forwarded ends ssh instead of leaving a
+        // tunnel that silently drops that channel.
+        tun.args(base_args(&spec)).args(["-o", "ExitOnForwardFailure=yes", "-N"]);
         for (l, r) in pairs {
             tun.arg("-L").arg(format!("127.0.0.1:{l}:127.0.0.1:{r}"));
         }
         tun.arg("--").arg(&spec.host).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut tun_child = platform::quiet(&mut tun).spawn().context("ssh (tunnel)")?;
         if let Some(err) = tun_child.stderr.take() {
-            tokio::spawn(pipe_log("tunnel.stderr", err));
+            tokio::spawn(pipe_log("tunnel.stderr", err, None));
         }
         // give the tunnel a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
         let info = ConnectionInfo { key: remote_info.key.clone(), signature_scheme: remote_info.signature_scheme.clone(), ..local };
-        Self::connect_inner(info, Some(kernel_child), vec![tun_child], true, true, None, Default::default()).await
+        Self::connect_inner(info, Some((kernel_child, tail)), vec![tun_child], true, true, None, Default::default()).await
     }
 
+    /// Connect, and on failure append what the kernel process wrote to stderr.
     async fn connect_inner(
         info: ConnectionInfo,
-        child: Option<Child>,
+        child: Option<(Child, StderrTail)>,
         extra: Vec<Child>,
+        remote: bool,
+        owned: bool,
+        conn_file: Option<launch::ConnFile>,
+        handles: platform::KernelHandles,
+    ) -> Result<Arc<Kernel>> {
+        let (child, tail) = child.unzip();
+        match (Self::connect_channels(info, child, extra, remote, owned, conn_file, handles).await, tail) {
+            (Err(e), Some(tail)) => Err(tail.annotate(e).await),
+            (r, _) => r,
+        }
+    }
+
+    async fn connect_channels(
+        info: ConnectionInfo,
+        mut child: Option<Child>,
+        mut extra: Vec<Child>,
         remote: bool,
         owned: bool,
         conn_file: Option<launch::ConnFile>,
@@ -235,22 +274,40 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         let (events, _) = broadcast::channel(65_536);
         let cancel = CancellationToken::new();
 
-        let ep = |port: u16| format!("tcp://{}:{}", info.ip, port);
+        let link_dead = Arc::new(AtomicBool::new(false));
+
+        // A kernel bound to all interfaces is reached over loopback.
+        let host = match info.ip.as_str() {
+            "0.0.0.0" | "*" => "127.0.0.1",
+            ip => ip,
+        };
+        let ep = |port: u16| format!("tcp://{host}:{port}");
 
         // Dealer sockets (shell / control / stdin): a send half fed by an mpsc
-        // and a recv half pumped into the broadcast channel.
-        let shell_tx = dealer(&ep(info.shell_port), Channel::Shell, signer.clone(), events.clone(), cancel.clone()).await?;
-        let control_tx = dealer(&ep(info.control_port), Channel::Control, signer.clone(), events.clone(), cancel.clone()).await?;
-        let stdin_tx = dealer(&ep(info.stdin_port), Channel::Stdin, signer.clone(), events.clone(), cancel.clone()).await?;
-
-        // IOPub subscriber.
-        let mut sub = SubSocket::new();
-        sub.connect(&ep(info.iopub_port)).await.context("connect iopub")?;
-        sub.subscribe("").await?;
+        // and a recv half pumped into the broadcast channel.  zeromq retries a
+        // refused connect for up to 30 s, so race it against the kernel dying.
+        let setup = async {
+            let d = |port: u16, channel: Channel| {
+                dealer(ep(port), channel, &session, signer.clone(), events.clone(), cancel.clone(), link_dead.clone())
+            };
+            let shell_tx = d(info.shell_port, Channel::Shell).await?;
+            let control_tx = d(info.control_port, Channel::Control).await?;
+            let stdin_tx = d(info.stdin_port, Channel::Stdin).await?;
+            // IOPub subscriber.
+            let mut sub = SubSocket::new();
+            sub.connect(&ep(info.iopub_port)).await.context("connect iopub")?;
+            sub.subscribe("").await?;
+            anyhow::Ok((shell_tx, control_tx, stdin_tx, sub))
+        };
+        let (shell_tx, control_tx, stdin_tx, mut sub) = tokio::select! {
+            r = setup => r?,
+            e = exited(&mut child, &mut extra) => return Err(e),
+        };
         {
             let signer = signer.clone();
             let events = events.clone();
             let cancel = cancel.clone();
+            let link_dead = link_dead.clone();
             tokio::spawn(async move {
                 loop {
                     let m = tokio::select! {
@@ -266,6 +323,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                         },
                         Err(e) => {
                             tracing::warn!("iopub closed: {e}");
+                            link_dead.store(true, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -274,14 +332,20 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             });
         }
 
-        // Heartbeat: REQ/REP ping every 3 s; three misses mark the kernel dead.
-        let hb_dead;
+        // Heartbeat: REQ/REP ping every 3 s; three misses mark the kernel dead
+        // until it answers again.  Started only once the kernel is ready, so a
+        // slow startup is bounded by wait_ready alone.
+        let hb_dead = Arc::new(AtomicBool::new(false));
+        let (hb_start, hb_start_rx) = tokio::sync::oneshot::channel::<()>();
         {
             let hb_ep = ep(info.hb_port);
             let cancel = cancel.clone();
-            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let flag2 = flag.clone();
+            let flag2 = hb_dead.clone();
             tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    r = hb_start_rx => if r.is_err() { return },
+                }
                 let mut misses = 0u32;
                 'outer: loop {
                     let mut sock = ReqSocket::new();
@@ -292,10 +356,8 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                     if !connected {
                         misses += 1; // refused / unreachable counts as a missed beat
                         tracing::debug!("heartbeat connect failed ({misses})");
-                        if misses >= 3 {
+                        if misses >= 3 && !flag2.swap(true, Ordering::Relaxed) {
                             tracing::warn!("kernel heartbeat lost");
-                            flag2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            break;
                         }
                         tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {} }
                         continue;
@@ -316,18 +378,20 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                             r = tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv()) => r,
                         };
                         match got {
-                            Ok(Ok(_)) => { misses = 0; flag2.store(false, std::sync::atomic::Ordering::Relaxed); }
+                            Ok(Ok(_)) => {
+                                misses = 0;
+                                if flag2.swap(false, Ordering::Relaxed) {
+                                    tracing::info!("kernel heartbeat recovered");
+                                }
+                            }
                             _ => { misses += 1; break; } // REQ state is now broken: rebuild the socket
                         }
                     }
-                    if misses >= 3 {
+                    if misses >= 3 && !flag2.swap(true, Ordering::Relaxed) {
                         tracing::warn!("kernel heartbeat lost");
-                        flag2.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
                     }
                 }
             });
-            hb_dead = flag;
         }
 
         let kernel = Arc::new(Kernel {
@@ -344,12 +408,14 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
             events,
             cancel,
             hb_dead,
+            link_dead,
             _conn_file: conn_file,
             handles,
         });
 
         // Wait until the kernel answers kernel_info (ipykernel needs ~1s to bind).
         kernel.wait_ready(std::time::Duration::from_secs(60)).await?;
+        let _ = hb_start.send(());
         Ok(kernel)
     }
 
@@ -514,7 +580,7 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
     }
 
     pub async fn is_alive(&self) -> bool {
-        if self.cancel.is_cancelled() || self.hb_dead.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.cancel.is_cancelled() || self.hb_dead.load(Ordering::Relaxed) || self.link_dead.load(Ordering::Relaxed) {
             return false;
         }
         for c in self.extra.lock().await.iter_mut() {
@@ -565,24 +631,48 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
     }
 }
 
+/// Resolves once the kernel process or one of its helper processes has exited.
+async fn exited(child: &mut Option<Child>, extra: &mut [Child]) -> anyhow::Error {
+    loop {
+        if let Some(Ok(Some(st))) = child.as_mut().map(|c| c.try_wait()) {
+            return anyhow::anyhow!("kernel process exited during startup ({st})");
+        }
+        for c in extra.iter_mut() {
+            if let Ok(Some(st)) = c.try_wait() {
+                return anyhow::anyhow!("ssh tunnel exited during startup ({st})");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn dealer(
-    endpoint: &str,
+    endpoint: String,
     channel: Channel,
+    identity: &str,
     signer: Signer,
     events: broadcast::Sender<Event>,
     cancel: CancellationToken,
+    dead: Arc<AtomicBool>,
 ) -> Result<mpsc::Sender<ZmqMessage>> {
-    let mut sock = DealerSocket::new();
-    sock.connect(endpoint).await.with_context(|| format!("connect {channel:?} {endpoint}"))?;
+    // ipykernel addresses input_request to the identity of the *shell* request, so
+    // shell, stdin and control must share one identity (jupyter_client uses the
+    // session id).  zeromq only sends an Identity in the handshake when one is set.
+    let mut opts = SocketOptions::default();
+    opts.peer_identity(PeerIdentity::try_from(identity.as_bytes())?);
+    let mut sock = DealerSocket::with_options(opts);
+    sock.connect(&endpoint).await.with_context(|| format!("connect {channel:?} {endpoint}"))?;
     let (mut send_half, mut recv_half): (DealerSendHalf, _) = sock.split();
     let (tx, mut rx) = mpsc::channel::<ZmqMessage>(256);
     let c1 = cancel.clone();
+    let dead2 = dead.clone();
     tokio::spawn(async move {
         loop {
             let m = tokio::select! { _ = c1.cancelled() => break, m = rx.recv() => m };
             let Some(m) = m else { break };
             if let Err(e) = send_half.send(m).await {
                 tracing::warn!("{channel:?} send: {e}");
+                dead2.store(true, Ordering::Relaxed);
                 break;
             }
         }
@@ -600,6 +690,7 @@ async fn dealer(
                 },
                 Err(e) => {
                     tracing::warn!("{channel:?} closed: {e}");
+                    dead.store(true, Ordering::Relaxed);
                     break;
                 }
             }
@@ -634,11 +725,51 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-async fn pipe_log<R: tokio::io::AsyncRead + Unpin>(name: &'static str, r: R) {
+async fn pipe_log<R: tokio::io::AsyncRead + Unpin>(name: &'static str, r: R, tail: Option<StderrLines>) {
     use tokio::io::AsyncBufReadExt;
     let mut lines = tokio::io::BufReader::new(r).lines();
     while let Ok(Some(l)) = lines.next_line().await {
         tracing::debug!(target: "kernel", "[{name}] {l}");
+        if let Some(Ok(mut t)) = tail.as_ref().map(|t| t.lock()) {
+            if t.len() == STDERR_TAIL {
+                t.pop_front();
+            }
+            t.push_back(l);
+        }
+    }
+}
+
+const STDERR_TAIL: usize = 20;
+type StderrLines = Arc<std::sync::Mutex<VecDeque<String>>>;
+
+/// The last lines a starting kernel (or its SSH session) wrote to stderr, so a
+/// startup failure can say why (ipykernel missing, wrong interpreter, ...).
+#[derive(Default)]
+struct StderrTail {
+    lines: StderrLines,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StderrTail {
+    fn spawn<R: tokio::io::AsyncRead + Unpin + Send + 'static>(name: &'static str, r: R) -> Self {
+        let lines = StderrLines::default();
+        let reader = tokio::spawn(pipe_log(name, r, Some(lines.clone())));
+        StderrTail { lines, reader: Some(reader) }
+    }
+
+    async fn annotate(mut self, e: anyhow::Error) -> anyhow::Error {
+        // Give a just-exited process's pipe a moment to drain.
+        if let Some(r) = self.reader.as_mut() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r).await;
+        }
+        let lines = match self.lines.lock() {
+            Ok(l) => l.iter().cloned().collect::<Vec<_>>(),
+            Err(_) => vec![],
+        };
+        if lines.is_empty() {
+            return e;
+        }
+        anyhow::anyhow!("{e:#}\nkernel stderr:\n{}", lines.join("\n"))
     }
 }
 
