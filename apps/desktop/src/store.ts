@@ -91,14 +91,13 @@ export function set(patch: Partial<State> | ((s: State) => Partial<State>)) {
   listeners.forEach((l) => l());
 }
 
+function subscribe(l: () => void) {
+  listeners.add(l);
+  return () => { listeners.delete(l); };
+}
+
 export function useStore<T>(selector: (s: State) => T): T {
-  return useSyncExternalStore(
-    (l) => {
-      listeners.add(l);
-      return () => listeners.delete(l);
-    },
-    () => selector(state),
-  );
+  return useSyncExternalStore(subscribe, () => selector(state));
 }
 
 /** Panels with unsaved changes: panel id → title. Kept outside dockview params (those do not round-trip). */
@@ -148,7 +147,10 @@ export function pushConsole(item: NewItem) {
     const list = s.console;
     let next: ConsoleItem[];
     const last = list[list.length - 1];
-    if (item.kind === "stream" && last && last.kind === "stream" && last.name === item.name && last.text.length + item.text.length <= MAX_STREAM_ITEM) {
+    if (item.kind === "stream" && last && last.kind === "stream" && last.name === item.name
+      && (last.text.length + item.text.length <= MAX_STREAM_ITEM || last.text.endsWith("\r") || item.text.startsWith("\r"))) {
+      // (a `\r` pending at the end of `last`, or leading `item`, must fold into `last` even past the size cap,
+      // e.g. when the Rust side split one stream at 256 KB right at a carriage return)
       next = [...list.slice(0, -1), { ...last, text: appendStreamText(last.text, item.text) }];
     } else {
       next = [...list, { ...item, ...(item.kind === "stream" ? { text: appendStreamText("", item.text) } : {}), id: uid() } as ConsoleItem];

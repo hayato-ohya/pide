@@ -8,9 +8,10 @@ mod term;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use kernel_client::{Channel, Kernel, LaunchSpec};
+use kernel_client::{CancellationToken, Channel, Kernel, LaunchSpec, Liveness};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -21,8 +22,22 @@ pub struct AppState {
     kernel: Mutex<Option<Arc<Kernel>>>,
     /// Serializes start / shutdown so two overlapping restarts cannot leak a kernel.
     lifecycle: Mutex<()>,
+    /// Aborts the launch in progress.  Outside `lifecycle`, which a launch holds for
+    /// its whole duration (an SSH launch can take a minute).
+    start_cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// Set on app exit: no kernel may be started any more.
+    exiting: AtomicBool,
     python: Mutex<Option<String>>,
     cwd: Mutex<Option<String>>,
+}
+
+impl AppState {
+    /// Abort a kernel launch in progress (no-op when there is none).
+    fn cancel_start(&self) {
+        if let Some(c) = self.start_cancel.lock().ok().and_then(|mut g| g.take()) {
+            c.cancel();
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -42,6 +57,9 @@ struct KernelStatus {
     python: Option<String>,
     cwd: Option<String>,
     detail: Option<String>,
+    /// For "dead": "exited" (final), "link" or "heartbeat" (may recover).  For "idle":
+    /// "reconnected" when a channel was re-established (replies may have been lost).
+    reason: Option<&'static str>,
 }
 
 /// Append an event, merging it into the previous one when both are `stream`
@@ -64,8 +82,14 @@ fn push_coalesced(batch: &mut Vec<KernelEvent>, ev: KernelEvent) {
 }
 
 fn emit_status(app: &AppHandle, state: &str, python: Option<String>, cwd: Option<String>, detail: Option<String>) {
-    let _ = app.emit("kernel-status", KernelStatus { state: state.into(), python, cwd, detail });
+    emit_status_reason(app, state, python, cwd, detail, None);
 }
+
+fn emit_status_reason(app: &AppHandle, state: &str, python: Option<String>, cwd: Option<String>, detail: Option<String>, reason: Option<&'static str>) {
+    let _ = app.emit("kernel-status", KernelStatus { state: state.into(), python, cwd, detail, reason });
+}
+
+const START_CANCELLED: &str = "kernel start cancelled";
 
 /// Directory holding the `pide_kernel` helper package.
 fn helper_dir(app: &AppHandle) -> PathBuf {
@@ -106,7 +130,21 @@ async fn start_kernel(
     remote: Option<kernel_client::launch::RemoteSpec>,
     connection_file: Option<String>,
 ) -> Result<Value, String> {
-    let _guard = state.lifecycle.lock().await;
+    // A newer start supersedes one still in progress (restart during startup).
+    let cancel = CancellationToken::new();
+    if let Some(prev) = state.start_cancel.lock().ok().and_then(|mut g| g.replace(cancel.clone())) {
+        prev.cancel();
+    }
+    if state.exiting.load(Ordering::SeqCst) {
+        cancel.cancel();
+    }
+    let _guard = tokio::select! {
+        g = state.lifecycle.lock() => g,
+        _ = cancel.cancelled() => return Err(START_CANCELLED.into()),
+    };
+    if cancel.is_cancelled() {
+        return Err(START_CANCELLED.into());
+    }
     // Stop an existing kernel first.
     let old = state.kernel.lock().await.take();
     if let Some(old) = old {
@@ -139,16 +177,26 @@ async fn start_kernel(
         #[cfg(debug_assertions)]
         if r.ssh.is_none() { r.ssh = std::env::var("PIDE_SSH").ok(); }
         let helper_src = std::fs::read_to_string(helper.join("pide_kernel/__init__.py")).map_err(|e| format!("helper source: {e}"))?;
-        Kernel::launch_remote(r, &helper_src).await
+        Kernel::launch_remote_cancellable(r, &helper_src, &cancel).await
     } else if let Some(cf) = connection_file {
         // Attach to a running kernel (needs pide_kernel importable there).
         let txt = std::fs::read_to_string(&cf).map_err(|e| format!("connection file: {e}"))?;
         let info: kernel_client::ConnectionInfo = serde_json::from_str(&txt).map_err(|e| format!("connection file: {e}"))?;
-        Kernel::connect(info).await
+        Kernel::connect_cancellable(info, &cancel).await
     } else {
-        Kernel::launch(spec).await
+        Kernel::launch_cancellable(spec, &cancel).await
     };
     let k = match launched {
+        // Cancelled (stop / restart / app exit): a kernel that came up anyway goes again.
+        Ok(k) if cancel.is_cancelled() => {
+            let _ = k.shutdown(false).await;
+            emit_status(&app, "stopped", None, None, None);
+            return Err(START_CANCELLED.into());
+        }
+        Err(_) if cancel.is_cancelled() => {
+            emit_status(&app, "stopped", None, None, None);
+            return Err(START_CANCELLED.into());
+        }
         Ok(k) => k,
         Err(e) => {
             emit_status(&app, "dead", Some(python.clone()), cwd.clone(), Some(format!("{e:#}")));
@@ -213,25 +261,40 @@ async fn start_kernel(
     let py = python.clone();
     let cwd2 = cwd.clone();
     tokio::spawn(async move {
-        let mut dead = false;
+        // Reported again when the reason changes (a stalled heartbeat, then the process exiting).
+        let mut down: Option<Liveness> = None;
+        let mut reconnects = k2.reconnects();
         loop {
             tokio::select! {
                 _ = k2.cancelled() => break,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
-            let alive = k2.is_alive().await;
-            // A shutdown in the meantime also makes is_alive false: do not report that as a death.
+            let live = k2.liveness().await;
+            // A shutdown in the meantime also makes it not alive: do not report that as a death.
             tokio::select! {
                 biased;
                 _ = k2.cancelled() => break,
                 _ = std::future::ready(()) => {}
             }
-            if !alive && !dead {
-                dead = true;
-                emit_status(&app3, "dead", Some(py.clone()), cwd2.clone(), Some("kernel stopped responding (process exited, tunnel dropped or heartbeat lost)".into()));
-            } else if alive && dead {
-                dead = false;
-                emit_status(&app3, "idle", Some(py.clone()), cwd2.clone(), None);
+            if live != Liveness::Alive {
+                if down != Some(live) {
+                    down = Some(live);
+                    let detail = match live {
+                        Liveness::Heartbeat => "kernel stopped responding to heartbeats",
+                        Liveness::Link => "connection to the kernel was lost and could not be re-established",
+                        _ if k2.remote => "remote kernel session or SSH tunnel exited",
+                        _ => "kernel process exited",
+                    };
+                    emit_status_reason(&app3, "dead", Some(py.clone()), cwd2.clone(), Some(detail.into()), Some(live.as_str()));
+                }
+            } else {
+                // Counted while alive only, so a reconnect during an outage is reported on recovery.
+                let now = k2.reconnects();
+                let reconnected = std::mem::replace(&mut reconnects, now) != now;
+                let recovered = down.take().is_some();
+                if recovered || reconnected {
+                    emit_status_reason(&app3, "idle", Some(py.clone()), cwd2.clone(), None, reconnected.then_some("reconnected"));
+                }
             }
         }
     });
@@ -379,6 +442,8 @@ async fn interrupt_kernel(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn shutdown_kernel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Abort a launch in progress first: it holds the lifecycle lock until it ends.
+    state.cancel_start();
     let _guard = state.lifecycle.lock().await;
     let k = state.kernel.lock().await.take();
     let res = match k {
@@ -388,6 +453,13 @@ async fn shutdown_kernel(app: AppHandle, state: State<'_, AppState>) -> Result<(
     // The kernel is gone from the state either way: always tell the UI.
     emit_status(&app, "stopped", None, None, None);
     res
+}
+
+/// Abort a kernel launch in progress (the UI's restart during "starting"); a running
+/// kernel is left alone.
+#[tauri::command]
+fn cancel_start(state: State<'_, AppState>) {
+    state.cancel_start();
 }
 
 // ---------------------------------------------------------------- files ----
@@ -633,6 +705,7 @@ pub fn run() {
             input_reply,
             interrupt_kernel,
             shutdown_kernel,
+            cancel_start,
             list_dir,
             read_text_file,
             write_text_file,
@@ -686,10 +759,17 @@ pub fn run() {
                 }
                 // Kernel (and its SSH sessions / tunnels) and language servers must not outlive the app.
                 if let Some(st) = app.try_state::<AppState>() {
-                    let k = tauri::async_runtime::block_on(async { st.kernel.lock().await.take() });
-                    if let Some(k) = k {
-                        let _ = tauri::async_runtime::block_on(tokio::time::timeout(std::time::Duration::from_secs(4), k.shutdown(false)));
-                    }
+                    // Abort a launch in progress and wait (bounded) until it has let go of the
+                    // lifecycle lock: it then has either cleaned up or stored its kernel.
+                    st.exiting.store(true, Ordering::SeqCst);
+                    st.cancel_start();
+                    tauri::async_runtime::block_on(async {
+                        let _guard = tokio::time::timeout(std::time::Duration::from_secs(3), st.lifecycle.lock()).await;
+                        let k = st.kernel.lock().await.take();
+                        if let Some(k) = k {
+                            let _ = tokio::time::timeout(std::time::Duration::from_secs(4), k.shutdown(false)).await;
+                        }
+                    });
                 }
                 if let Some(st) = app.try_state::<lsp::LspState>() {
                     tauri::async_runtime::block_on(lsp::shutdown_all(&st));
