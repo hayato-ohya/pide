@@ -205,20 +205,32 @@ async fn start_kernel(
         }
     });
 
-    // Liveness watcher.
+    // Liveness watcher: runs until the kernel is shut down or replaced (cancelled),
+    // reporting both loss and recovery (the heartbeat can come back after a stall).
     let app3 = app.clone();
     let k2 = k.clone();
     let py = python.clone();
     let cwd2 = cwd.clone();
     tokio::spawn(async move {
+        let mut dead = false;
         loop {
             tokio::select! {
                 _ = k2.cancelled() => break,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
-            if !k2.is_alive().await {
+            let alive = k2.is_alive().await;
+            // A shutdown in the meantime also makes is_alive false: do not report that as a death.
+            tokio::select! {
+                biased;
+                _ = k2.cancelled() => break,
+                _ = std::future::ready(()) => {}
+            }
+            if !alive && !dead {
+                dead = true;
                 emit_status(&app3, "dead", Some(py.clone()), cwd2.clone(), Some("kernel stopped responding (process exited, tunnel dropped or heartbeat lost)".into()));
-                break;
+            } else if alive && dead {
+                dead = false;
+                emit_status(&app3, "idle", Some(py.clone()), cwd2.clone(), None);
             }
         }
     });
@@ -368,11 +380,13 @@ async fn interrupt_kernel(state: State<'_, AppState>) -> Result<(), String> {
 async fn shutdown_kernel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let _guard = state.lifecycle.lock().await;
     let k = state.kernel.lock().await.take();
-    if let Some(k) = k {
-        k.shutdown(false).await.map_err(|e| e.to_string())?;
-    }
+    let res = match k {
+        Some(k) => k.shutdown(false).await.map_err(|e| e.to_string()),
+        None => Ok(()),
+    };
+    // The kernel is gone from the state either way: always tell the UI.
     emit_status(&app, "stopped", None, None, None);
-    Ok(())
+    res
 }
 
 // ---------------------------------------------------------------- files ----
@@ -390,8 +404,9 @@ struct DirEntry {
 fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let mut out = vec![];
     for e in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
-        let e = e.map_err(|e| e.to_string())?;
-        let md = e.metadata().map_err(|e| e.to_string())?;
+        let Ok(e) = e else { continue };
+        // Follow symlinks (a link to a folder is a folder); fall back to the link itself if dangling.
+        let Ok(md) = std::fs::metadata(e.path()).or_else(|_| std::fs::symlink_metadata(e.path())) else { continue };
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
@@ -410,7 +425,13 @@ fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 
 #[tauri::command(async)]
 fn read_text_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    const MAX: u64 = 50 * 1024 * 1024;
+    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if size > MAX {
+        return Err(format!("file is {:.1} MB; files over 50 MB are not opened", size as f64 / 1048576.0));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|_| "file is not UTF-8 encoded; opening read-only is not supported".to_string())
 }
 
 #[tauri::command(async)]
@@ -419,19 +440,42 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
 }
 
 /// Write to a sibling temp file and rename, so a crash never leaves a truncated file.
+/// Symlinks are written through (the real file is replaced, not the link); if the rename
+/// fails (e.g. the target is locked on Windows) fall back to a direct write.
 fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    let p = std::path::Path::new(path);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let given = std::path::Path::new(path);
+    let real = std::fs::canonicalize(given).unwrap_or_else(|_| given.to_path_buf());
+    let p = real.as_path();
     let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
-    let tmp = dir.join(format!(".{}.pide-tmp", p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
-    let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    f.write_all(bytes).map_err(|e| e.to_string())?;
-    f.sync_all().ok();
-    #[cfg(unix)]
-    if let Ok(md) = std::fs::metadata(p) {
-        let _ = std::fs::set_permissions(&tmp, md.permissions());
+    let tmp = dir.join(format!(
+        ".{}.{}-{}.pide-tmp",
+        p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all().ok();
+        if let Ok(md) = std::fs::metadata(p) {
+            let _ = std::fs::set_permissions(&tmp, md.permissions());
+        }
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
     }
-    std::fs::rename(&tmp, p).map_err(|e| { let _ = std::fs::remove_file(&tmp); e.to_string() })
+    match std::fs::rename(&tmp, p) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(p, bytes).map_err(|e| e.to_string())
+        }
+    }
 }
 
 /// Launch-time overrides (safe to ship): interpreter and working folder.

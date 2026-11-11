@@ -12,26 +12,48 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 #[derive(Default)]
 pub struct LspState {
     servers: Mutex<HashMap<String, Server>>,
+    /// Bumped per `lsp_start`; tags events so the UI can drop ones from an
+    /// earlier session of the same server name.
+    gen: std::sync::atomic::AtomicU64,
 }
 
 struct Server {
     child: Child,
     tx: mpsc::Sender<Value>,
+    gen: u64,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Server {
+    /// Kill the process and make sure its relay tasks can no longer emit.
+    async fn shutdown(mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+        for t in self.tasks.drain(..) {
+            let _ = t.await;
+        }
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
 }
 
 #[derive(Serialize, Clone)]
 struct LspMessage {
     server: String,
+    gen: u64,
     msg: Value,
 }
 
 #[derive(Serialize, Clone)]
 struct LspExit {
     server: String,
+    gen: u64,
     code: Option<i32>,
     detail: String,
 }
@@ -96,8 +118,9 @@ pub async fn lsp_start(
     cmd: String,
     args: Vec<String>,
     cwd: Option<String>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     lsp_stop_inner(&state, &name).await;
+    let gen = state.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut c = Command::new(&cmd);
     c.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     kernel_client::platform::quiet(&mut c);
@@ -112,7 +135,7 @@ pub async fn lsp_start(
     // Writer task.
     let (tx, mut rx) = mpsc::channel::<Value>(256);
     let n1 = name.clone();
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Some(v) = rx.recv().await {
             let body = serde_json::to_vec(&v).unwrap();
             let head = format!("Content-Length: {}\r\n\r\n", body.len());
@@ -127,7 +150,7 @@ pub async fn lsp_start(
     // Reader task: parse Content-Length frames and emit each message.
     let app2 = app.clone();
     let n2 = name.clone();
-    tokio::spawn(async move {
+    let reader = tokio::spawn(async move {
         let mut rd = BufReader::new(stdout);
         loop {
             let mut len: Option<usize> = None;
@@ -153,7 +176,7 @@ pub async fn lsp_start(
             }
             match serde_json::from_slice::<Value>(&buf) {
                 Ok(msg) => {
-                    let _ = app2.emit("lsp-message", LspMessage { server: n2.clone(), msg });
+                    let _ = app2.emit("lsp-message", LspMessage { server: n2.clone(), gen, msg });
                 }
                 Err(e) => tracing::warn!("lsp {n2}: bad json: {e}"),
             }
@@ -162,28 +185,37 @@ pub async fn lsp_start(
 
     // Stderr → log.
     let n3 = name.clone();
-    tokio::spawn(async move {
+    let errlog = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(l)) = lines.next_line().await {
             tracing::debug!(target: "lsp", "[{n3}] {l}");
         }
     });
 
-    state.servers.lock().await.insert(name, Server { child, tx });
-    Ok(())
+    let tasks = vec![writer, reader, errlog];
+    let old = state.servers.lock().await.insert(name, Server { child, tx, gen, tasks });
+    if let Some(old) = old {
+        old.shutdown().await; // a concurrent lsp_start for the same name won the race
+    }
+    Ok(gen)
 }
 
 #[tauri::command]
 pub async fn lsp_send(state: tauri::State<'_, LspState>, name: String, msg: Value) -> Result<(), String> {
-    let servers = state.servers.lock().await;
-    let s = servers.get(&name).ok_or_else(|| format!("lsp {name} not running"))?;
-    s.tx.send(msg).await.map_err(|e| e.to_string())
+    // Clone the sender and release the lock before a possibly long wait for
+    // channel space (a busy server not reading stdin must not block every
+    // other LSP command, including stopping/restarting it).
+    let tx = {
+        let servers = state.servers.lock().await;
+        servers.get(&name).ok_or_else(|| format!("lsp {name} not running"))?.tx.clone()
+    };
+    tx.send(msg).await.map_err(|e| e.to_string())
 }
 
 async fn lsp_stop_inner(state: &tauri::State<'_, LspState>, name: &str) {
-    if let Some(mut s) = state.servers.lock().await.remove(name) {
-        let _ = s.child.start_kill();
-        let _ = s.child.wait().await;
+    let s = state.servers.lock().await.remove(name);
+    if let Some(s) = s {
+        s.shutdown().await;
     }
 }
 
@@ -194,9 +226,9 @@ pub async fn lsp_stop(state: tauri::State<'_, LspState>, name: String) -> Result
 }
 
 pub async fn shutdown_all(state: &LspState) {
-    for (_, mut s) in state.servers.lock().await.drain() {
-        let _ = s.child.start_kill();
-        let _ = s.child.wait().await;
+    let all: Vec<Server> = state.servers.lock().await.drain().map(|(_, s)| s).collect();
+    for s in all {
+        s.shutdown().await;
     }
 }
 
@@ -208,7 +240,7 @@ pub async fn lsp_check(app: AppHandle, state: tauri::State<'_, LspState>) -> Res
     for (name, s) in servers.iter_mut() {
         if let Ok(Some(st)) = s.child.try_wait() {
             dead.push(name.clone());
-            let _ = app.emit("lsp-exit", LspExit { server: name.clone(), code: st.code(), detail: format!("{st}") });
+            let _ = app.emit("lsp-exit", LspExit { server: name.clone(), gen: s.gen, code: st.code(), detail: format!("{st}") });
         }
     }
     for d in &dead {
@@ -241,9 +273,13 @@ pub async fn run_tool(python: String, tool: String, args: Vec<String>, stdin: St
         c.current_dir(d);
     }
     let mut child = c.spawn().map_err(|e| format!("{tool}: {e}"))?;
+    // Feed stdin concurrently with draining stdout/stderr: writing it all
+    // first deadlocks once both pipes fill.  On timeout the dropped future
+    // drops the child, which kill_on_drop kills (the writer then fails too).
     if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(stdin.as_bytes()).await;
-        drop(si);
+        tokio::spawn(async move {
+            let _ = si.write_all(stdin.as_bytes()).await;
+        });
     }
     let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
         .await
