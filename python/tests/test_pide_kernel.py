@@ -728,3 +728,34 @@ def test_longdouble_cell(ns):
     ns["x"] = np.longdouble("1.5")
     assert by_name(payload(k.snapshot()))["x"]["value"] == "1.5"
     assert payload(k.detail("x"))["rows"] == [[1.5]]
+
+
+# ----------------------------------------------------------------------------
+# IPython-hidden names / fs_list
+# ----------------------------------------------------------------------------
+
+def test_snapshot_hides_ipython_names_only_while_unmodified(ns, monkeypatch):
+    orig_open, orig_in = object(), object()
+    fake = types.SimpleNamespace(user_ns_hidden={"open": orig_open, "In": orig_in, "Out": {}})
+    monkeypatch.setitem(sys.modules, "IPython", types.SimpleNamespace(get_ipython=lambda: fake))
+    ns.update({"open": orig_open, "In": [1], "x": 1})  # In was rebound by the user
+    v = by_name(payload(k.snapshot()))
+    assert "open" not in v and "In" in v and "x" in v
+
+
+def test_snapshot_fallback_list_without_ipython(ns, monkeypatch):
+    monkeypatch.delitem(sys.modules, "IPython", raising=False)
+    ns.update({"exit": 1, "x": 2})
+    v = by_name(payload(k.snapshot()))
+    assert "exit" not in v and "x" in v
+
+
+def test_fs_list_entries_are_absolute(tmp_path, monkeypatch):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "a.txt").write_text("hi")
+    monkeypatch.chdir(tmp_path)
+    for arg in (str(tmp_path), "."):
+        d = payload(k.fs_list(arg))
+        assert os.path.samefile(d["path"], tmp_path)
+        assert [e["name"] for e in d["entries"]] == ["sub", "a.txt"]
+        assert all(os.path.isabs(e["path"]) and os.path.dirname(e["path"]) == d["path"] for e in d["entries"])

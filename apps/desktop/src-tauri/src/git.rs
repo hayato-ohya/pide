@@ -193,12 +193,26 @@ fn blob_text(repo: &Repository, oid: Oid) -> Option<String> {
 }
 
 const MAX_DIFF_TEXT: u64 = 4 * 1024 * 1024;
+/// Line statistics are skipped for files larger than this (keeps status refresh fast).
+const MAX_STAT_SIZE: u64 = 2 * 1024 * 1024;
 
-fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool, with_content: bool) -> Vec<FileDiff> {
+/// `core.autocrlf` is true/input: the index side is LF, so CRLF is normalised for display.
+fn normalize_eol(repo: &Repository) -> bool {
+    match repo.config().and_then(|c| c.get_string("core.autocrlf")) {
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "true" | "input"),
+        Err(_) => false,
+    }
+}
+
+/// Build a `FileDiff` list.  With `only`, just the delta whose new path matches is kept.
+fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool, with_content: bool, only: Option<&str>) -> Vec<FileDiff> {
     let mut out = vec![];
     let root = repo.workdir().map(|p| p.to_path_buf());
-    for d in diff.deltas() {
+    let eol = with_content && normalize_eol(repo);
+    let norm = |t: String| if eol { t.replace("\r\n", "\n") } else { t };
+    for (i, d) in diff.deltas().enumerate() {
         let newp = d.new_file().path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        if only.is_some_and(|o| o != newp) { continue; }
         let oldp = d.old_file().path().map(|p| p.to_string_lossy().to_string());
         let code = match d.status() {
             git2::Delta::Added | git2::Delta::Untracked => "A",
@@ -221,14 +235,16 @@ fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool, with_content
                     std::fs::read(p).ok()
                 }).and_then(|b| if b.contains(&0) { None } else { Some(String::from_utf8_lossy(&b).to_string()) })
             } else if d.new_file().id().is_zero() { None } else { blob_text(repo, d.new_file().id()) };
-            (old, new)
+            (old.map(norm), new.map(norm))
         };
-        out.push(FileDiff { path: newp, old_path: oldp.filter(|_| code == "R"), code: code.into(), old, new, binary, additions: 0, deletions: 0 });
-    }
-    for (i, fd) in out.iter_mut().enumerate() {
-        if let Ok(Some(p)) = git2::Patch::from_diff(diff, i) {
-            if let Ok((_, a, d)) = p.line_stats() { fd.additions = a; fd.deletions = d; }
+        let (mut additions, mut deletions) = (0, 0);
+        let big_stat = d.old_file().size() > MAX_STAT_SIZE || d.new_file().size() > MAX_STAT_SIZE;
+        if !binary && !big_stat {
+            if let Ok(Some(p)) = git2::Patch::from_diff(diff, i) {
+                if let Ok((_, a, dl)) = p.line_stats() { additions = a; deletions = dl; }
+            }
         }
+        out.push(FileDiff { path: newp, old_path: oldp.filter(|_| code == "R"), code: code.into(), old, new, binary, additions, deletions });
     }
     out
 }
@@ -242,18 +258,21 @@ pub fn git_diff(cwd: String, staged: bool, path: Option<String>) -> Result<Vec<F
     // Untracked content (and file text in general) is only read for a single requested path.
     let with_content = path.is_some();
     opts.show_untracked_content(with_content);
-    if let Some(p) = &path { opts.pathspec(rel(&repo, p)); }
+    let only = path.as_ref().map(|p| rel(&repo, p).to_string_lossy().to_string());
+    // Staged diffs are filtered after rename detection (a pathspec would hide the old path).
+    if !staged { if let Some(o) = &only { opts.pathspec(o); } }
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-    let diff = if staged {
+    let mut diff = if staged {
         repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
     } else {
         repo.diff_index_to_workdir(None, Some(&mut opts))
     }
     .map_err(|e| e.message().to_string())?;
-    Ok(collect(&repo, &diff, !staged, with_content))
+    if staged { let _ = diff.find_similar(Some(git2::DiffFindOptions::new().renames(true))); }
+    Ok(collect(&repo, &diff, !staged, with_content, if staged { only.as_deref() } else { None }))
 }
 
-/// Files changed by a commit (vs its first parent), with full old/new text.
+/// Files changed by a commit (vs its first parent), with line stats only.
 #[tauri::command(async)]
 pub fn git_commit_diff(cwd: String, id: String) -> Result<Vec<FileDiff>, String> {
     let repo = open(&cwd)?;
@@ -262,8 +281,9 @@ pub fn git_commit_diff(cwd: String, id: String) -> Result<Vec<FileDiff>, String>
     let tree = c.tree().map_err(|e| e.message().to_string())?;
     let parent = c.parent(0).ok().and_then(|p| p.tree().ok());
     let mut opts = DiffOptions::new();
-    let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
-    Ok(collect(&repo, &diff, false, false))
+    let mut diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
+    let _ = diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)));
+    Ok(collect(&repo, &diff, false, false, None))
 }
 
 /// Full text of one file in a commit diff (vs first parent).
@@ -275,9 +295,9 @@ pub fn git_commit_file(cwd: String, id: String, path: String) -> Result<Option<F
     let tree = c.tree().map_err(|e| e.message().to_string())?;
     let parent = c.parent(0).ok().and_then(|p| p.tree().ok());
     let mut opts = DiffOptions::new();
-    opts.pathspec(&path).disable_pathspec_match(true);
-    let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
-    Ok(collect(&repo, &diff, false, true).into_iter().find(|f| f.path == path))
+    let mut diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
+    let _ = diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)));
+    Ok(collect(&repo, &diff, false, true, Some(&path)).into_iter().next())
 }
 
 #[tauri::command(async)]
@@ -295,16 +315,34 @@ pub fn git_stage(cwd: String, paths: Vec<String>) -> Result<(), String> {
 #[tauri::command(async)]
 pub fn git_unstage(cwd: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open(&cwd)?;
-    let head = repo.head().ok().and_then(|h| h.peel(git2::ObjectType::Commit).ok());
-    let specs: Vec<PathBuf> = paths.iter().map(|p| rel(&repo, p)).collect();
-    match head {
-        Some(obj) => repo.reset_default(Some(&obj), specs.iter()).map_err(|e| e.message().to_string()),
-        None => {
-            let mut idx = repo.index().map_err(|e| e.message().to_string())?;
-            for s in specs { let _ = idx.remove_path(&s); }
-            idx.write().map_err(|e| e.message().to_string())
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut idx = repo.index().map_err(|e| e.message().to_string())?;
+    // Written entry by entry (no pathspec), so `*`, `?`, `[` in names cannot over-match.
+    for p in &paths {
+        let r = rel(&repo, p);
+        match head_tree.as_ref().and_then(|t| t.get_path(&r).ok()) {
+            Some(te) => {
+                let path = r.to_string_lossy().as_bytes().to_vec();
+                let entry = git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0),
+                    mtime: git2::IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: te.filemode() as u32,
+                    uid: 0,
+                    gid: 0,
+                    file_size: 0,
+                    id: te.id(),
+                    flags: path.len().min(0xFFF) as u16,
+                    flags_extended: 0,
+                    path,
+                };
+                idx.add(&entry).map_err(|e| e.message().to_string())?;
+            }
+            None => { let _ = idx.remove_path(&r); }
         }
     }
+    idx.write().map_err(|e| e.message().to_string())
 }
 
 /// Discard working-tree changes of a file (checkout from index).
@@ -460,14 +498,15 @@ pub fn git_resolve(cwd: String, path: String, side: String, allow_markers: bool)
     let abs = workdir(&repo)?.join(&r);
     match side.as_str() {
         "ours" | "theirs" => {
-            let e = if side == "ours" { &c.our } else { &c.their };
-            match e {
-                Some(e) => {
-                    let blob = repo.find_blob(e.id).map_err(|e| e.message().to_string())?;
-                    if let Some(parent) = abs.parent() { let _ = std::fs::create_dir_all(parent); }
-                    std::fs::write(&abs, blob.content()).map_err(|e| e.to_string())?;
-                }
-                None => { let _ = std::fs::remove_file(&abs); }
+            let have = if side == "ours" { c.our.is_some() } else { c.their.is_some() };
+            if have {
+                // libgit2 checkout applies filters (eol/autocrlf), executable bit and symlinks.
+                let mut cb = git2::build::CheckoutBuilder::new();
+                cb.force().disable_pathspec_match(true).path(&r);
+                if side == "ours" { cb.use_ours(true); } else { cb.use_theirs(true); }
+                repo.checkout_index(Some(&mut idx), Some(&mut cb)).map_err(|e| e.message().to_string())?;
+            } else {
+                let _ = std::fs::remove_file(&abs);
             }
         }
         "workdir" => {
@@ -654,6 +693,121 @@ mod tests {
         git_checkout(cwd.clone(), "origin/feat".into()).unwrap();
         assert_eq!(repo.head().unwrap().name(), Some("refs/heads/feat"));
         assert!(!repo.head_detached().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_repo(name: &str) -> (PathBuf, String, Repository) {
+        let dir = std::env::temp_dir().join(format!("pide-git-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let repo = Repository::init(&cwd).unwrap();
+        repo.config().unwrap().set_str("user.name", "t").unwrap();
+        repo.config().unwrap().set_str("user.email", "t@e").unwrap();
+        (dir, cwd, repo)
+    }
+
+    #[test]
+    fn rename_in_commit_diff() {
+        let (dir, cwd, _repo) = temp_repo("rename");
+        std::fs::write(dir.join("a.py"), "print(1)\nprint(2)\nprint(3)\n").unwrap();
+        git_stage(cwd.clone(), vec!["a.py".into()]).unwrap();
+        git_commit(cwd.clone(), "first".into(), false).unwrap();
+        std::fs::rename(dir.join("a.py"), dir.join("b.py")).unwrap();
+        git_stage(cwd.clone(), vec!["a.py".into(), "b.py".into()]).unwrap();
+        // staged diff of the new path shows the rename
+        let d = git_diff(cwd.clone(), true, Some("b.py".into())).unwrap();
+        assert_eq!((d[0].code.as_str(), d[0].old_path.as_deref()), ("R", Some("a.py")));
+        let id = git_commit(cwd.clone(), "move".into(), false).unwrap();
+        let files = git_commit_diff(cwd.clone(), id.clone()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].path.as_str(), files[0].old_path.as_deref(), files[0].code.as_str()), ("b.py", Some("a.py"), "R"));
+        let f = git_commit_file(cwd.clone(), id, "b.py".into()).unwrap().unwrap();
+        assert_eq!(f.code, "R");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unstage_is_literal() {
+        let (dir, cwd, repo) = temp_repo("unstage");
+        // unborn HEAD: removes from index
+        std::fs::write(dir.join("a[1].py"), "x\n").unwrap();
+        std::fs::write(dir.join("a1.py"), "y\n").unwrap();
+        git_stage(cwd.clone(), vec!["a[1].py".into(), "a1.py".into()]).unwrap();
+        git_unstage(cwd.clone(), vec!["a[1].py".into()]).unwrap();
+        let idx = repo.index().unwrap();
+        assert!(idx.get_path(Path::new("a[1].py"), 0).is_none());
+        assert!(idx.get_path(Path::new("a1.py"), 0).is_some());
+        drop(idx);
+        git_commit(cwd.clone(), "c".into(), false).unwrap();
+        std::fs::write(dir.join("a[1].py"), "x2\n").unwrap();
+        std::fs::write(dir.join("a1.py"), "y2\n").unwrap();
+        git_stage(cwd.clone(), vec!["a[1].py".into(), "a1.py".into()]).unwrap();
+        git_unstage(cwd.clone(), vec!["a[1].py".into()]).unwrap();
+        let st = git_status(cwd.clone()).unwrap();
+        let staged: Vec<&str> = st.entries.iter().filter(|e| e.area == "staged").map(|e| e.path.as_str()).collect();
+        assert_eq!(staged, vec!["a1.py"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn large_file_has_no_stats() {
+        let (dir, cwd, _repo) = temp_repo("large");
+        std::fs::write(dir.join("big.txt"), "a\n").unwrap();
+        git_stage(cwd.clone(), vec!["big.txt".into()]).unwrap();
+        git_commit(cwd.clone(), "c".into(), false).unwrap();
+        std::fs::write(dir.join("big.txt"), "line\n".repeat(500_000)).unwrap();
+        let d = git_diff(cwd.clone(), false, None).unwrap();
+        assert_eq!((d[0].additions, d[0].deletions), (0, 0));
+        std::fs::write(dir.join("big.txt"), "b\n").unwrap();
+        let d = git_diff(cwd.clone(), false, None).unwrap();
+        assert_eq!((d[0].additions, d[0].deletions), (1, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_side_keeps_mode_and_stages() {
+        let (dir, cwd, repo) = temp_repo("resolve");
+        let base = {
+            std::fs::write(dir.join("s.sh"), "base\n").unwrap();
+            git_stage(cwd.clone(), vec!["s.sh".into()]).unwrap();
+            git_commit(cwd.clone(), "base".into(), false).unwrap()
+        };
+        let main = repo.head().unwrap().shorthand().unwrap().to_string();
+        let base_c = repo.find_commit(Oid::from_str(&base).unwrap()).unwrap();
+        repo.branch("other", &base_c, false).unwrap();
+        #[cfg(unix)]
+        let chmod = || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("s.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        #[cfg(not(unix))]
+        let chmod = || {};
+        std::fs::write(dir.join("s.sh"), "main\n").unwrap();
+        chmod();
+        git_stage(cwd.clone(), vec!["s.sh".into()]).unwrap();
+        git_commit(cwd.clone(), "main".into(), false).unwrap();
+        git_checkout(cwd.clone(), "other".into()).unwrap();
+        std::fs::write(dir.join("s.sh"), "other\n").unwrap();
+        git_stage(cwd.clone(), vec!["s.sh".into()]).unwrap();
+        git_commit(cwd.clone(), "other".into(), false).unwrap();
+        // merge main into other -> conflict
+        let ann = repo.find_annotated_commit(repo.find_branch(&main, BranchType::Local).unwrap().get().target().unwrap()).unwrap();
+        repo.merge(&[&ann], None, None).unwrap();
+        assert!(repo.index().unwrap().has_conflicts());
+        git_resolve(cwd.clone(), "s.sh".into(), "theirs".into(), false).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("s.sh")).unwrap(), "main\n");
+        let mut idx = repo.index().unwrap();
+        idx.read(true).unwrap();
+        assert!(!idx.has_conflicts());
+        let e = idx.get_path(Path::new("s.sh"), 0).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(e.mode, 0o100755);
+            assert_eq!(std::fs::metadata(dir.join("s.sh")).unwrap().permissions().mode() & 0o111, 0o111);
+        }
+        assert_eq!(repo.find_blob(e.id).unwrap().content(), b"main\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

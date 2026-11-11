@@ -224,16 +224,30 @@ function settlePending(reason: string, resolveInstead = false) {
   early.clear();
 }
 
+/** Grace period for a heartbeat loss before pending executions are given up. */
+const HB_GRACE_MS = 30_000;
+let graceTimer: ReturnType<typeof setTimeout> | null = null;
+/** The kernel session is over: settle everything that waited on it. */
+function kernelGone(detail: string | null, reason = "kernel died") {
+  if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+  settlePending(reason);
+  resetDebugState();
+  set({ inputRequest: null });
+  if (detail && reason === "kernel died") pushConsole({ kind: "info", text: `Kernel died: ${detail}` });
+}
+
 /** Debugger state belongs to one kernel session: drop it when that session ends (death, restart, start). */
 function resetDebugState() {
   set((s) => ({ debug: { ...s.debug, active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, variables: [], scopes: [], cellFiles: {}, exceptionInfo: null } }));
 }
 
-/** Events were dropped under load: once the kernel answers a cheap request, settle everything older. */
+/** Replies may have been lost (events dropped under load, or a channel reconnected): once the kernel
+ * answers a cheap request, settle everything older. `force` runs even while another resync waits
+ * (its marker may itself have been lost; a newer resync settles that marker too). */
 let resyncing = false;
-async function resyncAfterLag(n: number) {
-  pushConsole({ kind: "info", text: `${n} kernel messages were dropped (output too fast); re-synchronizing.` });
-  if (resyncing) return;
+async function resync(note: string, force = false) {
+  pushConsole({ kind: "info", text: note });
+  if (resyncing && !force) return;
   resyncing = true;
   try {
     const stale = [...pending.keys()];
@@ -260,18 +274,30 @@ export async function initKernelBridge() {
   if (started) return;
   started = true;
   unlisteners.push(await listen<KernelEvent[]>("kernel-events", (e) => { for (const ev of e.payload) handleEvent(ev); }));
-  unlisteners.push(await listen<number>("kernel-lagged", (e) => resyncAfterLag(e.payload)));
+  unlisteners.push(await listen<number>("kernel-lagged", (e) => resync(`${e.payload} kernel messages were dropped (output too fast); re-synchronizing.`)));
   unlisteners.push(await listen<any>("kernel-status", (e) => {
     const p = e.payload;
     // "idle" also reports a recovered heartbeat: keep showing busy while our executions run.
     const state = p.state === "idle" && userExecs.size ? "busy" : p.state;
     set({ kernel: state, python: p.python ?? get().python, cwd: p.cwd ?? get().cwd, kernelDetail: p.detail ?? null });
     if (p.state === "dead") {
-      settlePending("kernel died");
-      resetDebugState();
-      set({ inputRequest: null });
-      if (p.detail) pushConsole({ kind: "info", text: `Kernel died: ${p.detail}` });
+      if (p.reason === "heartbeat") {
+        // The heartbeat may come back (stall, network blip): keep pending executions and their
+        // output sinks for a while, so a still-running cell's output lands in its cell.
+        if (!graceTimer) {
+          pushConsole({ kind: "info", text: `Connection lost: ${p.detail ?? "kernel not responding"}. Waiting up to ${HB_GRACE_MS / 1000} s for it to recover.` });
+          graceTimer = setTimeout(() => { graceTimer = null; kernelGone(p.detail); }, HB_GRACE_MS);
+        }
+      } else {
+        kernelGone(p.detail); // the process exited / the link is gone for good
+      }
+    } else if (graceTimer) {
+      // Recovered ("idle" / "busy"), or a new session ("starting" / "stopped") replaces the old one.
+      const recovered = p.state === "idle" || p.state === "busy";
+      if (recovered) { clearTimeout(graceTimer); graceTimer = null; pushConsole({ kind: "info", text: "Kernel is responding again." }); }
+      else kernelGone(null, "kernel restarted");
     }
+    if (p.reason === "reconnected") void resync("The connection to the kernel was interrupted and has been re-established; replies sent meanwhile may be lost.", true);
   }));
   const pythons = await invoke<string[]>("detect_pythons");
   const overrides = await invoke<{ python: string | null; cwd: string | null }>("launch_overrides").catch(() => ({ python: null, cwd: null }));
@@ -289,18 +315,24 @@ import.meta.hot?.dispose(() => { for (const u of unlisteners.splice(0)) u(); });
 
 /** In-flight start / restart; execute() waits on it (the backend has no kernel meanwhile). */
 let starting: Promise<void> | null = null;
+/** Bumped to abort a start that has not reached the backend yet (restart during startup). */
+let startGen = 0;
 export function startKernel() {
   if (!starting) starting = startKernelInner().finally(() => (starting = null));
   return starting;
 }
 
 async function startKernelInner() {
+  const gen = startGen;
+  // A heartbeat grace period of the previous session ends here: its executions are over.
+  if (graceTimer) kernelGone(null, "kernel restarted");
   let { python, cwd, remote, connectionFile } = get();
   if (!remote && !connectionFile && cwd) {
     // A cwd left over from a remote session may not exist here.
     const ok = await invoke("list_dir", { path: cwd }).then(() => true).catch(() => false);
-    if (!ok) { cwd = await invoke<string>("home_dir"); set({ cwd }); localStorage.setItem("pide.cwd", cwd); }
+    if (!ok) { cwd = await invoke<string>("home_dir").catch(() => cwd!); set({ cwd }); localStorage.setItem("pide.cwd", cwd); }
   }
+  if (gen !== startGen) return;
   set({ console: [...get().console], inputRequest: null });
   resetDebugState();
   pushConsole({ kind: "info", text: remote ? `Starting remote kernel on ${remote.host}: ${remote.python}` : connectionFile ? `Connecting to kernel: ${connectionFile}` : `Starting kernel: ${python}` });
@@ -325,7 +357,8 @@ async function startKernelInner() {
       void devAutorun();
     }
   } catch (e) {
-    pushConsole({ kind: "info", text: `Failed to start kernel: ${e}` });
+    if (gen !== startGen || String(e).includes("kernel start cancelled")) pushConsole({ kind: "info", text: "Kernel start cancelled." });
+    else pushConsole({ kind: "info", text: `Failed to start kernel: ${e}` });
   }
 }
 let autorunDone = false;
@@ -336,13 +369,34 @@ async function devAutorun() {
   if (script) new Function(script)();
 }
 
-export function restartKernel() {
+/** In-flight restart, registered synchronously so execute() never slips between cancelling
+ *  the old start and registering the new one. A restart pressed during a restart aborts the
+ *  in-flight start (e.g. a hung SSH launch) and restarts again after it. */
+let restarting: Promise<void> | null = null;
+export function restartKernel(): Promise<void> {
+  const prev = restarting;
+  if (prev) { startGen++; void invoke("cancel_start").catch(() => {}); }
+  const p: Promise<void> = (prev ? prev.then(restartKernelInner) : restartKernelInner()).finally(() => {
+    if (restarting === p) restarting = null;
+  });
+  restarting = p;
+  return p;
+}
+
+async function restartKernelInner() {
   pushConsole({ kind: "info", text: "Restarting kernel..." });
+  if (starting) {
+    // A start in progress (possibly a minute-long SSH launch, or its setup requests to an
+    // unresponsive kernel) is aborted, not waited out.
+    startGen++;
+    settlePending("kernel restarted");
+    await invoke("cancel_start").catch(() => {});
+    await starting; // never rejects: startKernelInner reports its own errors
+  }
   settlePending("kernel restarted");
   set({ variables: [], changed: new Set() });
   resetDebugState();
-  // startKernel() registers the in-flight promise synchronously, so execute() waits on it too.
-  return startKernel();
+  await startKernel();
 }
 
 export async function interrupt() {
@@ -353,8 +407,9 @@ export async function interrupt() {
 export async function execute(code: string, { echo = true, sink, history = true }: { echo?: boolean; sink?: (item: OutputItem) => void; history?: boolean } = {}): Promise<any> {
   if (!code.trim()) return;
   // During start / restart the backend has no kernel yet ("kernel not running"): wait for it.
-  if (starting) await starting;
-  else if (get().kernel === "stopped" || get().kernel === "dead") await startKernel();
+  if (restarting || starting) {
+    while (restarting || starting) await (restarting ?? starting);
+  } else if (get().kernel === "stopped" || get().kernel === "dead") await startKernel();
   const id = crypto.randomUUID();
   if (sink) sinks.set(id, sink);
   else consoleMarks.set(id, get().console[get().console.length - 1]?.id ?? 0);

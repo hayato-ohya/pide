@@ -805,6 +805,15 @@ def _namespace():
     return __import__("__main__").__dict__
 
 
+def _is_ipy_hidden(name, obj):
+    """True for names IPython injected into user_ns (what %who hides), unless the user rebound them."""
+    ip = sys.modules.get("IPython") and __import__("IPython").get_ipython()
+    hidden = getattr(ip, "user_ns_hidden", None)
+    if hidden is None:  # not running under IPython: fixed fallback list
+        return name in IPY_NAMES
+    return name in hidden and hidden[name] is obj
+
+
 def snapshot(include_hidden=False):
     """Summaries for every object in the user namespace.  Called via user_expressions."""
     out = []
@@ -814,7 +823,7 @@ def snapshot(include_hidden=False):
         for name, obj in list(ns.items()):
             if not isinstance(name, str):
                 continue
-            if name in IPY_NAMES:
+            if _is_ipy_hidden(name, obj):
                 continue
             if not include_hidden and name.startswith(HIDDEN_PREFIXES):
                 continue
@@ -1506,7 +1515,7 @@ def run_file(path, argv=None):
 # ----------------------------------------------------------------------------
 
 def fs_list(path):
-    path = os.path.expanduser(path or "~")
+    path = os.path.abspath(os.path.expanduser(path or "~"))
     out = []
     try:
         with os.scandir(path) as it:
@@ -1523,7 +1532,7 @@ def fs_list(path):
     except OSError as e:
         return _Payload({"path": path, "error": str(e)})
     out.sort(key=lambda d: (not d["is_dir"], d["name"].lower()))
-    return _Payload({"path": os.path.abspath(path), "entries": out})
+    return _Payload({"path": path, "entries": out})
 
 
 def fs_read(path):

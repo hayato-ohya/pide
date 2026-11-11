@@ -8,7 +8,7 @@ pub mod platform;
 
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -16,9 +16,10 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio_util::sync::CancellationToken;
+use futures_util::StreamExt;
+pub use tokio_util::sync::CancellationToken;
 use zeromq::util::PeerIdentity;
-use zeromq::{DealerSendHalf, DealerSocket, ReqSocket, Socket, SocketOptions, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+use zeromq::{DealerSendHalf, DealerSocket, ReqSocket, Socket, SocketEvent, SocketOptions, SocketRecv, SocketSend, SubSocket, ZmqError, ZmqMessage};
 
 pub use launch::{ConnectionInfo, LaunchSpec};
 pub use message::{Header, Message, Signer};
@@ -37,6 +38,63 @@ pub enum Channel {
 pub struct Event {
     pub channel: Channel,
     pub msg: Message,
+}
+
+/// Why `Kernel::liveness` considers the kernel gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Alive,
+    /// The kernel process (or, remote, its SSH session / tunnel) exited, or it was shut down.
+    Exited,
+    /// A channel dropped and could not be reconnected.
+    Link,
+    /// The heartbeat stopped answering; it may come back.
+    Heartbeat,
+}
+
+impl Liveness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Liveness::Alive => "alive",
+            Liveness::Exited => "exited",
+            Liveness::Link => "link",
+            Liveness::Heartbeat => "heartbeat",
+        }
+    }
+}
+
+/// Returned (inside `anyhow::Error`) when a launch was aborted through its cancellation token.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("kernel start cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Run a launch step until it finishes or `cancel` fires.  Dropping the step kills what it
+/// spawned so far (kill_on_drop children, `GroupGuard`).
+async fn cancellable<T>(cancel: &CancellationToken, f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Cancelled.into()),
+        r = f => r,
+    }
+}
+
+/// Kills a starting local kernel's process group unless disarmed (kill_on_drop only reaches the
+/// leader, e.g. a wrapper script, not what it already started).
+struct GroupGuard(Option<u32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            platform::kill_group(pid);
+        }
+    }
 }
 
 pub struct Kernel {
@@ -58,9 +116,11 @@ pub struct Kernel {
     cancel: CancellationToken,
     /// Set by the heartbeat task after repeated misses, cleared when it answers again.
     hb_dead: Arc<AtomicBool>,
-    /// Set when a socket pump fails: zeromq 0.7 DEALERs do not reconnect, so the
-    /// channel is gone for good and the kernel must be restarted.
+    /// Set when a channel dropped and could not be reconnected (see `dealer`): the
+    /// kernel must be restarted.
     link_dead: Arc<AtomicBool>,
+    /// Bumped each time a channel was reconnected (replies in flight may have been lost).
+    reconnects: Arc<AtomicU64>,
     _conn_file: Option<launch::ConnFile>,
     /// Interrupt / parent handles for a locally launched kernel.
     handles: platform::KernelHandles,
@@ -81,6 +141,15 @@ impl Drop for Kernel {
 impl Kernel {
     /// Launch a kernel process and connect all channels.
     pub async fn launch(spec: LaunchSpec) -> Result<Arc<Kernel>> {
+        Self::launch_cancellable(spec, &CancellationToken::new()).await
+    }
+
+    /// `launch`, aborted (killing the kernel's process group) when `cancel` fires.
+    pub async fn launch_cancellable(spec: LaunchSpec, cancel: &CancellationToken) -> Result<Arc<Kernel>> {
+        cancellable(cancel, Self::launch_inner(spec)).await
+    }
+
+    async fn launch_inner(spec: LaunchSpec) -> Result<Arc<Kernel>> {
         let info = ConnectionInfo::new_local()?;
         let conn_file = launch::ConnFile::write(&info)?;
 
@@ -103,6 +172,7 @@ impl Kernel {
         }
         let handles = platform::KernelHandles::prepare(&mut cmd);
         let mut child = cmd.spawn().context("spawning ipykernel")?;
+        let mut group = GroupGuard(child.id());
         // Forward kernel stderr/stdout to tracing so they are never lost.
         if let Some(out) = child.stdout.take() {
             tokio::spawn(pipe_log("kernel.stdout", out, None));
@@ -111,13 +181,19 @@ impl Kernel {
             Some(err) => StderrTail::spawn("kernel.stderr", err),
             None => StderrTail::default(),
         };
-        Self::connect_inner(info, Some((child, tail)), vec![], false, true, Some(conn_file), handles).await
+        let k = Self::connect_inner(info, Some((child, tail)), vec![], false, true, Some(conn_file), handles).await?;
+        group.0 = None; // the Kernel's Drop / shutdown takes over
+        Ok(k)
     }
 
     /// Connect to an already running kernel described by a connection file
     /// (e.g. a kernel started by hand, or in a container with published ports).
     pub async fn connect(info: ConnectionInfo) -> Result<Arc<Kernel>> {
-        Self::connect_inner(info, None, vec![], true, false, None, Default::default()).await
+        Self::connect_cancellable(info, &CancellationToken::new()).await
+    }
+
+    pub async fn connect_cancellable(info: ConnectionInfo, cancel: &CancellationToken) -> Result<Arc<Kernel>> {
+        cancellable(cancel, Self::connect_inner(info, None, vec![], true, false, None, Default::default())).await
     }
 
     /// Start a kernel on a remote host over SSH and tunnel its ports.
@@ -128,6 +204,15 @@ impl Kernel {
     ///    with its stdin held open by us, stays open for the kernel's lifetime)
     /// 3. open a second SSH session with `-L` forwards for the five ports
     pub async fn launch_remote(spec: launch::RemoteSpec, helper_src: &str) -> Result<Arc<Kernel>> {
+        Self::launch_remote_cancellable(spec, helper_src, &CancellationToken::new()).await
+    }
+
+    /// `launch_remote`, aborted (killing the SSH sessions started so far) when `cancel` fires.
+    pub async fn launch_remote_cancellable(spec: launch::RemoteSpec, helper_src: &str, cancel: &CancellationToken) -> Result<Arc<Kernel>> {
+        cancellable(cancel, Self::launch_remote_inner(spec, helper_src)).await
+    }
+
+    async fn launch_remote_inner(spec: launch::RemoteSpec, helper_src: &str) -> Result<Arc<Kernel>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         if spec.host.starts_with('-') || spec.host.is_empty() {
             anyhow::bail!("invalid ssh host {:?}", spec.host);
@@ -149,7 +234,7 @@ impl Kernel {
         let mut up = Command::new(&ssh);
         up.args(base_args(&spec)).arg("--").arg(&spec.host)
             .arg("umask 077 && mkdir -p ~/.pide/pide_kernel && chmod 700 ~/.pide && cat > ~/.pide/pide_kernel/__init__.py")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut up_child = platform::quiet(&mut up).spawn().context("ssh (upload helper)")?;
         if let Some(mut stdin) = up_child.stdin.take() {
             // A write error (EPIPE when ssh fails to connect) is reported below via ssh's own
@@ -275,6 +360,10 @@ impl Kernel {
         // Large enough that a tight print loop does not drop the execute_reply.
         let (events, _) = broadcast::channel(65_536);
         let cancel = CancellationToken::new();
+        // Created before the channels: a DEALER that lost its connection keeps reconnecting
+        // while the heartbeat says the kernel is there.
+        let hb_dead = Arc::new(AtomicBool::new(false));
+        let reconnects = Arc::new(AtomicU64::new(0));
 
         // A kernel bound to all interfaces is reached over loopback.
         let host = match info.ip.as_str() {
@@ -283,22 +372,29 @@ impl Kernel {
         };
         let ep = |port: u16| format!("tcp://{host}:{port}");
 
-        // Dealer sockets (shell / control / stdin): a send half fed by an mpsc
-        // and a recv half pumped into the broadcast channel.  zeromq retries a
-        // refused connect for up to 30 s, so race it against the kernel dying.
+        // Dealer sockets (shell / control / stdin): a supervisor task per channel feeds
+        // the socket from an mpsc, pumps what it receives into the broadcast channel and
+        // reconnects it when it drops.  zeromq retries a refused connect for up to 30 s,
+        // so race it against the kernel dying.
         let attempt = || async {
             // Per attempt, so pumps of a failed attempt can neither linger nor mark the
             // link of the next one dead.
             let cancel = cancel.child_token();
             let link_dead = Arc::new(AtomicBool::new(false));
             let r = async {
-                let d = |port: u16, channel: Channel| {
-                    dealer(ep(port), channel, &session, signer.clone(), events.clone(), cancel.clone(), link_dead.clone())
+                let shared = ChannelShared {
+                    signer: signer.clone(),
+                    events: events.clone(),
+                    cancel: cancel.clone(),
+                    link_dead: link_dead.clone(),
+                    hb_dead: hb_dead.clone(),
+                    reconnects: reconnects.clone(),
                 };
+                let d = |port: u16, channel: Channel| dealer(ep(port), channel, &session, shared.clone());
                 let shell_tx = d(info.shell_port, Channel::Shell).await?;
                 let control_tx = d(info.control_port, Channel::Control).await?;
                 let stdin_tx = d(info.stdin_port, Channel::Stdin).await?;
-                // IOPub subscriber.
+                // IOPub subscriber (zeromq's SUB reconnects by itself and re-subscribes).
                 let mut sub = SubSocket::new();
                 sub.connect(&ep(info.iopub_port)).await.context("connect iopub")?;
                 sub.subscribe("").await?;
@@ -336,7 +432,6 @@ impl Kernel {
             let signer = signer.clone();
             let events = events.clone();
             let cancel = cancel.clone();
-            let link_dead = link_dead.clone();
             tokio::spawn(async move {
                 loop {
                     let m = tokio::select! {
@@ -351,9 +446,14 @@ impl Kernel {
                             Err(e) => tracing::warn!("iopub decode: {e:#}"),
                         },
                         Err(e) => {
-                            tracing::warn!("iopub closed: {e}");
-                            link_dead.store(true, Ordering::Relaxed);
-                            break;
+                            // The peer dropped: zeromq's reconnect task brings it back (messages
+                            // published meanwhile are lost); a later loss shows as a heartbeat
+                            // or DEALER failure.
+                            tracing::warn!("iopub connection lost: {e}");
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                            }
                         }
                     }
                 }
@@ -364,7 +464,6 @@ impl Kernel {
         // Heartbeat: REQ/REP ping every 3 s; three misses mark the kernel dead
         // until it answers again.  Started only once the kernel is ready, so a
         // slow startup is bounded by wait_ready alone.
-        let hb_dead = Arc::new(AtomicBool::new(false));
         let (hb_start, hb_start_rx) = tokio::sync::oneshot::channel::<()>();
         {
             let hb_ep = ep(info.hb_port);
@@ -438,6 +537,7 @@ impl Kernel {
             cancel,
             hb_dead,
             link_dead,
+            reconnects,
             _conn_file: conn_file,
             handles,
         });
@@ -617,19 +717,37 @@ impl Kernel {
     }
 
     pub async fn is_alive(&self) -> bool {
-        if self.cancel.is_cancelled() || self.hb_dead.load(Ordering::Relaxed) || self.link_dead.load(Ordering::Relaxed) {
-            return false;
+        self.liveness().await == Liveness::Alive
+    }
+
+    /// Whether the kernel is reachable and, if not, why (a process exit is final, a
+    /// heartbeat loss may recover).
+    pub async fn liveness(&self) -> Liveness {
+        if self.cancel.is_cancelled() {
+            return Liveness::Exited;
         }
         for c in self.extra.lock().await.iter_mut() {
             if matches!(c.try_wait(), Ok(Some(_))) {
-                return false; // ssh tunnel died
+                return Liveness::Exited; // ssh tunnel died
             }
         }
-        let mut child = self.child.lock().await;
-        match child.as_mut() {
-            Some(c) => matches!(c.try_wait(), Ok(None)),
-            None => true,
+        if let Some(c) = self.child.lock().await.as_mut() {
+            if !matches!(c.try_wait(), Ok(None)) {
+                return Liveness::Exited;
+            }
         }
+        if self.link_dead.load(Ordering::Relaxed) {
+            Liveness::Link
+        } else if self.hb_dead.load(Ordering::Relaxed) {
+            Liveness::Heartbeat
+        } else {
+            Liveness::Alive
+        }
+    }
+
+    /// How many times a channel has been reconnected so far.
+    pub fn reconnects(&self) -> u64 {
+        self.reconnects.load(Ordering::Relaxed)
     }
 
     /// Resolves when the kernel has been shut down or dropped.
@@ -770,58 +888,141 @@ async fn exited(child: &mut Option<Child>, extra: &mut [Child]) -> anyhow::Error
     }
 }
 
-async fn dealer(
-    endpoint: String,
-    channel: Channel,
-    identity: &str,
+/// What every channel supervisor of one connection attempt shares.
+#[derive(Clone)]
+struct ChannelShared {
     signer: Signer,
     events: broadcast::Sender<Event>,
     cancel: CancellationToken,
-    dead: Arc<AtomicBool>,
-) -> Result<mpsc::Sender<ZmqMessage>> {
+    link_dead: Arc<AtomicBool>,
+    hb_dead: Arc<AtomicBool>,
+    reconnects: Arc<AtomicU64>,
+}
+
+type DealerConn = (DealerSocket, futures_util::stream::BoxStream<'static, SocketEvent>);
+
+/// A DEALER with our identity, connected to `endpoint`, plus its monitor (which reports
+/// the peer disconnecting: a closed connection never makes `recv` fail on its own).
+async fn connect_dealer(endpoint: &str, identity: &PeerIdentity, timeout: Option<std::time::Duration>) -> zeromq::ZmqResult<DealerConn> {
     // ipykernel addresses input_request to the identity of the *shell* request, so
     // shell, stdin and control must share one identity (jupyter_client uses the
     // session id).  zeromq only sends an Identity in the handshake when one is set.
     let mut opts = SocketOptions::default();
-    opts.peer_identity(PeerIdentity::try_from(identity.as_bytes())?);
+    opts.peer_identity(identity.clone());
+    if let Some(t) = timeout {
+        opts.connect_timeout(t);
+    }
     let mut sock = DealerSocket::with_options(opts);
-    sock.connect(&endpoint).await.with_context(|| format!("connect {channel:?} {endpoint}"))?;
-    let (mut send_half, mut recv_half): (DealerSendHalf, _) = sock.split();
+    let monitor = sock.monitor().boxed();
+    sock.connect(endpoint).await?;
+    Ok((sock, monitor))
+}
+
+/// Connect a DEALER channel and start its supervisor, which owns the socket: it sends
+/// what arrives on the returned mpsc, broadcasts what it receives and, since zeromq 0.7
+/// DEALERs do not reconnect, replaces the socket (same identity) when the connection
+/// drops.  Requests queued meanwhile wait in the mpsc; replies the kernel sent while
+/// we were disconnected are lost.  Only when reconnecting fails is the link marked dead
+/// (and the mpsc closed, so senders get an error).
+async fn dealer(endpoint: String, channel: Channel, identity: &str, sh: ChannelShared) -> Result<mpsc::Sender<ZmqMessage>> {
+    let identity = PeerIdentity::try_from(identity.as_bytes())?;
+    let first = connect_dealer(&endpoint, &identity, None).await.with_context(|| format!("connect {channel:?} {endpoint}"))?;
     let (tx, mut rx) = mpsc::channel::<ZmqMessage>(256);
-    let c1 = cancel.clone();
-    let dead2 = dead.clone();
     tokio::spawn(async move {
+        let mut conn = Some(first);
+        // A message the dropped socket handed back (no peer): sent again after reconnecting.
+        let mut unsent: Option<ZmqMessage> = None;
         loop {
-            let m = tokio::select! { _ = c1.cancelled() => break, m = rx.recv() => m };
-            let Some(m) = m else { break };
-            if let Err(e) = send_half.send(m).await {
-                tracing::warn!("{channel:?} send: {e}");
-                dead2.store(true, Ordering::Relaxed);
-                break;
-            }
-        }
-        drop(send_half);
-    });
-    tokio::spawn(async move {
-        loop {
-            let r = tokio::select! { _ = cancel.cancelled() => break, r = recv_half.recv() => r };
-            match r {
-                Ok(m) => match Message::decode(m.into_vec(), &signer) {
-                    Ok(msg) => {
-                        let _ = events.send(Event { channel, msg });
+            let (sock, mut monitor) = match conn.take() {
+                Some(c) => c,
+                None => match reconnect_dealer(&endpoint, &identity, channel, &sh).await {
+                    Some(c) => {
+                        sh.reconnects.fetch_add(1, Ordering::Relaxed);
+                        c
                     }
-                    Err(e) => tracing::warn!("{channel:?} decode: {e:#}"),
+                    None => {
+                        if !sh.cancel.is_cancelled() {
+                            sh.link_dead.store(true, Ordering::Relaxed);
+                        }
+                        break;
+                    }
                 },
-                Err(e) => {
-                    tracing::warn!("{channel:?} closed: {e}");
-                    dead.store(true, Ordering::Relaxed);
-                    break;
+            };
+            let (mut send_half, mut recv_half): (DealerSendHalf, _) = sock.split();
+            let lost = loop {
+                let m = match unsent.take() {
+                    Some(m) => Some(m),
+                    None => tokio::select! {
+                        _ = sh.cancel.cancelled() => return,
+                        m = rx.recv() => match m {
+                            Some(m) => Some(m),
+                            None => return, // the Kernel is gone
+                        },
+                        r = recv_half.recv() => {
+                            match r {
+                                Ok(m) => match Message::decode(m.into_vec(), &sh.signer) {
+                                    Ok(msg) => {
+                                        let _ = sh.events.send(Event { channel, msg });
+                                    }
+                                    Err(e) => tracing::warn!("{channel:?} decode: {e:#}"),
+                                },
+                                Err(e) => break format!("recv: {e}"),
+                            }
+                            None
+                        }
+                        ev = monitor.next() => match ev {
+                            Some(SocketEvent::Disconnected(_)) | None => break "peer disconnected".to_string(),
+                            Some(_) => None,
+                        },
+                    },
+                };
+                if let Some(m) = m {
+                    match send_half.send(m).await {
+                        Ok(()) => {}
+                        Err(ZmqError::ReturnToSender { message, reason }) => {
+                            unsent = Some(message);
+                            break format!("send: {reason}");
+                        }
+                        Err(e) => break format!("send: {e}"),
+                    }
                 }
-            }
+            };
+            tracing::warn!("{channel:?} connection lost ({lost}); reconnecting");
+            // Dropping both halves shuts the old socket down.
         }
-        drop(recv_half);
     });
     Ok(tx)
+}
+
+/// Reconnect a dropped DEALER with backoff: keep trying for 30 s, and beyond that for as
+/// long as the heartbeat still answers (at most 5 min).  None when cancelled or given up.
+async fn reconnect_dealer(endpoint: &str, identity: &PeerIdentity, channel: Channel, sh: &ChannelShared) -> Option<DealerConn> {
+    use std::time::Duration;
+    let since = tokio::time::Instant::now();
+    let mut delay = Duration::from_millis(100);
+    loop {
+        tokio::select! {
+            _ = sh.cancel.cancelled() => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        let r = tokio::select! {
+            _ = sh.cancel.cancelled() => return None,
+            r = connect_dealer(endpoint, identity, Some(Duration::from_secs(5))) => r,
+        };
+        match r {
+            Ok(c) => {
+                tracing::info!("{channel:?} reconnected after {:?}", since.elapsed());
+                return Some(c);
+            }
+            Err(e) => tracing::debug!("{channel:?} reconnect failed: {e}"),
+        }
+        let waited = since.elapsed();
+        if (waited > Duration::from_secs(30) && sh.hb_dead.load(Ordering::Relaxed)) || waited > Duration::from_secs(300) {
+            tracing::warn!("{channel:?} could not reconnect within {waited:?}; giving up");
+            return None;
+        }
+        delay = (delay * 2).min(Duration::from_secs(2));
+    }
 }
 
 pub fn b64encode(d: &[u8]) -> String {
