@@ -3,6 +3,7 @@
 
 mod git;
 mod lsp;
+mod shellenv;
 mod term;
 
 use std::collections::HashMap;
@@ -589,6 +590,8 @@ fn dirs_log_dir() -> PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First, while no other thread exists: PATH/LANG of a Finder/Dock launch.
+    let env_note = shellenv::init();
     // Log to stderr (dev) and to a daily-rotated file in the OS log dir, so a
     // Dock-launched app still leaves diagnostics behind. Child-process output
     // is DEBUG; set RUST_LOG=debug to see it.
@@ -606,6 +609,9 @@ pub fn run() {
         .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
         .init();
     tracing::info!("log directory: {}", log_dir.display());
+    if let Some(n) = env_note {
+        tracing::info!("{n}");
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
