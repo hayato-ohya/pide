@@ -30,7 +30,7 @@ export function buildDefaultLayout(a: DockviewApi) {
 export const revealRequests = new Map<string, number>();
 export function openNotebook(path: string | null) {
   if (!api) return;
-  const id = path ? `nb:${path}` : `nb:untitled-${Date.now()}`;
+  const id = path ? `nb:${path}` : `nb:/Untitled-${Date.now()}.ipynb`;
   const existing = api.getPanel(id);
   if (existing) { existing.api.setActive(); return; }
   const ref = api.panels.find((p) => p.id.startsWith("nb:") || p.id.startsWith("editor:"));
@@ -74,8 +74,9 @@ export function revealInEditor(uri: string, line: number) {
     if (p) { p.api.setActive(); p.api.updateParameters({ ...p.params, reveal: line, revealTick: Date.now() }); }
     return;
   }
-  const path = uri.startsWith("file://") ? decodeURIComponent(uri.slice(7)) : uri;
-  openFile(path, line);
+  if (!uri.startsWith("file://")) { openFile(uri, line); return; }
+  // Same URI -> path conversion as the debugger (handles Windows drive letters).
+  import("./debug").then((d) => openFile(d.uriToPath(uri) ?? uri, line));
 }
 
 export function openDiff(diff: import("./git").FileDiff, label: string) {

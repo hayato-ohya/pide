@@ -15,6 +15,7 @@ export default function Modal({ title, onClose, width, children, onEnter }: { ti
     return () => { prev?.focus?.(); };
   }, []);
   const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return; // IME conversion in progress
     if (e.key === "Escape") { e.stopPropagation(); onClose(); return; }
     if (e.key === "Enter" && onEnter && !(e.target instanceof HTMLTextAreaElement) && !(e.target instanceof HTMLButtonElement) && !e.shiftKey) { e.preventDefault(); onEnter(); return; }
     if (e.key !== "Tab" || !ref.current) return;

@@ -39,6 +39,7 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
   }, []);
   const blocks = useRef(new Map<string, DetailWindow>());
   const inflight = useRef(new Set<string>());
+  const genRef = useRef(0); // bumped whenever the cache is cleared; stale responses are dropped
   const scroller = useRef<HTMLDivElement>(null);
   const [scroll, setScroll] = useState({ top: 0, left: 0, h: 400, w: 600 });
 
@@ -50,6 +51,8 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
   // (Re)load the first block whenever the variable changes.
   useEffect(() => {
     blocks.current.clear();
+    inflight.current.clear();
+    genRef.current++;
     setMeta(null);
     setError(null);
     let cancelled = false;
@@ -84,10 +87,11 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
     const key = `${br}:${bc}`;
     if (blocks.current.has(key) || inflight.current.has(key)) return;
     inflight.current.add(key);
+    const gen = genRef.current;
     fetchDetail(path, { row0: br * BLOCK_R, row1: (br + 1) * BLOCK_R, col0: bc * BLOCK_C, col1: (bc + 1) * BLOCK_C, index: index.length ? index : undefined })
-      .then((d) => { putBlock(key, d); bump((x) => x + 1); })
-      .catch((e) => setError(String(e)))
-      .finally(() => inflight.current.delete(key));
+      .then((d) => { if (gen !== genRef.current) return; putBlock(key, d); bump((x) => x + 1); })
+      .catch((e) => { if (gen === genRef.current) setError(String(e)); })
+      .finally(() => { if (gen === genRef.current) inflight.current.delete(key); });
   };
 
   useEffect(() => {
@@ -146,7 +150,8 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
     const b = getBlock(`${Math.floor(r / BLOCK_R)}:0`);
     return b?.index_labels?.[r - Math.floor(r / BLOCK_R) * BLOCK_R] ?? String(r);
   };
-  const children = meta.children;
+  const childAt = (r: number) => getBlock(`${Math.floor(r / BLOCK_R)}:0`)?.children?.[r - Math.floor(r / BLOCK_R) * BLOCK_R];
+  const hasChildren = !!meta.children;
   const leadDims = meta.shape && meta.shape.length > 2 ? meta.shape.slice(0, -2) : [];
 
   const rowsEls = [];
@@ -156,7 +161,7 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
       const v = cellAt(r, c);
       cells.push(
         <div key={c} className={`vv-cell ${typeof v === "number" ? "num" : ""} ${selCols.includes(c) ? "sel" : ""}`} style={{ left: IDX_W + c * COL_W, width: COL_W }}
-             onDoubleClick={() => children && openVariable(`${path}${children[r - Math.floor(r / BLOCK_R) * BLOCK_R]?.name.startsWith("[") ? "" : "."}${children[r - Math.floor(r / BLOCK_R) * BLOCK_R]?.name ?? ""}`)}>
+             onDoubleClick={() => { const ch = hasChildren ? childAt(r) : undefined; if (ch) openVariable(`${path}${ch.name.startsWith("[") ? "" : "."}${ch.name}`); }}>
           {v === undefined ? "" : fmt(v)}
         </div>,
       );

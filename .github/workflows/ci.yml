@@ -52,6 +52,12 @@ jobs:
         run: npm run build
         working-directory: apps/desktop
       - run: cargo test -p kernel-client
+      - name: Clippy (workspace, warnings are errors)
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Workspace tests
+        if: runner.os == 'Linux'
+        run: cargo test --workspace
       - name: Kernel smoke test (launch, snapshot, interrupt, shutdown)
         run: cargo run -p kernel-client --example smoke -- python
         env:

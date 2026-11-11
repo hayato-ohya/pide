@@ -15,6 +15,7 @@ pub struct ConnectionInfo {
     pub hb_port: u16,
     pub key: String,
     pub signature_scheme: String,
+    #[serde(default)]
     pub kernel_name: String,
 }
 
@@ -60,8 +61,18 @@ impl ConnFile {
         std::fs::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            // Without XDG_RUNTIME_DIR this is the shared /tmp: refuse a directory (or symlink)
+            // planted by another user, which could read the HMAC key or swap the file.
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            let md = std::fs::symlink_metadata(&dir)?;
+            let uid = unsafe { geteuid() };
+            if !md.file_type().is_dir() || md.uid() != uid {
+                anyhow::bail!("{} is not a directory owned by the current user", dir.display());
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
         // Sweep files left behind by crashed sessions (older than a day).
         if let Ok(rd) = std::fs::read_dir(&dir) {

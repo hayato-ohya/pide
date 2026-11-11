@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { AnsiUp } from "ansi_up";
 import { complete, execute, interrupt, isComplete, replyInput } from "../kernel";
-import { useStore } from "../store";
+import { pushConsole, streamDisplay, useStore } from "../store";
 import type { ConsoleItem, Mime } from "../types";
 import { safeHtml } from "../sanitize";
 
@@ -27,7 +27,7 @@ const Item = memo(function Item({ it }: { it: ConsoleItem }) {
         </div>
       );
     case "stream":
-      return <pre className={`c-stream ${it.name}`} dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(it.text) }} />;
+      return <pre className={`c-stream ${it.name}`} dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(streamDisplay(it.text)) }} />;
     case "result":
       return (
         <div className="c-result">
@@ -83,14 +83,14 @@ export default function Console() {
     const c = codeRef.current;
     if (inputReq) {
       setCode("");
-      await replyInput(c);
+      await replyInput(c).catch((e) => pushConsole({ kind: "info", text: `input: ${e}` }));
       return;
     }
     if (!c.trim()) return;
     setCode("");
     setHIdx(null);
     stickBottom.current = true;
-    await execute(c);
+    await execute(c).catch((e) => pushConsole({ kind: "info", text: `Cannot execute: ${e}` }));
   };
 
   const applyComp = (m: string) => {
@@ -102,6 +102,7 @@ export default function Console() {
   };
 
   const onKey = async (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return; // IME conversion in progress
     if (comp) {
       if (e.key === "ArrowDown") { e.preventDefault(); setComp({ ...comp, sel: (comp.sel + 1) % comp.matches.length }); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); setComp({ ...comp, sel: (comp.sel - 1 + comp.matches.length) % comp.matches.length }); return; }
@@ -139,14 +140,14 @@ export default function Console() {
           return;
         }
       }
-    } else if (e.key === "ArrowUp" && !code.includes("\n")) {
+    } else if (e.key === "ArrowUp" && !code.slice(0, e.currentTarget.selectionStart).includes("\n")) {
       e.preventDefault();
       const i = hIdx === null ? history.length - 1 : Math.max(0, hIdx - 1);
       if (history[i] !== undefined) {
         setHIdx(i);
         setCode(history[i]);
       }
-    } else if (e.key === "ArrowDown" && hIdx !== null) {
+    } else if (e.key === "ArrowDown" && hIdx !== null && !code.slice(e.currentTarget.selectionEnd).includes("\n")) {
       e.preventDefault();
       const i = hIdx + 1;
       if (i >= history.length) {

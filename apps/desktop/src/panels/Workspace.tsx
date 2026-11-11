@@ -52,7 +52,7 @@ function cell(v: VarInfo, k: ColKey): string {
     case "min": return fmtNum(v.stats?.min);
     case "max": return fmtNum(v.stats?.max);
     case "mean": return fmtNum(v.stats?.mean);
-    case "nan": return v.stats?.nan != null ? String(v.stats.nan) : "";
+    case "nan": { const st = v.stats; if (st?.nan == null && st?.null == null) return ""; return [st?.nan != null ? String(st.nan) : "", st?.null ? `${st.null} null` : ""].filter(Boolean).join(" / ") || "0"; }
   }
 }
 

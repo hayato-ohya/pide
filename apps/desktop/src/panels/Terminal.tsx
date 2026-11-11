@@ -48,15 +48,31 @@ function TermView({ tab, onExit, onTitle }: { tab: Tab; onExit: () => void; onTi
       const sq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
       const cdCmd = remote?.cwd ? (remote.cwd.startsWith("~/") ? `cd ~/${sq(remote.cwd.slice(2))}` : remote.cwd === "~" ? "cd ~" : `cd ${sq(remote.cwd)}`) : null;
       const command = remote ? ["ssh", "-t", ...(remote.port ? ["-p", String(remote.port)] : []), "--", remote.host, cdCmd ? `${cdCmd}; exec $SHELL -l` : "exec $SHELL -l"] : null;
-      unlistenData = await listen<{ id: number; data: string }>("pty-data", (e) => { if (e.payload.id === ptyRef.current) term.write(decode(e.payload.data)); });
+      // Output (or even the exit of a short-lived command) can arrive before
+      // pty_spawn resolves with our id: hold events until then and replay ours.
+      let early: (() => void)[] | null = [];
+      const onPtyData = (id: number, data: string) => { if (id === ptyRef.current) term.write(decode(data)); };
+      const onPtyExit = (id: number, code: number | null) => {
+        if (id !== ptyRef.current) return;
+        ptyRef.current = null; // once: no more input, nothing left to kill
+        term.write(`\r\n\x1b[90m[process exited${code != null ? ` with code ${code}` : ""}]\x1b[0m\r\n`);
+        onExit();
+      };
+      unlistenData = await listen<{ id: number; data: string }>("pty-data", (e) => { if (early) early.push(() => onPtyData(e.payload.id, e.payload.data)); else onPtyData(e.payload.id, e.payload.data); });
       if (disposed) { unlistenData(); return; }
-      unlistenExit = await listen<{ id: number }>("pty-exit", (e) => { if (e.payload.id === ptyRef.current) { term.write("\r\n\x1b[90m[process exited]\x1b[0m\r\n"); invoke("pty_reap").catch(() => {}); onExit(); } });
+      unlistenExit = await listen<{ id: number; code: number | null }>("pty-exit", (e) => { if (early) early.push(() => onPtyExit(e.payload.id, e.payload.code)); else onPtyExit(e.payload.id, e.payload.code); });
       if (disposed) { unlistenData(); unlistenExit(); return; }
       try {
         const id = await invoke<number>("pty_spawn", { cols: term.cols, rows: term.rows, cwd: remote ? null : get().cwd, command, env: { PIDE_PYTHON: get().python ?? "" } });
+        // Unmounted while spawning: the cleanup saw no id, so kill it here.
+        if (disposed) { invoke("pty_kill", { id }).catch(() => {}); return; }
         ptyRef.current = id;
+        const queued = early;
+        early = null;
+        for (const f of queued) f();
         onTitle(remote ? `ssh ${remote.host}` : (get().cwd ?? "shell").split("/").pop() || "shell");
       } catch (err) {
+        early = null;
         term.write(`\x1b[31mfailed to start terminal: ${err}\x1b[0m\r\n`);
       }
     })();

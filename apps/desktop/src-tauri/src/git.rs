@@ -15,7 +15,9 @@ fn rel(repo: &Repository, path: &str) -> PathBuf {
     let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let p = Path::new(path);
     let p_c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    p_c.strip_prefix(&root_c).or_else(|_| p.strip_prefix(root)).map(|x| x.to_path_buf()).unwrap_or_else(|_| PathBuf::from(path))
+    let r = p_c.strip_prefix(&root_c).or_else(|_| p.strip_prefix(root)).map(|x| x.to_path_buf()).unwrap_or_else(|_| PathBuf::from(path));
+    // Index / pathspec paths always use '/', also on Windows.
+    PathBuf::from(r.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/"))
 }
 
 fn workdir(repo: &Repository) -> Result<PathBuf, String> {
@@ -25,6 +27,8 @@ fn workdir(repo: &Repository) -> Result<PathBuf, String> {
 #[derive(Serialize)]
 pub struct StatusEntry {
     path: String,
+    /// Previous path of a renamed file (staged renames only).
+    old_path: Option<String>,
     /// "staged" | "unstaged" | "untracked" | "conflicted"
     area: &'static str,
     /// M A D R T ? U
@@ -75,20 +79,23 @@ pub fn git_status(cwd: String) -> Result<GitStatus, String> {
     let mut entries = vec![];
     for e in statuses.iter() {
         let s = e.status();
-        let path = e.path().unwrap_or("").to_string();
+        // With rename detection `e.path()` is the OLD path; show/act on the new one.
+        let new_path = |d: Option<git2::DiffDelta>| d.and_then(|d| d.new_file().path().map(|p| p.to_string_lossy().to_string()));
+        let path = new_path(e.head_to_index()).or_else(|| new_path(e.index_to_workdir())).or_else(|| e.path().map(|p| p.to_string())).unwrap_or_default();
+        let old_path = e.head_to_index().filter(|_| s.is_index_renamed()).and_then(|d| d.old_file().path().map(|p| p.to_string_lossy().to_string()));
         if s.is_conflicted() {
-            entries.push(StatusEntry { path: path.clone(), area: "conflicted", code: "U".into() });
+            entries.push(StatusEntry { path: path.clone(), old_path: None, area: "conflicted", code: "U".into() });
             continue;
         }
         if s.is_index_new() || s.is_index_modified() || s.is_index_deleted() || s.is_index_renamed() || s.is_index_typechange() {
             let code = if s.is_index_new() { "A" } else if s.is_index_deleted() { "D" } else if s.is_index_renamed() { "R" } else { "M" };
-            entries.push(StatusEntry { path: path.clone(), area: "staged", code: code.into() });
+            entries.push(StatusEntry { path: path.clone(), old_path, area: "staged", code: code.into() });
         }
         if s.is_wt_new() {
-            entries.push(StatusEntry { path: path.clone(), area: "untracked", code: "?".into() });
+            entries.push(StatusEntry { path: path.clone(), old_path: None, area: "untracked", code: "?".into() });
         } else if s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_renamed() || s.is_wt_typechange() {
             let code = if s.is_wt_deleted() { "D" } else if s.is_wt_renamed() { "R" } else { "M" };
-            entries.push(StatusEntry { path, area: "unstaged", code: code.into() });
+            entries.push(StatusEntry { path, old_path: None, area: "unstaged", code: code.into() });
         }
     }
     Ok(GitStatus { state: repo_state(&repo), root, branch, head: head_oid, detached, ahead, behind, upstream, entries })
@@ -124,8 +131,10 @@ pub fn git_log(cwd: String, limit: usize, all: bool) -> Result<Vec<Commit>, Stri
     let mut labels: std::collections::HashMap<Oid, Vec<String>> = Default::default();
     if let Ok(refs) = repo.references() {
         for r in refs.flatten() {
-            if let (Some(name), Some(oid)) = (r.shorthand(), r.target()) {
+            if let (Some(name), Some(_)) = (r.shorthand(), r.target()) {
                 if name == "HEAD" { continue; }
+                // Annotated tags: target() is the tag object; label the commit it points to.
+                let Some(oid) = r.peel_to_commit().ok().map(|c| c.id()) else { continue };
                 labels.entry(oid).or_default().push(name.to_string());
             }
         }
@@ -229,7 +238,7 @@ fn collect(repo: &Repository, diff: &git2::Diff, workdir_new: bool, with_content
 pub fn git_diff(cwd: String, staged: bool, path: Option<String>) -> Result<Vec<FileDiff>, String> {
     let repo = open(&cwd)?;
     let mut opts = DiffOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
+    opts.include_untracked(true).recurse_untracked_dirs(true).disable_pathspec_match(true);
     // Untracked content (and file text in general) is only read for a single requested path.
     let with_content = path.is_some();
     opts.show_untracked_content(with_content);
@@ -266,7 +275,7 @@ pub fn git_commit_file(cwd: String, id: String, path: String) -> Result<Option<F
     let tree = c.tree().map_err(|e| e.message().to_string())?;
     let parent = c.parent(0).ok().and_then(|p| p.tree().ok());
     let mut opts = DiffOptions::new();
-    opts.pathspec(&path);
+    opts.pathspec(&path).disable_pathspec_match(true);
     let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut opts)).map_err(|e| e.message().to_string())?;
     Ok(collect(&repo, &diff, false, true).into_iter().find(|f| f.path == path))
 }
@@ -303,7 +312,7 @@ pub fn git_unstage(cwd: String, paths: Vec<String>) -> Result<(), String> {
 pub fn git_discard(cwd: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open(&cwd)?;
     let mut cb = git2::build::CheckoutBuilder::new();
-    cb.force();
+    cb.force().disable_pathspec_match(true);
     for p in &paths { cb.path(rel(&repo, p)); }
     repo.checkout_index(None, Some(&mut cb)).map_err(|e| e.message().to_string())
 }
@@ -311,6 +320,9 @@ pub fn git_discard(cwd: String, paths: Vec<String>) -> Result<(), String> {
 #[tauri::command(async)]
 pub fn git_commit(cwd: String, message: String, amend: bool) -> Result<String, String> {
     let repo = open(&cwd)?;
+    if repo.state() != git2::RepositoryState::Clean {
+        return Err("a merge / rebase / cherry-pick / revert is in progress: resolve conflicts and use Continue instead of Commit".into());
+    }
     let sig = repo.signature().map_err(|e| format!("git identity not configured: {}", e.message()))?;
     let mut idx = repo.index().map_err(|e| e.message().to_string())?;
     let tree_oid = idx.write_tree().map_err(|e| e.message().to_string())?;
@@ -318,8 +330,13 @@ pub fn git_commit(cwd: String, message: String, amend: bool) -> Result<String, S
     let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let oid = if amend {
         let h = head.ok_or("nothing to amend")?;
-        h.amend(Some("HEAD"), None, None, None, Some(&message), Some(&tree)).map_err(|e| e.message().to_string())?
+        // An empty message keeps the original one.
+        let msg = if message.trim().is_empty() { None } else { Some(message.as_str()) };
+        h.amend(Some("HEAD"), None, Some(&sig), None, msg, Some(&tree)).map_err(|e| e.message().to_string())?
     } else {
+        if head.as_ref().map_or(tree.is_empty(), |h| h.tree_id() == tree_oid) {
+            return Err("nothing to commit (staged tree is identical to HEAD)".into());
+        }
         let parents: Vec<&git2::Commit> = head.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &parents).map_err(|e| e.message().to_string())?
     };
@@ -345,10 +362,24 @@ pub fn git_branches(cwd: String) -> Result<Vec<Branch>, String> {
 #[tauri::command(async)]
 pub fn git_checkout(cwd: String, name: String) -> Result<(), String> {
     let repo = open(&cwd)?;
-    let (obj, reference) = repo.revparse_ext(&name).map_err(|e| e.message().to_string())?;
+    let (mut obj, reference) = repo.revparse_ext(&name).map_err(|e| e.message().to_string())?;
+    let mut head_ref = reference.as_ref().map(|r| r.name().map(|n| n.to_string()).ok_or("reference name is not valid UTF-8")).transpose()?;
+    if let Some(r) = reference.as_ref().filter(|r| r.is_remote()) {
+        // Remote-tracking branch: check out (creating if needed) a local branch tracking it.
+        let short = r.shorthand().ok_or("reference name is not valid UTF-8")?.to_string();
+        let local = short.split_once('/').map(|(_, l)| l.to_string()).ok_or_else(|| format!("unexpected remote branch name {short:?}"))?;
+        if repo.find_branch(&local, BranchType::Local).is_err() {
+            let commit = r.peel_to_commit().map_err(|e| e.message().to_string())?;
+            let mut b = repo.branch(&local, &commit, false).map_err(|e| e.message().to_string())?;
+            b.set_upstream(Some(&short)).map_err(|e| e.message().to_string())?;
+        }
+        let lref = format!("refs/heads/{local}");
+        obj = repo.revparse_single(&lref).map_err(|e| e.message().to_string())?;
+        head_ref = Some(lref);
+    }
     repo.checkout_tree(&obj, Some(git2::build::CheckoutBuilder::new().safe())).map_err(|e| e.message().to_string())?;
-    match reference {
-        Some(r) => repo.set_head(r.name().unwrap()).map_err(|e| e.message().to_string()),
+    match head_ref {
+        Some(r) => repo.set_head(&r).map_err(|e| e.message().to_string()),
         None => repo.set_head_detached(obj.id()).map_err(|e| e.message().to_string()),
     }
 }
@@ -514,7 +545,14 @@ async fn run_git(cwd: &str, args: &[&str]) -> Result<CmdResult, String> {
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0") // never hang on a password prompt
         .env("GIT_EDITOR", "true") // merge/rebase --continue must not open an editor
-        .env("GIT_SSH_COMMAND", std::env::var("GIT_SSH_COMMAND").map(|v| format!("{v} -o BatchMode=yes")).unwrap_or_else(|_| "ssh -o BatchMode=yes".into()));
+        .kill_on_drop(true); // on timeout, don't leave git/ssh running with index.lock held
+    // Fail instead of prompting for an ssh passphrase, unless the user configured their own ssh command.
+    let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || open(cwd).ok().and_then(|r| r.config().ok()).is_some_and(|c| c.get_string("core.sshCommand").is_ok());
+    if !user_ssh {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
     kernel_client::platform::quiet(&mut cmd);
     let out = tokio::time::timeout(std::time::Duration::from_secs(300), cmd.output())
     .await
@@ -545,13 +583,24 @@ pub async fn git_push(cwd: String, set_upstream: Option<String>, force: bool) ->
     if force {
         args.push("--force-with-lease");
     }
-    let branch;
+    let (branch, remote);
     if let Some(b) = set_upstream {
         if b.starts_with('-') || b.contains(char::is_whitespace) || b.is_empty() {
             return Err(format!("invalid branch name {b:?}"));
         }
+        remote = {
+            let repo = open(&cwd)?;
+            let configured = repo.config().ok().and_then(|c| c.get_string(&format!("branch.{b}.remote")).ok()).filter(|r| !r.is_empty() && r != ".");
+            let names: Vec<String> = repo.remotes().map_err(|e| e.message().to_string())?.iter().flatten().map(|s| s.to_string()).collect();
+            match configured {
+                Some(r) => r,
+                None if names.iter().any(|n| n == "origin") => "origin".to_string(),
+                None if names.len() == 1 => names[0].clone(),
+                None => return Err("no remote to publish to (configure branch.<name>.remote or add 'origin')".into()),
+            }
+        };
         branch = b;
-        args.extend(["-u", "origin", branch.as_str()]);
+        args.extend(["-u", remote.as_str(), branch.as_str()]);
     }
     run_git(&cwd, &args).await
 }
@@ -570,4 +619,41 @@ pub fn git_remotes(cwd: String) -> Result<Vec<Remote>, String> {
 pub fn git_add_remote(cwd: String, name: String, url: String) -> Result<(), String> {
     let repo = open(&cwd)?;
     repo.remote(&name, &url).map(|_| ()).map_err(|e| e.message().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_commit_amend_checkout() {
+        let dir = std::env::temp_dir().join(format!("pide-gitcheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let repo = Repository::init(&cwd).unwrap();
+        repo.config().unwrap().set_str("user.name", "t").unwrap();
+        repo.config().unwrap().set_str("user.email", "t@e").unwrap();
+        std::fs::write(dir.join("a.py"), "print(1)\n").unwrap();
+        git_stage(cwd.clone(), vec![dir.join("a.py").to_string_lossy().to_string()]).unwrap();
+        git_commit(cwd.clone(), "first".into(), false).unwrap();
+        assert!(git_commit(cwd.clone(), "empty".into(), false).is_err());
+        // rename shows the new path with old_path
+        std::fs::rename(dir.join("a.py"), dir.join("b.py")).unwrap();
+        git_stage(cwd.clone(), vec!["a.py".into(), "b.py".into()]).unwrap();
+        let st = git_status(cwd.clone()).unwrap();
+        let e = st.entries.iter().find(|e| e.area == "staged").unwrap();
+        assert_eq!((e.path.as_str(), e.old_path.as_deref(), e.code.as_str()), ("b.py", Some("a.py"), "R"));
+        // amend with empty message keeps it
+        let id = git_commit(cwd.clone(), "  ".into(), true).unwrap();
+        let c = repo.find_commit(Oid::from_str(&id).unwrap()).unwrap();
+        assert_eq!(c.message(), Some("first"));
+        // remote-tracking checkout creates a local branch
+        repo.remote("origin", "/nonexistent").unwrap();
+        repo.reference("refs/remotes/origin/feat", c.id(), false, "t").unwrap();
+        git_checkout(cwd.clone(), "origin/feat".into()).unwrap();
+        assert_eq!(repo.head().unwrap().name(), Some("refs/heads/feat"));
+        assert!(!repo.head_detached().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

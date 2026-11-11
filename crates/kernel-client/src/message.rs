@@ -85,11 +85,8 @@ impl Message {
             let expected = signer.sign([header, parent, metadata, content]);
             let a = expected.as_bytes();
             let b: &[u8] = sig.as_ref();
-            let mut diff = (a.len() ^ b.len()) as u8;
-            for i in 0..a.len().min(b.len()) {
-                diff |= a[i] ^ b[i];
-            }
-            if diff != 0 {
+            // The length of a hex HMAC is public; only the contents need a constant-time compare.
+            if a.len() != b.len() || a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) != 0 {
                 bail!("bad HMAC signature");
             }
         }

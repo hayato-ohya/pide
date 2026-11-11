@@ -12,6 +12,7 @@ subject to a per-snapshot time budget.
 """
 from __future__ import annotations
 
+import array
 import collections
 import inspect
 import itertools
@@ -22,6 +23,7 @@ import reprlib
 import sys
 import time
 import types
+import zlib
 
 MIME = "application/x-pide+json"
 
@@ -33,6 +35,7 @@ IPY_NAMES = {"In", "Out", "get_ipython", "exit", "quit", "open"}
 _STATS_MAX = 10_000_000
 _STATS_SAMPLE = 1_000_000
 _STATS_CACHE_MAX = 256
+_STATS_NOCACHE_MAX = 1_000_000  # up to this many elements stats are recomputed every time
 _STATS_BUDGET_S = 0.2  # per snapshot() call
 _DEVICE_STATS_MAX = 1_000_000  # non-CPU tensors / jax arrays above this get no stats
 _CELL_STR_MAX = 1000
@@ -213,6 +216,22 @@ def _finite(x):
     return f
 
 
+def _int_stat(v):
+    """int for JSON; beyond +-2**53 a string, so that JS does not round it."""
+    v = int(v)
+    return v if abs(v) < 2**53 else str(v)
+
+
+def _py_scalar(v):
+    """numpy scalar -> plain Python value (longdouble / clongdouble .item() stays numpy)."""
+    npg = _classes("numpy", ("generic",))
+    v = v.item()
+    if npg and isinstance(v, npg):
+        kind = getattr(v, "dtype", None) and v.dtype.kind
+        v = float(v) if kind == "f" else complex(v) if kind == "c" else str(v)
+    return v
+
+
 def _nbytes(obj):
     if _is_numpy(obj):
         return int(obj.nbytes)
@@ -282,6 +301,14 @@ class _Repr(reprlib.Repr):
 
     def repr1(self, x, level):
         t = type(x)
+        if isinstance(x, collections.UserList):
+            return self.repr_list(x.data, level)
+        if isinstance(x, collections.UserDict):
+            return self.repr_dict(x.data, level)
+        if isinstance(x, types.MappingProxyType):
+            return self.repr_dict(x, level)
+        if isinstance(x, _DICT_VIEWS):
+            return self._items(x, level, self.maxlist, f"{t.__name__}([", "])")
         if t not in self._BASES and isinstance(x, self._BASES) and _safe(lambda: len(x), 0) > 200:
             # a big subclass (OrderedDict, defaultdict, ...): never call its own __repr__
             for base, meth in ((dict, self.repr_dict), (list, self.repr_list), (tuple, self.repr_tuple),
@@ -291,15 +318,21 @@ class _Repr(reprlib.Repr):
         return super().repr1(x, level)
 
 
+_DICT_VIEWS = (type({}.keys()), type({}.values()), type({}.items()))
 _REPR = _Repr()
-_CONTAINERS = (list, tuple, set, frozenset, dict, collections.deque)
+_CONTAINERS = (list, tuple, set, frozenset, dict, collections.deque, array.array, collections.UserList,
+               collections.UserDict, types.MappingProxyType) + _DICT_VIEWS
+_SLOW_REPR_S = 0.05
+_SLOW_REPR: set = set()  # types whose __repr__ was slow: shown as <qualname> from then on
+_BYTES_LIKE = (bytes, bytearray, memoryview)
 
 
 def _short_repr(obj, n=120):
     """A repr of at most ``n`` characters that never materializes a huge string."""
     try:
-        if isinstance(obj, (str, bytes)):
-            s = repr(obj[:n])
+        if isinstance(obj, (str, bytes, bytearray, memoryview)):
+            head = obj[:n]
+            s = repr(bytes(head) if isinstance(obj, memoryview) else head)
             if len(obj) > n:
                 s += "…"
         elif isinstance(obj, _CONTAINERS):
@@ -309,7 +342,17 @@ def _short_repr(obj, n=120):
             else:
                 s = _REPR.repr(obj)
         else:
-            s = repr(obj)
+            t = type(obj)
+            ln = _safe(lambda: len(obj)) if hasattr(t, "__len__") else None
+            if t in _SLOW_REPR:
+                s = f"<{t.__qualname__}>"
+            elif isinstance(ln, int) and ln > 10_000:
+                s = f"<{t.__qualname__} of {ln} items>"
+            else:
+                t0 = time.perf_counter()
+                s = repr(obj)
+                if time.perf_counter() - t0 > _SLOW_REPR_S:
+                    _SLOW_REPR.add(t)
     except Exception as e:  # noqa: BLE001
         s = f"<repr failed: {e!r}>"
     if len(s) > n:
@@ -319,7 +362,7 @@ def _short_repr(obj, n=120):
 
 def _full_repr(obj, n):
     """repr for detail(): full for ordinary objects, bounded for big containers."""
-    if isinstance(obj, _CONTAINERS):
+    if isinstance(obj, _CONTAINERS) or isinstance(obj, (str, bytes, bytearray, memoryview)):
         return _short_repr(obj, n)
     try:
         s = repr(obj)
@@ -370,12 +413,16 @@ def _memmap_backed(np, arr):
 
 
 def _fingerprint(arr, size):
-    """Bytes of ~32 strided elements: catches in-place edits that keep id/ptr/shape."""
+    """Cheap change detector for big contiguous arrays (approximate: an in-place edit that
+    touches only unsampled elements is missed): 4096 strided elements plus a checksum over a
+    denser strided subset.  None = do not cache."""
     try:
         if not (arr.flags.c_contiguous or arr.flags.f_contiguous):
             return None
         flat = arr.ravel(order="K")
-        return flat[:: max(1, size // 32)].tobytes()
+        head = flat[:: max(1, size // 4096)]
+        dense = flat[:: max(1, size // 262_144)]
+        return head.tobytes(), zlib.adler32(dense.tobytes())
     except Exception:  # noqa: BLE001
         return None
 
@@ -391,7 +438,7 @@ def _np_stats_inner(np, a, kind, k):
         n = int(a.size)
         return {"min": 0 if true < n else 1, "max": 1 if true else 0, "mean": true / n, "true": true * k, "nan": 0}
     if kind in "iu":
-        return {"min": int(a.min()), "max": int(a.max()), "mean": _finite(a.mean(dtype="float64")), "nan": 0}
+        return {"min": _int_stat(a.min()), "max": _int_stat(a.max()), "mean": _finite(a.mean(dtype="float64")), "nan": 0}
     nan = int(np.count_nonzero(np.isnan(a)))
     if nan >= a.size:
         return {"min": None, "max": None, "mean": None, "nan": nan * k}
@@ -419,27 +466,34 @@ def _array_stats(arr, owner=None):
             return None
         if _memmap_backed(np, arr):
             return None
-        try:
-            ptr = arr.__array_interface__["data"][0]
-        except Exception:  # noqa: BLE001
-            ptr = None
-        key = ("np", id(owner if owner is not None else arr), ptr, tuple(arr.shape), arr.dtype.str,
-               _fingerprint(arr, size))
-        hit = _cache_get(key)
-        if hit is not None:
-            return hit
+        key = None
+        if size > _STATS_NOCACHE_MAX:
+            fp = _fingerprint(arr, size)
+            if fp is not None:
+                try:
+                    ptr = arr.__array_interface__["data"][0]
+                except Exception:  # noqa: BLE001
+                    ptr = None
+                key = ("np", id(owner if owner is not None else arr), ptr, tuple(arr.shape), arr.dtype.str, fp)
+                hit = _cache_get(key)
+                if hit is not None:
+                    return hit
         if not _budget_ok():
             return None
         a, k = arr, 1
         if size > _STATS_MAX:
-            if not (arr.flags.c_contiguous or arr.flags.f_contiguous):
-                return None
-            k = -(-size // _STATS_SAMPLE)  # ceil
-            a = arr.ravel(order="K")[::k]
+            if arr.flags.c_contiguous or arr.flags.f_contiguous:
+                k = -(-size // _STATS_SAMPLE)  # ceil
+                a = arr.ravel(order="K")[::k]
+            else:  # strided view over every axis: still no copy
+                s = int(math.ceil((size / _STATS_SAMPLE) ** (1.0 / arr.ndim)))
+                a = arr[(slice(None, None, s),) * arr.ndim]
+                k = max(1, int(round(size / max(1, a.size))))
         res = _np_stats(np, a, arr.dtype.kind, size, k)
         if k > 1:
             res["approx"] = True
-        _cache_put(key, res)
+        if key is not None:
+            _cache_put(key, res)
         return res
     except Exception:  # noqa: BLE001
         return None
@@ -471,9 +525,9 @@ def _torch_reduce(torch, d):
                                   torch.nan_to_num(d, nan=-math.inf).max().to(acc)]).tolist()
         return {"min": _finite(mn), "max": _finite(mx), "mean": _finite(mean), "nan": nan}
     mn, mx = torch.aminmax(d)
-    s = d.sum(dtype=acc)
-    mn, mx, s = torch.stack([mn.to(acc), mx.to(acc), s]).tolist()
-    return {"min": int(mn), "max": int(mx), "mean": _finite(s / n), "nan": 0}
+    mn, mx = torch.stack([mn, mx]).tolist()  # native integer dtype: exact
+    s = d.sum(dtype=acc).item()
+    return {"min": _int_stat(mn), "max": _int_stat(mx), "mean": _finite(s / n), "nan": 0}
 
 
 def _tensor_stats(t):
@@ -565,7 +619,7 @@ def _jax_stats(obj):
         elif kind == "b":
             res = {"min": int(vals[0]), "max": int(vals[1]), "mean": _finite(vals[2]), "true": int(vals[3]), "nan": 0}
         else:
-            res = {"min": int(vals[0]), "max": int(vals[1]), "mean": _finite(vals[2]), "nan": 0}
+            res = {"min": _int_stat(vals[0]), "max": _int_stat(vals[1]), "mean": _finite(vals[2]), "nan": 0}
         _cache_put(key, res)
         return res
     except Exception:  # noqa: BLE001
@@ -585,8 +639,14 @@ def _pandas_series_stats(s):
         if getattr(dt, "kind", "O") in "biuf":  # nullable / arrow-backed numeric
             if not _budget_ok():
                 return None
-            a = s.to_numpy(dtype="float64", na_value=np.nan)
-            return _np_stats(np, a, "f") if a.size else None
+            k = -(-len(s) // _STATS_SAMPLE) if len(s) > _STATS_NOCACHE_MAX else 1
+            a = (s.iloc[::k] if k > 1 else s).to_numpy(dtype="float64", na_value=np.nan)
+            if not a.size:
+                return None
+            res = _np_stats(np, a, "f", None, k)
+            if k > 1:
+                res["approx"] = True
+            return res
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -599,8 +659,23 @@ def _polars_series_stats(s):
             return None
         if not _budget_ok():
             return None
-        return {"min": _finite(s.min()), "max": _finite(s.max()), "mean": _finite(s.mean()),
-                "nan": int(s.null_count())}
+        k = -(-len(s) // _STATS_SAMPLE) if len(s) > _STATS_NOCACHE_MAX else 1
+        if k > 1:
+            s = s.gather_every(k)
+        nan = 0
+        if dt.is_float():
+            nan = int(s.is_nan().sum() or 0)
+            if nan:
+                s = s.fill_nan(None)  # min/max/mean skip nulls, not NaN
+        res = {"min": _finite(s.min()), "max": _finite(s.max()), "mean": _finite(s.mean()), "nan": nan * k}
+        if dt.is_integer():
+            res["min"], res["max"] = (None if v is None else _int_stat(v) for v in (s.min(), s.max()))
+        nulls = int(s.null_count()) - nan
+        if nulls > 0:
+            res["null"] = nulls * k
+        if k > 1:
+            res["approx"] = True
+        return res
     except Exception:  # noqa: BLE001
         return None
 
@@ -640,7 +715,7 @@ def _kind(obj):
         return "function"
     if isinstance(obj, dict):
         return "dict"
-    if isinstance(obj, (list, tuple, set, frozenset)):
+    if isinstance(obj, (list, tuple, set, frozenset, collections.deque)):
         return "sequence"
     if isinstance(obj, (str, bytes)):
         return "text"
@@ -710,13 +785,13 @@ def summarize(name, obj):
     elif kind == "scalar":
         if _is_numpy_scalar(obj):
             info["dtype"] = str(obj.dtype)
-            plain = str(obj) if obj.dtype.kind in "MmSUOV" else _safe(lambda: obj.item(), obj)
+            plain = str(obj) if obj.dtype.kind in "MmSUOV" else _safe(lambda: _py_scalar(obj), obj)
             info["value"] = plain if isinstance(plain, str) else _short_repr(plain)
         else:
             info["value"] = _short_repr(obj)
     else:
         qn = type(obj).__qualname__
-        if type(obj).__repr__ is object.__repr__:
+        if type(obj).__repr__ is object.__repr__ or type(obj) in _SLOW_REPR:
             info["value"] = f"<{qn}>"
         else:
             info["value"] = f"{qn} · {_short_repr(obj, 80)}"
@@ -876,7 +951,7 @@ def _to_cell(v):
         kind = v.dtype.kind
         if kind in "Mm":
             return str(v)
-        v = v.item()
+        v = _py_scalar(v)
         if v is None:
             return None
     import datetime as _dt
@@ -907,33 +982,54 @@ def _window_np(obj, kind, idx):
         t = obj.detach()
         if t.layout != torch.strided:
             t = t.to_dense()
-        t = t[idx]
+        t = t[idx].resolve_conj().resolve_neg()
         if t.dtype == torch.bfloat16:
             t = t.float()
         return t.cpu().numpy()
     if kind == "xarray":
         return np.asarray(obj[idx].values)
+    if np.ma.isMaskedArray(obj):
+        return obj[idx]  # keep the mask: masked cells are shown as None
     return np.asarray(obj[idx])
+
+
+def _masked(win):
+    """(data, mask-or-None) of a window that may be a masked array."""
+    import numpy as np
+    if np.ma.isMaskedArray(win):
+        m = np.ma.getmaskarray(win)
+        return np.ma.getdata(win), (m if m.any() else None)
+    return win, None
 
 
 def _cells_1d(win):
     import numpy as np
+    win, mask = _masked(win)
     k = win.dtype.kind
     if k == "M":
-        return [[s] for s in np.datetime_as_string(win).tolist()]
-    if k == "m":
-        return [[s] for s in win.astype(str).tolist()]
-    return [[_to_cell(x)] for x in win.tolist()]
+        cells = [[s] for s in np.datetime_as_string(win).tolist()]
+    elif k == "m":
+        cells = [[s] for s in win.astype(str).tolist()]
+    else:
+        cells = [[_to_cell(x)] for x in win.tolist()]
+    if mask is not None:
+        cells = [[None] if m else c for c, m in zip(cells, mask.tolist())]
+    return cells
 
 
 def _cells_2d(win):
     import numpy as np
+    win, mask = _masked(win)
     k = win.dtype.kind
     if k == "M":
-        return np.datetime_as_string(win).tolist()
-    if k == "m":
-        return win.astype(str).tolist()
-    return [[_to_cell(x) for x in r] for r in win.tolist()]
+        cells = np.datetime_as_string(win).tolist()
+    elif k == "m":
+        cells = win.astype(str).tolist()
+    else:
+        cells = [[_to_cell(x) for x in r] for r in win.tolist()]
+    if mask is not None:
+        cells = [[None if m else c for c, m in zip(r, mr)] for r, mr in zip(cells, mask.tolist())]
+    return cells
 
 
 def _property_stub(name):
@@ -953,7 +1049,7 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
 
     if kind == "image":
         import numpy as np
-        obj = np.asarray(obj)
+        obj = _pil_array(obj)
         kind = res["kind"] = "ndarray"
 
     if kind == "model":
@@ -982,8 +1078,9 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
         ndim = len(shape)
         try:
             if ndim == 0:
-                win = _window_np(obj, kind, ())
-                res["rows"] = [[_to_cell(win.item())]] if win.dtype.kind not in "Mm" else [[str(win)]]
+                win, mask = _masked(_window_np(obj, kind, ()))
+                res["rows"] = ([[None]] if mask is not None else [[_to_cell(win.item())]] if win.dtype.kind not in "Mm"
+                               else [[str(win)]])
                 res["nrows"], res["ncols"] = 1, 1
             elif ndim == 1:
                 res["nrows"], res["ncols"] = shape[0], 1
@@ -1066,7 +1163,7 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
             res["rows"] = [[_to_cell(v)] for v in items]
             res["note"] = "set iteration order is not stable; elements cannot be addressed by index"
         else:
-            items = obj[row0:row1]
+            items = list(itertools.islice(obj, row0, row1)) if isinstance(obj, collections.deque) else obj[row0:row1]
             res["rows"] = [[_to_cell(v)] for v in items]
             res["children"] = [summarize(f"[{i}]", v) for i, v in enumerate(items, start=row0)]
         res["row0"] = row0
@@ -1077,10 +1174,10 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
         res["nrows"], res["ncols"] = len(names), 4
         res["columns"] = ["variable", "shape", "dtype", "dims"]
         rows, children = [], []
-        for name in names[row0:row1]:
+        for i, name in enumerate(names[row0:row1]):
             v = obj[name]
             rows.append([str(name), str(tuple(int(s) for s in v.shape)), str(v.dtype), str(tuple(str(d) for d in v.dims))])
-            children.append(summarize(_key_name(str(name), 0), v))
+            children.append(summarize(_key_name(name, row0 + i), v))
         res["rows"], res["children"] = rows, children
         res["repr"] = _full_repr(obj, 4000)
         res["row0"] = row0
@@ -1144,14 +1241,29 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
 # plots
 # ----------------------------------------------------------------------------
 
+def _pil_array(img):
+    """PIL image -> numpy, with palette / CMYK / YCbCr / ... modes converted to displayable RGB(A)."""
+    import numpy as np
+    mode = img.mode
+    if mode in ("P", "PA"):
+        img = img.convert("RGBA" if mode == "PA" or "transparency" in img.info else "RGB")
+    elif mode in ("CMYK", "YCbCr", "HSV", "LAB", "RGBX"):
+        img = img.convert("RGB")
+    elif mode in ("LA", "La", "RGBa"):
+        img = img.convert("RGBA")
+    return np.asarray(img)
+
+
 def _as_numpy(obj):
     import numpy as np
     kind = _kind(obj)
     if kind == "tensor":
-        t = obj.detach()
+        t = obj.detach().resolve_conj().resolve_neg()
         if str(t.dtype) == "torch.bfloat16":
             t = t.float()
         return t.cpu().numpy()
+    if kind == "image":
+        return _pil_array(obj)
     if kind in ("dataframe", "series", "polars"):
         return obj.to_numpy()
     if kind == "xarray":
@@ -1194,14 +1306,14 @@ def _plot_payload(label, obj, max_points, heat_max=1000):
         arr = _dt_to_ms(np, arr)
     elif arr.dtype.kind not in "biuf":
         try:
-            arr = arr.astype("float64")
+            arr = np.real(arr).astype("float64") if arr.dtype.kind == "c" else arr.astype("float64")
         except Exception:  # noqa: BLE001
             res["error"] = f"cannot plot dtype {arr.dtype}"
             return _Payload(res)
     if arr.ndim == 0:
         arr = arr.reshape(1)
     if arr.ndim == 1:
-        step = max(1, arr.shape[0] // max_points)
+        step = max(1, -(-arr.shape[0] // max_points))
         res["y"] = _nums(np, arr[::step])
         res["step"] = step
         if x is not None and x.shape[0] == arr.shape[0]:
@@ -1209,7 +1321,7 @@ def _plot_payload(label, obj, max_points, heat_max=1000):
     elif arr.ndim == 2:
         rows, ncols = arr.shape
         if ncols <= 64:  # tall-and-narrow: columns are series, sample rows
-            step = max(1, rows // max_points)
+            step = max(1, -(-rows // max_points))
             arr = arr[::step]
             res["step"] = step
             if x is not None and x.shape[0] == rows:
@@ -1219,6 +1331,9 @@ def _plot_payload(label, obj, max_points, heat_max=1000):
             s1 = -(-ncols // heat_max) if ncols > heat_max else 1
             arr = arr[::s0, ::s1]
             res["step"] = s0
+            res["step1"] = s1
+            if cols:
+                cols = cols[::s1]
         f = arr.astype("float64", copy=False)
         res["z"] = np.where(np.isfinite(f), f, None).astype(object).tolist()
         if cols:
@@ -1247,10 +1362,14 @@ def _guess_layout(shape):
         return None, 0
     if n == 2:
         return "HW", 0
-    # last axis is 1/3/4 -> HWC ; third-from-last is 1/3/4 -> CHW
+    # last axis is 1/3/4 -> HWC ; third-from-last 3 (or 1/4 with real H,W) -> CHW ;
+    # otherwise a stack of gray images.  (4, H, W) is ambiguous (RGBA vs batch): HW stack.
     if shape[-1] in (1, 3, 4):
         return "HWC", n - 3
-    if shape[-3] in (1, 3, 4):
+    c = shape[-3]
+    if c == 3:
+        return "CHW", n - 3
+    if min(shape[-2:]) >= 8 and (c == 1 or (c == 4 and n > 3)):
         return "CHW", n - 3
     return "HW", n - 2
 
@@ -1265,11 +1384,17 @@ def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_00
     import numpy as np
 
     try:
-        arr = _as_numpy(_resolve(path))
+        arr = _resolve(path)
+        kind = _kind(arr)
+        if kind == "image":
+            arr = _pil_array(arr)
+        elif kind in ("dataframe", "series", "polars") or not hasattr(arr, "shape"):
+            arr = _as_numpy(arr)
+        shape = [int(d) for d in arr.shape]  # slice the original object; convert only the slice
+        dtype = str(arr.dtype).replace("torch.", "")
     except Exception as e:  # noqa: BLE001
         return _Payload({"path": path, "error": repr(e)})
-    shape = list(arr.shape)
-    if arr.ndim < 2:
+    if len(shape) < 2:
         return _Payload({"path": path, "error": "need at least 2 dimensions"})
     if layout == "auto":
         lay, extra = _guess_layout(shape)
@@ -1285,22 +1410,26 @@ def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_00
         return _Payload({"path": path, "error": f"bad index {index!r}"})
     if len(idx) != extra or any(not (0 <= i < s) for i, s in zip(idx, shape)):
         return _Payload({"path": path, "error": f"index {list(idx)} out of range for leading dims {shape[:extra]}"})
-    view = arr[idx] if extra else arr
+    chans = shape[-1] if lay == "HWC" else shape[extra] if lay == "CHW" else 1
+    if lay in ("HWC", "CHW") and chans not in (1, 3, 4):
+        return _Payload({"path": path, "error": f"expected 1, 3 or 4 channels, got {chans}"})
+    h, w = (shape[-3], shape[-2]) if lay == "HWC" else shape[-2:]
+    step = int(np.ceil(np.sqrt(h * w / max_px))) if h * w > max_px else 1
+    try:
+        view = arr[idx] if extra else arr
+        if step > 1:
+            view = view[:, ::step, ::step] if lay == "CHW" else view[::step, ::step]
+        view = _as_numpy(view) if _kind(view) != "ndarray" else np.asarray(view)
+    except Exception as e:  # noqa: BLE001
+        return _Payload({"path": path, "error": repr(e)})
     if lay == "CHW":
         view = np.moveaxis(view, 0, -1)
     if lay in ("HWC", "CHW"):
-        if view.shape[-1] == 1:
+        if chans == 1:
             view = view[..., 0]
             lay = "HW"
-        elif view.shape[-1] == 4:
+        elif chans == 4:
             view = view[..., :3]
-        elif view.shape[-1] != 3:
-            return _Payload({"path": path, "error": f"expected 1, 3 or 4 channels, got {view.shape[-1]}"})
-    # downsample very large images
-    h, w = view.shape[0], view.shape[1]
-    step = int(np.ceil(np.sqrt(h * w / max_px))) if h * w > max_px else 1
-    if step > 1:
-        view = view[::step, ::step]
     view = np.asarray(view)
     if view.dtype == bool:
         view = view.astype(np.uint8)
@@ -1321,7 +1450,7 @@ def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_00
     out = {
         "path": path,
         "shape": shape,
-        "dtype": str(arr.dtype),
+        "dtype": dtype,
         "layout": lay,
         "extra": [int(s) for s in shape[:extra]],
         "index": list(idx),
@@ -1403,8 +1532,10 @@ def fs_read(path):
         size = os.path.getsize(p)
         if size > _FS_READ_MAX:
             return _Payload({"path": path, "error": f"file is {size:,} bytes; limit is {_FS_READ_MAX:,}"})
-        with open(p, encoding="utf-8", errors="replace") as f:
+        with open(p, encoding="utf-8", newline="") as f:  # newline="": keep CRLF as-is
             return _Payload({"path": path, "text": f.read()})
+    except UnicodeDecodeError:
+        return _Payload({"path": path, "error": "file is not UTF-8 encoded; refusing to open it (saving would corrupt it)"})
     except (OSError, ValueError) as e:
         return _Payload({"path": path, "error": str(e)})
 
@@ -1412,11 +1543,26 @@ def fs_read(path):
 def fs_write(path, b64):
     import base64
     try:
-        p = os.path.expanduser(path)
+        import tempfile
+        p = os.path.realpath(os.path.expanduser(path))  # write through symlinks
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         data = base64.b64decode(b64)
-        with open(p, "wb") as f:
-            f.write(data)
+        mode = os.stat(p).st_mode & 0o7777 if os.path.exists(p) else None
+        fd, tmp = tempfile.mkstemp(prefix=".pide-", dir=os.path.dirname(p) or ".")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            if mode is not None:
+                os.chmod(tmp, mode)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return _Payload({"path": path, "ok": True})
     except (OSError, ValueError) as e:  # binascii.Error is a ValueError
         return _Payload({"path": path, "error": str(e)})

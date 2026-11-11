@@ -1,4 +1,5 @@
 // Side-by-side view of a conflicted file: ours / theirs / base, with one-click resolution.
+import { reloadOpenFiles } from "../reload";
 import { useEffect, useState } from "react";
 import { DiffEditor } from "@monaco-editor/react";
 import { invoke } from "@tauri-apps/api/core";
@@ -40,6 +41,7 @@ export default function ConflictView(props: IDockviewPanelProps<{ path: string }
     }
     pushConsole({ kind: "info", text: `Resolved ${path} (${side})` });
     await refreshGit();
+    reloadOpenFiles();
     props.api.close();
   };
 

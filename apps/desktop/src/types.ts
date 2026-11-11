@@ -16,7 +16,7 @@ export interface VarInfo {
   params?: number;
   len?: number;
   value: string;
-  stats?: { min?: number | string | null; max?: number | string | null; mean?: number | string | null; nan?: number; true?: number } | null;
+  stats?: { min?: number | string | null; max?: number | string | null; mean?: number | string | null; nan?: number; null?: number; true?: number } | null;
 }
 
 export interface DetailWindow {

@@ -28,21 +28,35 @@ class LspClient {
   private pending = new Map<number, { resolve: (v: Json) => void; reject: (e: Error) => void }>();
   private initialized: Promise<void> | null = null;
   capabilities: Json = {};
+  /** Backend session id from lsp_start; events from older sessions are ignored. */
+  gen: number | null = null;
+  private started: { cwd: string; python: string } | null = null;
+  private crashes: number[] = [];
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
   constructor(public name: ServerName, public cmd: string, public args: string[]) {}
 
   async start(cwd: string, python: string) {
     this.state = "starting";
+    this.started = { cwd, python };
     publishStatus();
-    await invoke("lsp_start", { name: this.name, cmd: this.cmd, args: this.args, cwd });
-    // A home directory or / as workspace makes pyright enumerate everything;
-    // in that case run without a workspace folder (open files still work).
-    const home = await invoke<string>("home_dir");
-    const useRoot = cwd !== "/" && cwd.replace(/\/$/, "") !== home.replace(/\/$/, "") && !get().remote && !get().connectionFile;
-    const rootUri = useRoot ? monacoRef!.Uri.file(cwd).toString() : null;
+    let root: string | null;
+    try {
+      this.gen = await invoke<number>("lsp_start", { name: this.name, cmd: this.cmd, args: this.args, cwd });
+      root = await workspaceRoot(cwd);
+    } catch (e) {
+      if ((this.state as LspClient["state"]) === "off") return; // disposed meanwhile
+      this.state = "failed";
+      publishStatus();
+      pushConsole({ kind: "info", text: `${this.name}: failed to start: ${e}` });
+      return;
+    }
+    const gen = this.gen;
+    const useRoot = root !== null;
+    const rootUri = useRoot ? monacoRef!.Uri.file(root!).toString() : null;
     this.initialized = this.request("initialize", {
       processId: null,
       rootUri,
-      workspaceFolders: useRoot ? [{ uri: rootUri, name: cwd.split("/").pop() }] : null,
+      workspaceFolders: useRoot ? [{ uri: rootUri, name: root!.split(/[\\/]/).pop() }] : null,
       initializationOptions: this.name === "ruff" ? { settings: { lint: { enable: true }, organizeImports: true } } : {},
       capabilities: {
         textDocument: {
@@ -58,7 +72,9 @@ class LspClient {
         workspace: { configuration: true, workspaceFolders: true, didChangeConfiguration: { dynamicRegistration: false } },
       },
     }).then((r) => {
+      if (this.gen !== gen) return; // this session already exited or was disposed
       this.capabilities = r?.capabilities ?? {};
+      if (this.name === "pyright") registerCompletion(monacoRef!, r?.capabilities?.completionProvider?.triggerCharacters);
       this.notify("initialized", {});
       if (this.name === "pyright") {
         this.notify("workspace/didChangeConfiguration", { settings: { python: { pythonPath: python, analysis: { typeCheckingMode: "standard", diagnosticMode: "openFilesOnly" } } } });
@@ -68,6 +84,7 @@ class LspClient {
       for (const d of docs.values()) this.notify("textDocument/didOpen", { textDocument: { uri: d.uri, languageId: d.languageId, version: d.version, text: d.text } });
       for (const nb of notebooks.values()) this.notify("notebookDocument/didOpen", notebookOpenParams(nb));
     }).catch((e) => {
+      if (this.gen !== gen) return; // exited (restart handles it) or disposed
       this.state = "failed";
       publishStatus();
       pushConsole({ kind: "info", text: `${this.name}: initialize failed: ${e}` });
@@ -75,17 +92,58 @@ class LspClient {
     return this.initialized;
   }
 
-  dispose() {
-    this.state = "off";
-    for (const [id, p] of this.pending) { this.pending.delete(id); p.reject(new Error(`${this.name} restarted`)); }
+  private rejectPending(why: string) {
+    for (const [id, p] of this.pending) { this.pending.delete(id); p.reject(new Error(why)); }
   }
 
-  request(method: string, params: Json, timeoutMs = 15000): Promise<Json> {
+  dispose() {
+    this.state = "off";
+    this.gen = null;
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
+    this.rejectPending(`${this.name} restarted`);
+    clearMarkers(this.name);
+  }
+
+  /** The server process died: fail its requests now, drop its markers, and restart with backoff. */
+  exited(detail: string) {
+    if (this.state === "off") return;
+    this.gen = null;
+    this.state = "failed";
+    this.rejectPending(`${this.name} exited`);
+    clearMarkers(this.name);
+    const now = Date.now();
+    this.crashes = this.crashes.filter((t) => now - t < 60_000);
+    this.crashes.push(now);
+    const n = this.crashes.length;
+    if (n > 3 || !this.started) {
+      pushConsole({ kind: "info", text: `${this.name} exited: ${detail} (gave up restarting)` });
+      publishStatus();
+      return;
+    }
+    pushConsole({ kind: "info", text: `${this.name} exited: ${detail}; restarting…` });
+    this.state = "starting";
+    publishStatus();
+    const { cwd, python } = this.started;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (clients.get(this.name) !== this || this.state !== "starting") return;
+      // Serialized with startLsp so a full restart and this one never interleave.
+      lspChain = lspChain.then(() => (clients.get(this.name) === this && this.state === "starting" ? this.start(cwd, python) : undefined)).catch(() => {});
+    }, 1000 * 2 ** (n - 1));
+  }
+
+  request(method: string, params: Json, timeoutMs = 15000, token?: Monaco.CancellationToken): Promise<Json> {
     flushPendingChanges();
     const id = this.nextId++;
     const p = new Promise<Json>((resolve, reject) => {
+      const cancel = (why: string) => {
+        if (!this.pending.delete(id)) return;
+        this.notify("$/cancelRequest", { id });
+        reject(new Error(why));
+      };
       this.pending.set(id, { resolve, reject });
-      setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`${this.name} ${method} timed out`)); }, timeoutMs);
+      setTimeout(() => cancel(`${this.name} ${method} timed out`), timeoutMs);
+      token?.onCancellationRequested(() => cancel(`${this.name} ${method} cancelled`));
     });
     invoke("lsp_send", { name: this.name, msg: { jsonrpc: "2.0", id, method, params } }).catch((e) => {
       const q = this.pending.get(id);
@@ -148,11 +206,13 @@ export async function initLsp(monaco: typeof Monaco) {
   monacoRef = monaco;
   if (listening) return;
   listening = true;
-  await listen<{ server: ServerName; msg: Json }>("lsp-message", (e) => clients.get(e.payload.server)?.handle(e.payload.msg));
-  await listen<{ server: ServerName; detail: string }>("lsp-exit", (e) => {
+  await listen<{ server: ServerName; gen: number; msg: Json }>("lsp-message", (e) => {
     const c = clients.get(e.payload.server);
-    if (c) { c.state = "failed"; publishStatus(); }
-    pushConsole({ kind: "info", text: `${e.payload.server} exited: ${e.payload.detail}` });
+    if (c && c.gen === e.payload.gen) c.handle(e.payload.msg);
+  });
+  await listen<{ server: ServerName; gen: number; detail: string }>("lsp-exit", (e) => {
+    const c = clients.get(e.payload.server);
+    if (c && c.gen === e.payload.gen) c.exited(e.payload.detail);
   });
   setInterval(() => invoke("lsp_check").catch(() => {}), 5000);
   registerProviders(monaco);
@@ -166,10 +226,27 @@ export function startLsp(): Promise<void> {
   return next;
 }
 
+/** A home directory or / as workspace makes pyright enumerate everything;
+ * in that case run without a workspace folder (open files still work). */
+async function workspaceRoot(cwd: string): Promise<string | null> {
+  const home = await invoke<string>("home_dir");
+  const strip = (p: string) => p.replace(/[\\/]$/, "");
+  return cwd !== "/" && strip(cwd) !== strip(home) && !get().remote && !get().connectionFile ? cwd : null;
+}
+
+/** Interpreter + workspace root the running servers were started with. */
+let lspKey = "";
 async function startLspInner() {
   const python = get().python ?? "python3";
   const cwd = get().cwd ?? "/";
   const det = await invoke<{ pyright: string | null; ruff: string | null }>("detect_lsp", { python });
+  const t0 = toolSettings();
+  const wantRuff = (t0.linter === "ruff" || t0.formatter === "ruff") && !!det.ruff;
+  const key = JSON.stringify([python, await workspaceRoot(cwd).catch(() => null)]);
+  // A kernel restart alone must not throw away pyright's index: restart only when the
+  // interpreter, the workspace root or the set of servers changed (or one gave up).
+  if (key === lspKey && clients.has("pyright") === !!det.pyright && clients.has("ruff") === wantRuff && [...clients.values()].every((c) => c.state === "running" || c.state === "starting")) return;
+  lspKey = key;
   for (const c of clients.values()) { c.dispose(); await invoke("lsp_stop", { name: c.name }).catch(() => {}); }
   clients.clear();
   const missing: string[] = [];
@@ -293,6 +370,13 @@ export async function formatDocument(uri: string, text: string): Promise<string 
 
 // ------------------------------------------------------------ diagnostics --
 
+/** Remove every marker a server put on any model (it stopped or crashed). */
+function clearMarkers(owner: string) {
+  const monaco = monacoRef;
+  if (!monaco) return;
+  for (const m of monaco.editor.getModels()) monaco.editor.setModelMarkers(m, owner, []);
+}
+
 function setDiagnostics(owner: string, uri: string, diags: Json[]) {
   const monaco = monacoRef;
   if (!monaco) return;
@@ -330,16 +414,25 @@ function markdown(c: Json): Monaco.IMarkdownString[] {
 }
 const KIND_NAMES = ["", "Text", "Method", "Function", "Constructor", "Field", "Variable", "Class", "Interface", "Module", "Property", "Unit", "Value", "Enum", "Keyword", "Snippet", "Color", "File", "Reference", "Folder", "EnumMember", "Constant", "Struct", "Event", "Operator", "TypeParameter"];
 
-function registerProviders(monaco: typeof Monaco) {
-  const py = () => { const c = clients.get("pyright"); return c && c.state === "running" ? c : null; };
-  const ruff = () => { const c = clients.get("ruff"); return c && c.state === "running" ? c : null; };
+const editsOf = (monaco: typeof Monaco, edits: Json[] | undefined) => (edits ?? []).map((e) => ({ range: toRange(monaco, e.range), text: e.newText }));
 
-  monaco.languages.registerCompletionItemProvider("python", {
-    triggerCharacters: [".", "[", "\"", "'"],
-    async provideCompletionItems(model, position) {
+/** (Re)register the completion provider; trigger characters come from the server once it is initialized. */
+let completionReg: Monaco.IDisposable | null = null;
+let completionChars = "";
+function registerCompletion(monaco: typeof Monaco, serverChars?: string[]) {
+  const chars = serverChars ?? ["."];
+  if (completionReg && chars.join("") === completionChars) return;
+  completionReg?.dispose();
+  completionChars = chars.join("");
+  const py = () => { const c = clients.get("pyright"); return c && c.state === "running" ? c : null; };
+  completionReg = monaco.languages.registerCompletionItemProvider("python", {
+    triggerCharacters: chars,
+    async provideCompletionItems(model, position, context, token) {
       const c = py();
       if (!c) return { suggestions: [] };
-      const r = await c.request("textDocument/completion", { textDocument: { uri: model.uri.toString() }, position: pos(position) }).catch(() => null);
+      const triggerKind = context.triggerKind + 1; // Monaco 0-based -> LSP 1-based (Invoked / TriggerCharacter / Incomplete)
+      const ctx = triggerKind === 2 ? { triggerKind, triggerCharacter: context.triggerCharacter } : { triggerKind };
+      const r = await c.request("textDocument/completion", { textDocument: { uri: model.uri.toString() }, position: pos(position), context: ctx }, 15000, token).catch(() => null);
       const items: Json[] = Array.isArray(r) ? r : r?.items ?? [];
       const word = model.getWordUntilPosition(position);
       const defRange: Monaco.IRange = { startLineNumber: position.lineNumber, endLineNumber: position.lineNumber, startColumn: word.startColumn, endColumn: word.endColumn };
@@ -355,27 +448,36 @@ function registerProviders(monaco: typeof Monaco) {
           range: it.textEdit?.range ? toRange(monaco, it.textEdit.range) : defRange,
           sortText: it.sortText,
           filterText: it.filterText,
+          additionalTextEdits: it.additionalTextEdits ? editsOf(monaco, it.additionalTextEdits) : undefined,
           // keep the raw item for resolve
           _lsp: it,
         } as Monaco.languages.CompletionItem)),
       };
     },
-    async resolveCompletionItem(item) {
+    async resolveCompletionItem(item, token) {
       const c = py();
       const raw = (item as any)._lsp;
       if (!c || !raw) return item;
-      const r = await c.request("completionItem/resolve", raw).catch(() => null);
+      const r = await c.request("completionItem/resolve", raw, 15000, token).catch(() => null);
       if (r?.documentation) item.documentation = markdown(r.documentation)[0];
       if (r?.detail) item.detail = r.detail;
+      if (r?.additionalTextEdits) item.additionalTextEdits = editsOf(monaco, r.additionalTextEdits);
       return item;
     },
   });
+}
+
+function registerProviders(monaco: typeof Monaco) {
+  const py = () => { const c = clients.get("pyright"); return c && c.state === "running" ? c : null; };
+  const ruff = () => { const c = clients.get("ruff"); return c && c.state === "running" ? c : null; };
+
+  registerCompletion(monaco);
 
   monaco.languages.registerHoverProvider("python", {
-    async provideHover(model, position) {
+    async provideHover(model, position, token) {
       const c = py();
       if (!c) return null;
-      const r = await c.request("textDocument/hover", { textDocument: { uri: model.uri.toString() }, position: pos(position) }).catch(() => null);
+      const r = await c.request("textDocument/hover", { textDocument: { uri: model.uri.toString() }, position: pos(position) }, 15000, token).catch(() => null);
       if (!r?.contents) return null;
       return { contents: markdown(r.contents), range: r.range ? toRange(monaco, r.range) : undefined };
     },
@@ -384,10 +486,10 @@ function registerProviders(monaco: typeof Monaco) {
   monaco.languages.registerSignatureHelpProvider("python", {
     signatureHelpTriggerCharacters: ["(", ","],
     signatureHelpRetriggerCharacters: [")"],
-    async provideSignatureHelp(model, position) {
+    async provideSignatureHelp(model, position, token) {
       const c = py();
       if (!c) return null;
-      const r = await c.request("textDocument/signatureHelp", { textDocument: { uri: model.uri.toString() }, position: pos(position) }).catch(() => null);
+      const r = await c.request("textDocument/signatureHelp", { textDocument: { uri: model.uri.toString() }, position: pos(position) }, 15000, token).catch(() => null);
       if (!r?.signatures?.length) return null;
       return {
         dispose() {},
@@ -406,10 +508,10 @@ function registerProviders(monaco: typeof Monaco) {
   });
 
   monaco.languages.registerDefinitionProvider("python", {
-    async provideDefinition(model, position) {
+    async provideDefinition(model, position, token) {
       const c = py();
       if (!c) return null;
-      const r = await c.request("textDocument/definition", { textDocument: { uri: model.uri.toString() }, position: pos(position) }).catch(() => null);
+      const r = await c.request("textDocument/definition", { textDocument: { uri: model.uri.toString() }, position: pos(position) }, 15000, token).catch(() => null);
       if (!r) return null;
       const locs: Json[] = Array.isArray(r) ? r : [r];
       return locs.map((l) => ({ uri: monaco.Uri.parse(l.targetUri ?? l.uri), range: toRange(monaco, l.targetSelectionRange ?? l.targetRange ?? l.range) }));
@@ -436,7 +538,7 @@ function registerProviders(monaco: typeof Monaco) {
     openCodeEditor(_source, resource, selectionOrPosition) {
       if (resource.scheme !== "file") return false;
       const line = selectionOrPosition && "lineNumber" in selectionOrPosition ? selectionOrPosition.lineNumber : (selectionOrPosition as Monaco.IRange | undefined)?.startLineNumber;
-      import("./layout").then((l) => l.openFile(resource.path, line));
+      import("./layout").then((l) => l.openFile(resource.fsPath, line));
       return true;
     },
   });

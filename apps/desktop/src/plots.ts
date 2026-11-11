@@ -5,16 +5,20 @@ import { dockApi } from "./layout";
 
 export type PlotKind = "line" | "scatter" | "bar" | "histogram" | "heatmap" | "subplots";
 
-interface Series { name: string; y: number[]; x?: number[] }
+interface Series { name: string; y: number[]; x?: number[]; date?: boolean }
 
 /** Flatten plot_expr results into named series (1-D → one, 2-D → one per column). */
 function toSeries(expr: string, d: any): Series[] {
-  if (d.y) return [{ name: expr, y: d.y, x: d.y.map((_: unknown, i: number) => i * (d.step ?? 1)) }];
+  // d.x (epoch ms, datetime index) wins over the positional x; d.step is the row stride
+  const date = Array.isArray(d.x);
+  if (d.y) return [{ name: expr, y: d.y, x: d.x ?? d.y.map((_: unknown, i: number) => i * (d.step ?? 1)), date }];
   if (d.z) {
     const z: number[][] = d.z;
     const ncol = z[0]?.length ?? 0;
-    const cols = d.columns ?? Array.from({ length: ncol }, (_, i) => `${expr}[:, ${i}]`);
-    return Array.from({ length: ncol }, (_, c) => ({ name: String(cols[c]), y: z.map((r) => r[c]) }));
+    const step1 = d.step1 ?? 1;
+    const cols = d.columns ?? Array.from({ length: ncol }, (_, i) => `${expr}[:, ${i * step1}]`);
+    const x = d.x ?? z.map((_, i) => i * (d.step ?? 1));
+    return Array.from({ length: ncol }, (_, c) => ({ name: String(cols[c]), y: z.map((r) => r[c]), x, date }));
   }
   return [];
 }
@@ -41,6 +45,10 @@ export async function plotExprs(exprs: string[], kind: PlotKind) {
       layout.showlegend = false;
     } else {
       const series = results.flatMap((r, i) => toSeries(exprs[i], r));
+      if (series.length && series.every((s) => s.date) && kind !== "histogram") {
+        // epoch-ms x values: let Plotly label them as dates
+        for (let i = 0; i < (kind === "subplots" ? series.length : 1); i++) layout[`xaxis${i ? i + 1 : ""}`] = { type: "date" };
+      }
       if (kind === "subplots") {
         const n = series.length;
         const cols = Math.ceil(Math.sqrt(n));
