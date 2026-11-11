@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { copyToGlobals, fetchVariables, frameLabel, selectFrame, type DapVar } from "../debug";
 import { useStore } from "../store";
 
@@ -6,6 +6,7 @@ import { useStore } from "../store";
 export default function DebugVariables() {
   const debug = useStore((s) => s.debug);
   const [open, setOpen] = useState<Record<number, DapVar[]>>({});
+  useEffect(() => { setOpen({}); }, [debug.variables]); // new stop / frame: drop expansions
   const frame = debug.frames.find((f) => f.id === debug.frameId);
 
   const toggle = async (v: DapVar) => {
@@ -22,7 +23,7 @@ export default function DebugVariables() {
         </td>
         <td className="val">{v.value}</td>
         <td className="muted">{v.type ?? ""}</td>
-        <td><button className="mini" title="Copy into kernel globals so the Workspace and viewers can use it" onClick={() => frame && copyToGlobals(v.name, frame.id)}>→ ws</button></td>
+        <td>{depth === 0 && <button className="mini" title="Copy into kernel globals so the Workspace and viewers can use it" onClick={() => frame && copyToGlobals(v.name, frame.id)}>→ ws</button>}</td>
       </tr>,
       ...(open[v.variablesReference] ? render(open[v.variablesReference], depth + 1) : []),
     ]);

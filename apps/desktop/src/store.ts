@@ -117,6 +117,31 @@ const MAX_CONSOLE = 5000;
 const MAX_STREAM_ITEM = 64 * 1024;
 /** Total retained stream text; oldest items are dropped beyond it. */
 const MAX_CONSOLE_BYTES = 8 * 1024 * 1024;
+/**
+ * Append stream text with terminal semantics: a lone `\r` returns to the start of the current line
+ * (progress bars), `\r\n` is a newline. A `\r` ending the chunk is kept until the next chunk shows
+ * whether a `\n` follows. Only the last line of `base` is ever touched.
+ */
+export function appendStreamText(base: string, text: string): string {
+  if (!text) return base;
+  const lineStart = (t: string) => t.lastIndexOf("\n") + 1;
+  let out = base;
+  if (out.endsWith("\r")) out = text[0] === "\n" ? out.slice(0, -1) : out.slice(0, lineStart(out));
+  if (text.indexOf("\r") < 0) return out + text;
+  let i = 0;
+  while (i < text.length) {
+    const cr = text.indexOf("\r", i);
+    if (cr < 0) { out += text.slice(i); break; }
+    out += text.slice(i, cr);
+    if (cr === text.length - 1) out += "\r";
+    else if (text[cr + 1] !== "\n") out = out.slice(0, lineStart(out));
+    i = cr + 1;
+  }
+  return out;
+}
+/** Display form of stream text (drops a pending trailing `\r`). */
+export const streamDisplay = (t: string) => (t.endsWith("\r") ? t.slice(0, -1) : t);
+
 type NewItem = ConsoleItem extends infer T ? (T extends ConsoleItem ? Omit<T, "id"> : never) : never;
 export function pushConsole(item: NewItem) {
   set((s) => {
@@ -124,9 +149,9 @@ export function pushConsole(item: NewItem) {
     let next: ConsoleItem[];
     const last = list[list.length - 1];
     if (item.kind === "stream" && last && last.kind === "stream" && last.name === item.name && last.text.length + item.text.length <= MAX_STREAM_ITEM) {
-      next = [...list.slice(0, -1), { ...last, text: last.text + item.text }];
+      next = [...list.slice(0, -1), { ...last, text: appendStreamText(last.text, item.text) }];
     } else {
-      next = [...list, { ...item, id: uid() } as ConsoleItem];
+      next = [...list, { ...item, ...(item.kind === "stream" ? { text: appendStreamText("", item.text) } : {}), id: uid() } as ConsoleItem];
     }
     if (next.length > MAX_CONSOLE) next = next.slice(next.length - MAX_CONSOLE);
     let bytes = 0;

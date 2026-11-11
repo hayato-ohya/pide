@@ -22,8 +22,12 @@ const FORMATTERS: { id: Formatter; label: string; note: string }[] = [
 export default function ToolsDialog({ onClose }: { onClose: () => void }) {
   const current = useStore((s) => s.tools);
   const python = useStore((s) => s.python);
-  const [t, setT] = useState<ToolSettings>({ ...current });
+  const [tt, setT] = useState<ToolSettings>({ ...current });
+  const t = tt;
+  const [lenDraft, setLenDraft] = useState(String(current.lineLength));
+  const lenValue = () => { const n = Math.round(Number(lenDraft)); return n >= 60 && n <= 200 ? n : 88; };
   const apply = async () => {
+    const t = { ...tt, lineLength: lenValue() };
     saveToolSettings(t);
     onClose();
     pushConsole({ kind: "info", text: `Tools: linter=${t.linter}, formatter=${t.formatter}, line length ${t.lineLength}` });
@@ -40,7 +44,7 @@ export default function ToolsDialog({ onClose }: { onClose: () => void }) {
           <select id="td-fmt" value={t.formatter} onChange={(e) => setT({ ...t, formatter: e.target.value as Formatter })}>{FORMATTERS.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}</select>
           <span className="muted">{FORMATTERS.find((f) => f.id === t.formatter)?.note}</span></div>
         <div className="row"><label htmlFor="td-fargs">Formatter args</label><input id="td-fargs" value={t.formatterArgs} onChange={(e) => setT({ ...t, formatterArgs: e.target.value })} placeholder="e.g. --skip-string-normalization" /></div>
-        <div className="row"><label htmlFor="td-len">Line length</label><input id="td-len" className="small" type="number" min={60} max={200} value={t.lineLength} onChange={(e) => setT({ ...t, lineLength: Number(e.target.value) || 88 })} /><span className="muted">passed to flake8 / pylint / black / autopep8 (ruff reads pyproject.toml)</span></div>
+        <div className="row"><label htmlFor="td-len">Line length</label><input id="td-len" className="small" type="number" min={60} max={200} value={lenDraft} onChange={(e) => setLenDraft(e.target.value)} onBlur={() => setLenDraft(String(lenValue()))} /><span className="muted">passed to flake8 / pylint / black / autopep8 (ruff reads pyproject.toml)</span></div>
         <div className="row buttons"><button className="primary" onClick={apply}>Apply</button><button onClick={onClose}>Cancel</button></div>
     </Modal>
   );

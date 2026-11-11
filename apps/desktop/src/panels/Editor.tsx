@@ -9,8 +9,10 @@ import { readText, savePath, writeText } from "../fs";
 import { scheduleLint } from "../tools";
 import { execute } from "../kernel";
 import { get, pushConsole, setDirtyPanel, useStore } from "../store";
-import { cont, debugCell, debugFile, editorPathFor, setBreakpoint, toggleBreakpoint, type Breakpoint } from "../debug";
+import { cont, debugCell, debugFile, editorPathFor, setBreakpoint, syncBreakpointLines, toggleBreakpoint, type Breakpoint } from "../debug";
 import { set as setStore } from "../store";
+import { confirmAsync } from "../dialogs";
+import { reloaders } from "../reload";
 import { changeDocument, closeDocument, initLsp, openDocument, queueDocumentChange, saveDocument } from "../lsp";
 
 // Use the bundled monaco (no CDN) so the app works offline.
@@ -49,13 +51,16 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const [dirty, setDirty] = useState(false);
   const [conflicts, setConflicts] = useState<ConflictBlock[]>([]);
   const ed = useRef<Editor | null>(null);
+  const savedText = useRef<string | null>(null); // last text known to be on disk
+  const saving = useRef(false);
+  const checking = useRef(false);
   const id = props.api.id;
   // Stable URI for the LSP: real files use file://, new buffers use untitled:.
   const uriRef = useRef<string>(path ? monaco.Uri.file(path).toString() : `untitled:Untitled-${++untitledCounter}.py`);
   const uri = uriRef.current;
 
   useEffect(() => {
-    if (path) readText(path).then(setContent).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setLoadError(String(e)); });
+    if (path) readText(path).then((t) => { savedText.current = t; setContent(t); }).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setLoadError(String(e)); });
   }, [loadError === "retry"]);
 
   useEffect(() => {
@@ -84,13 +89,19 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
       if (!p) return;
     }
     const text = ed.current?.getValue() ?? content ?? "";
+    const ver = ed.current?.getModel()?.getAlternativeVersionId();
+    saving.current = true;
     try {
       await writeText(p, text);
     } catch (e) {
       pushConsole({ kind: "info", text: `Save failed: ${e}` });
       return;
+    } finally {
+      saving.current = false;
     }
-    setDirty(false);
+    savedText.current = text;
+    // Keystrokes typed while the save was in flight must stay dirty.
+    if (ed.current?.getModel()?.getAlternativeVersionId() === ver) setDirty(false);
     pushConsole({ kind: "info", text: `Saved ${p}` });
     if (wasUntitled) {
       // Re-open under the real path so LSP, breakpoints and "open file" all key on it.
@@ -141,6 +152,35 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     return () => { editors.delete(id); d.dispose(); };
   });
 
+  /** Compare disk with the last saved text; reload a clean buffer, ask for a dirty one. */
+  const checkReload = async () => {
+    const e = ed.current; const model = e?.getModel();
+    if (!path || !e || !model || savedText.current === null || saving.current || checking.current) return;
+    checking.current = true;
+    try {
+      const disk = await readText(path);
+      if (saving.current || disk === savedText.current) return;
+      const cur = model.getValue();
+      if (disk === cur) { savedText.current = disk; setDirty(false); return; }
+      if (dirtyRef.current) {
+        savedText.current = disk; // ask once per external change
+        if (!(await confirmAsync(`${path.split("/").pop()} changed on disk. Reload and discard your unsaved edits?`))) return;
+      }
+      savedText.current = disk;
+      const pos = e.getPosition();
+      e.pushUndoStop();
+      e.executeEdits("reload", [{ range: model.getFullModelRange(), text: disk }]);
+      e.pushUndoStop();
+      if (pos) e.setPosition(model.validatePosition(pos));
+      setDirty(false);
+    } finally {
+      checking.current = false;
+    }
+  };
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+  useEffect(() => { reloaders.set(id, checkReload); return () => { reloaders.delete(id); }; });
+
   useEffect(() => () => closeDocument(uri), []);
   useEffect(() => { setDirtyPanel(id, path ? path.split("/").pop()! : "untitled.py", dirty); }, [dirty, path]);
   useEffect(() => () => setDirtyPanel(id, "", false), []);
@@ -148,16 +188,18 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const onMount: OnMount = (editor, m) => {
     ed.current = editor;
     if (import.meta.env.DEV && (window as any).pide) (window as any).pide.editor = editor;
-    editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.Enter, () => editors.get(id)?.runCell());
-    editor.addCommand(m.KeyCode.F5, () => { if (get().debug.stopped) cont(); else editors.get(id)?.run(); });
-    editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, () => editors.get(id)?.save());
-    editor.addCommand(m.KeyCode.F9, () => editors.get(id)?.runCell());
-    editor.addCommand(m.KeyMod.Shift | m.KeyMod.Alt | m.KeyCode.KeyF, () => editors.get(id)?.format());
+    editor.addAction({ id: "pide.runCellCtrlEnter", label: "Run Cell", keybindings: [m.KeyMod.CtrlCmd | m.KeyCode.Enter], run: () => { editors.get(id)?.runCell(); } });
+    editor.addAction({ id: "pide.runOrContinue", label: "Run File / Continue", keybindings: [m.KeyCode.F5], run: () => { if (get().debug.stopped) cont(); else editors.get(id)?.run(); } });
+    editor.addAction({ id: "pide.save", label: "Save File", keybindings: [m.KeyMod.CtrlCmd | m.KeyCode.KeyS], run: () => { editors.get(id)?.save(); } });
+    editor.addAction({ id: "pide.runCellF9", label: "Run Cell (F9)", keybindings: [m.KeyCode.F9], run: () => { editors.get(id)?.runCell(); } });
+    editor.addAction({ id: "pide.format", label: "Format File", keybindings: [m.KeyMod.Shift | m.KeyMod.Alt | m.KeyCode.KeyF], run: () => { editors.get(id)?.format(); } });
     openDocument(uri, editor.getValue());
     const lint = () => { const model = editor.getModel(); if (model) scheduleLint(m, model, path?.split("/").pop() ?? "untitled.py"); };
     lint();
-    editor.onDidChangeModelContent(() => {
+    editor.onDidChangeModelContent((ev) => {
       setDirty(true);
+      const ranges = ev.isFlush ? null : bpDec.current?.getRanges(); // a full setValue collapses decorations; do not sync that
+      if (ranges) syncBreakpointLines(uri, ranges.map((r) => r.startLineNumber));
       queueDocumentChange(uri, () => editor.getValue(), (t) => changeDocument(uri, t));
       lint();
     });

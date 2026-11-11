@@ -90,7 +90,7 @@ export default function App() {
       import("./git").then((g) => g.refreshGit());
     };
     const t = setInterval(gitTick, 4000);
-    const onFocus = () => import("./git").then((g) => g.refreshGit());
+    const onFocus = () => { import("./git").then((g) => g.refreshGit()); import("./reload").then((r) => r.reloadOpenFiles()); };
     window.addEventListener("focus", onFocus);
     const unlisten = getCurrentWindow().onCloseRequested(async (ev) => {
       const dirty = [...dirtyPanels.values()];
@@ -98,9 +98,9 @@ export default function App() {
     });
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "F5" && !e.shiftKey && get().debug.stopped) { e.preventDefault(); e.stopPropagation(); cont(); }
-      else if (e.key === "F10") { e.preventDefault(); stepOver(); }
-      else if (e.key === "F11" && e.shiftKey) { e.preventDefault(); stepOut(); }
-      else if (e.key === "F11") { e.preventDefault(); stepIn(); }
+      else if (e.key === "F10" && !e.shiftKey && get().debug.stopped) { e.preventDefault(); stepOver(); }
+      else if (e.key === "F11" && e.shiftKey && get().debug.stopped) { e.preventDefault(); stepOut(); }
+      else if (e.key === "F11" && get().debug.stopped) { e.preventDefault(); stepIn(); }
       else if (e.key === "F5" && e.shiftKey) { e.preventDefault(); stopDebugger(); }
     };
     window.addEventListener("keydown", onKey);
@@ -241,7 +241,12 @@ export default function App() {
                 <button onClick={() => showPanel("terminal", "terminal", "Terminal")}>Terminal</button>
                 <button onClick={() => showPanel("figures", "figures", "Figures")}>Figures</button>
               </div><div className="ts-label">PANELS</div></div>
-              <div className="ts-group"><div className="ts-row"><button onClick={() => apiRef.current && buildDefaultLayout(apiRef.current)}>Default Layout</button></div><div className="ts-label">LAYOUT</div></div>
+              <div className="ts-group"><div className="ts-row"><button onClick={async () => {
+                const a = apiRef.current; if (!a) return;
+                const dirty = [...dirtyPanels.values()];
+                if (dirty.length && !(await confirmAsync(`Unsaved changes in: ${dirty.join(", ")}. Resetting the layout closes them. Continue?`))) return;
+                buildDefaultLayout(a);
+              }}>Default Layout</button></div><div className="ts-label">LAYOUT</div></div>
               <div className="ts-group"><div className="ts-row"><button onClick={() => setToolsDlg(true)}>⚙ Linter / Formatter…</button></div><div className="ts-label">TOOLS</div></div>
               <div className="ts-group"><div className="ts-row">
                 {(["light", "dark", "system"] as const).map((t) => <button key={t} className={themePref === t ? "primary" : ""} onClick={() => applyTheme(t)}>{t === "light" ? "☀ Light" : t === "dark" ? "☾ Dark" : "⟳ System"}</button>)}

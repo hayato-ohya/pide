@@ -8,7 +8,15 @@ import { startLsp } from "./lsp";
 const pending = new Map<string, { resolve: (c: any) => void; reject: (e: any) => void }>();
 /** Replies that arrived before the caller registered a waiter (fast control replies). */
 const early = new Map<string, any>();
+/** User executions sent and not yet reported idle on iopub: the "busy" indicator is derived from these
+ * (ipykernel also publishes busy/idle for control-channel debug_requests and internal requests). */
 const userExecs = new Set<string>();
+function syncBusy() {
+  const k = get().kernel;
+  if (k !== "idle" && k !== "busy") return;
+  const next = userExecs.size ? "busy" : "idle";
+  if (k !== next) set({ kernel: next });
+}
 
 /** Per-execution output sinks (notebook cells). Items mirror console items, plus "clear". */
 export type OutputItem =
@@ -20,18 +28,43 @@ export type OutputItem =
   | { kind: "count"; count: number | null };
 type Mime = Record<string, unknown>;
 const sinks = new Map<string, (item: OutputItem) => void>();
+/** Callbacks of rendered outputs per display_id (notebook panels): update_display_data reaches all of them. */
+const displayRegs = new Map<string, Set<(data: Mime) => void>>();
+export function registerDisplay(id: string, cb: (data: Mime) => void): () => void {
+  let set_ = displayRegs.get(id);
+  if (!set_) displayRegs.set(id, (set_ = new Set()));
+  set_.add(cb);
+  return () => { set_!.delete(cb); if (!set_!.size && displayRegs.get(id) === set_) displayRegs.delete(id); };
+}
+
+/** Console executions (no sink): id of the last console item before they started, for clear_output. */
+const consoleMarks = new Map<string, number>();
+/** clear_output(wait=True) seen for these executions: applied just before their next output. */
+const pendingClear = new Set<string>();
+function clearOutputs(parent: string) {
+  const sink = sinks.get(parent);
+  if (sink) { sink({ kind: "clear", wait: false }); return; }
+  const mark = consoleMarks.get(parent);
+  if (mark === undefined) return;
+  set((s) => ({ console: s.console.filter((it) => it.id <= mark || it.kind === "input" || it.kind === "info") }));
+}
+/** Apply a deferred clear right before this execution's next output. */
+function flushClear(parent: string | null) {
+  if (parent && pendingClear.delete(parent)) clearOutputs(parent);
+}
+
 /** Executions whose shell reply arrived; their sink is dropped on the matching iopub idle. */
 const settledReplies = new Set<string>();
 
-/** Resolve when the shell reply for `msgId` arrives. */
-export function awaitReply(msgId: string, timeoutMs = 600_000): Promise<any> {
+/** Resolve when the shell reply for `msgId` arrives (`timeoutMs: null` = wait until the kernel dies / restarts). */
+export function awaitReply(msgId: string, timeoutMs: number | null = 600_000): Promise<any> {
   if (early.has(msgId)) {
     const c = early.get(msgId);
     early.delete(msgId);
     return Promise.resolve(c);
   }
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    const timer = timeoutMs == null ? undefined : setTimeout(() => {
       if (pending.delete(msgId)) reject(new Error("timeout waiting for kernel reply"));
     }, timeoutMs);
     pending.set(msgId, { resolve: (c) => { clearTimeout(timer); resolve(c); }, reject: (e) => { clearTimeout(timer); reject(e); } });
@@ -59,9 +92,13 @@ function handleEvent(ev: KernelEvent) {
   if (ev.channel === "iopub") {
     switch (ev.msg_type) {
       case "status":
-        if (c.execution_state === "busy") set({ kernel: "busy" });
+        // Only our own user executions drive the busy indicator: control-channel debug_requests
+        // (sent while stopped at a breakpoint) also publish busy/idle and must not flip it.
+        if (c.execution_state === "busy") { if (ev.parent_id && userExecs.has(ev.parent_id)) syncBusy(); }
         else if (c.execution_state === "idle") {
-          set({ kernel: "idle" });
+          if (ev.parent_id && userExecs.delete(ev.parent_id)) syncBusy();
+          if (ev.parent_id) { consoleMarks.delete(ev.parent_id); pendingClear.delete(ev.parent_id); }
+          if (ev.parent_id && get().inputRequest?.parent.parent_id === ev.parent_id) set({ inputRequest: null });
           // ipykernel sends idle after the last output of an execution: release that sink now.
           const sink = ev.parent_id && sinks.get(ev.parent_id);
           if (sink && settledReplies.has(ev.parent_id!)) { sinks.delete(ev.parent_id!); settledReplies.delete(ev.parent_id!); }
@@ -71,6 +108,7 @@ function handleEvent(ev: KernelEvent) {
         // Only echo code we did not print ourselves (e.g. from other clients).
         return;
       case "stream": {
+        flushClear(ev.parent_id);
         const sink = ev.parent_id && sinks.get(ev.parent_id);
         if (sink) sink({ kind: "stream", name: c.name, text: c.text });
         else pushConsole({ kind: "stream", name: c.name, text: c.text });
@@ -78,6 +116,7 @@ function handleEvent(ev: KernelEvent) {
       }
       case "execute_result": {
         set({ execCount: c.execution_count ?? get().execCount });
+        flushClear(ev.parent_id);
         const sink = ev.parent_id && sinks.get(ev.parent_id);
         if (sink) sink({ kind: "result", data: c.data, count: c.execution_count });
         else pushConsole({ kind: "result", data: c.data, count: c.execution_count });
@@ -87,10 +126,14 @@ function handleEvent(ev: KernelEvent) {
       case "display_data":
       case "update_display_data": {
         const displayId = c.transient?.display_id;
+        if (ev.msg_type === "display_data") flushClear(ev.parent_id);
         const sink = ev.parent_id && sinks.get(ev.parent_id);
         if (ev.msg_type === "update_display_data" && displayId) {
           // Replace in place (progress bars, animations) instead of appending.
           set((s) => ({ console: s.console.map((it) => (it.kind === "display" && it.displayId === displayId ? { ...it, data: c.data } : it)) }));
+          // Every rendered output with this id (any notebook cell); the running cell's sink also gets it
+          // (idempotent) in case its output is not registered yet.
+          displayRegs.get(displayId)?.forEach((cb) => cb(c.data));
           if (sink) sink({ kind: "display", data: c.data, displayId, update: true });
           routeFigure(c.data, `Figure ${get().figures.length + 1}`, displayId);
           return;
@@ -101,14 +144,17 @@ function handleEvent(ev: KernelEvent) {
         return;
       }
       case "error": {
+        flushClear(ev.parent_id);
         const sink = ev.parent_id && sinks.get(ev.parent_id);
         if (sink) sink({ kind: "error", ename: c.ename, evalue: c.evalue, traceback: c.traceback ?? [] });
         else pushConsole({ kind: "error", ename: c.ename, evalue: c.evalue, traceback: c.traceback ?? [] });
         return;
       }
       case "clear_output": {
-        const sink = ev.parent_id && sinks.get(ev.parent_id);
-        if (sink) sink({ kind: "clear", wait: !!c.wait });
+        if (!ev.parent_id) return;
+        // wait=True: clear just before the next output arrives (no flicker); otherwise now.
+        if (c.wait) pendingClear.add(ev.parent_id);
+        else { pendingClear.delete(ev.parent_id); clearOutputs(ev.parent_id); }
         return;
       }
       case "debug_event":
@@ -124,6 +170,8 @@ function handleEvent(ev: KernelEvent) {
     if (ev.msg_type === "execute_reply") {
       applyWorkspace(c.user_expressions);
       if (c.execution_count != null) set({ execCount: c.execution_count });
+      // input() was interrupted / raised: the kernel no longer waits for that reply.
+      if (ev.parent_id && get().inputRequest?.parent.parent_id === ev.parent_id) set({ inputRequest: null });
       const sink = ev.parent_id && sinks.get(ev.parent_id);
       if (sink) {
         sink({ kind: "count", count: c.execution_count ?? null });
@@ -169,7 +217,16 @@ function settlePending(reason: string, resolveInstead = false) {
     else p.reject(new Error(reason));
   }
   for (const [id, sink] of sinks) { sinks.delete(id); sink({ kind: "count", count: null }); }
+  settledReplies.clear();
+  consoleMarks.clear();
+  pendingClear.clear();
+  userExecs.clear();
   early.clear();
+}
+
+/** Debugger state belongs to one kernel session: drop it when that session ends (death, restart, start). */
+function resetDebugState() {
+  set((s) => ({ debug: { ...s.debug, active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, variables: [], scopes: [], cellFiles: {}, exceptionInfo: null } }));
 }
 
 /** Events were dropped under load: once the kernel answers a cheap request, settle everything older. */
@@ -180,27 +237,42 @@ async function resyncAfterLag(n: number) {
   resyncing = true;
   try {
     const stale = [...pending.keys()];
+    const staleExecs = [...userExecs];
     const id = await invoke<string>("is_complete", { code: "" });
-    await awaitReply(id, 30_000).catch(() => {});
+    // Shell requests are answered in order: the marker reply means everything older is done.
+    // No timeout: a long print-heavy cell is still running until then. If the kernel dies or
+    // restarts meanwhile, settlePending has already settled everything (and rejects this wait).
+    try { await awaitReply(id, null); } catch { return; }
     for (const k of stale) { const p = pending.get(k); if (p) { pending.delete(k); p.resolve({ status: "unknown", lagged: true }); } }
-    for (const k of stale) { const sink = sinks.get(k); if (sink) { sinks.delete(k); sink({ kind: "count", count: null }); } }
-    set({ kernel: "idle" });
+    for (const k of stale) { const sink = sinks.get(k); if (sink) { sinks.delete(k); settledReplies.delete(k); sink({ kind: "count", count: null }); } }
+    for (const k of staleExecs) { userExecs.delete(k); consoleMarks.delete(k); pendingClear.delete(k); }
+    syncBusy();
+  } catch {
+    /* kernel not running */
   } finally {
     resyncing = false;
   }
 }
 
 let started = false;
+const unlisteners: (() => void)[] = [];
 export async function initKernelBridge() {
   if (started) return;
   started = true;
-  await listen<KernelEvent[]>("kernel-events", (e) => { for (const ev of e.payload) handleEvent(ev); });
-  await listen<number>("kernel-lagged", (e) => resyncAfterLag(e.payload));
-  await listen<any>("kernel-status", (e) => {
+  unlisteners.push(await listen<KernelEvent[]>("kernel-events", (e) => { for (const ev of e.payload) handleEvent(ev); }));
+  unlisteners.push(await listen<number>("kernel-lagged", (e) => resyncAfterLag(e.payload)));
+  unlisteners.push(await listen<any>("kernel-status", (e) => {
     const p = e.payload;
-    set({ kernel: p.state, python: p.python ?? get().python, cwd: p.cwd ?? get().cwd, kernelDetail: p.detail ?? null });
-    if (p.state === "dead") { settlePending("kernel died"); if (p.detail) pushConsole({ kind: "info", text: `Kernel died: ${p.detail}` }); }
-  });
+    // "idle" also reports a recovered heartbeat: keep showing busy while our executions run.
+    const state = p.state === "idle" && userExecs.size ? "busy" : p.state;
+    set({ kernel: state, python: p.python ?? get().python, cwd: p.cwd ?? get().cwd, kernelDetail: p.detail ?? null });
+    if (p.state === "dead") {
+      settlePending("kernel died");
+      resetDebugState();
+      set({ inputRequest: null });
+      if (p.detail) pushConsole({ kind: "info", text: `Kernel died: ${p.detail}` });
+    }
+  }));
   const pythons = await invoke<string[]>("detect_pythons");
   const overrides = await invoke<{ python: string | null; cwd: string | null }>("launch_overrides").catch(() => ({ python: null, cwd: null }));
   const envPython = overrides.python;
@@ -212,6 +284,10 @@ export async function initKernelBridge() {
   else if (!get().cwd) set({ cwd: localStorage.getItem("pide.cwd") ?? (await invoke<string>("home_dir")) });
 }
 
+// Vite HMR re-evaluates this module: drop the old listeners or every event is handled twice.
+import.meta.hot?.dispose(() => { for (const u of unlisteners.splice(0)) u(); });
+
+/** In-flight start / restart; execute() waits on it (the backend has no kernel meanwhile). */
 let starting: Promise<void> | null = null;
 export function startKernel() {
   if (!starting) starting = startKernelInner().finally(() => (starting = null));
@@ -226,6 +302,7 @@ async function startKernelInner() {
     if (!ok) { cwd = await invoke<string>("home_dir"); set({ cwd }); localStorage.setItem("pide.cwd", cwd); }
   }
   set({ console: [...get().console], inputRequest: null });
+  resetDebugState();
   pushConsole({ kind: "info", text: remote ? `Starting remote kernel on ${remote.host}: ${remote.python}` : connectionFile ? `Connecting to kernel: ${connectionFile}` : `Starting kernel: ${python}` });
   try {
     await invoke("start_kernel", { python, cwd, remote: remote ? { host: remote.host, port: remote.port ?? null, python: remote.python, cwd: remote.cwd || null } : null, connectionFile });
@@ -242,24 +319,30 @@ async function startKernelInner() {
     await refreshWorkspace();
     // Dev helpers (debug builds only): PIDE_AUTORUN runs Python once the kernel
     // is up, PIDE_DEV_SCRIPT runs JS for scripted UI checks.
+    // Not awaited: execute() waits for `starting`, which is this very function.
     if (import.meta.env.DEV && !autorunDone) {
       autorunDone = true;
-      const auto = await invoke<string | null>("dev_autorun").catch(() => null);
-      if (auto) await execute(auto);
-      const script = await invoke<string | null>("dev_script").catch(() => null);
-      if (script) new Function(script)();
+      void devAutorun();
     }
   } catch (e) {
     pushConsole({ kind: "info", text: `Failed to start kernel: ${e}` });
   }
 }
 let autorunDone = false;
+async function devAutorun() {
+  const auto = await invoke<string | null>("dev_autorun").catch(() => null);
+  if (auto) await execute(auto);
+  const script = await invoke<string | null>("dev_script").catch(() => null);
+  if (script) new Function(script)();
+}
 
-export async function restartKernel() {
+export function restartKernel() {
   pushConsole({ kind: "info", text: "Restarting kernel..." });
   settlePending("kernel restarted");
-  set((s) => ({ variables: [], changed: new Set(), debug: { ...s.debug, active: false, stopped: false, frames: [], frameId: null, variables: [], cellFiles: {} } }));
-  await startKernel();
+  set({ variables: [], changed: new Set() });
+  resetDebugState();
+  // startKernel() registers the in-flight promise synchronously, so execute() waits on it too.
+  return startKernel();
 }
 
 export async function interrupt() {
@@ -269,14 +352,24 @@ export async function interrupt() {
 /** Execute user code: echoes it in the console and records history. */
 export async function execute(code: string, { echo = true, sink, history = true }: { echo?: boolean; sink?: (item: OutputItem) => void; history?: boolean } = {}): Promise<any> {
   if (!code.trim()) return;
-  if (get().kernel === "stopped" || get().kernel === "dead") await startKernel();
+  // During start / restart the backend has no kernel yet ("kernel not running"): wait for it.
+  if (starting) await starting;
+  else if (get().kernel === "stopped" || get().kernel === "dead") await startKernel();
   const id = crypto.randomUUID();
   if (sink) sinks.set(id, sink);
-  const reply = awaitReply(id);
+  else consoleMarks.set(id, get().console[get().console.length - 1]?.id ?? 0);
+  // No timeout: user code may legitimately run for hours. The wait ends with the reply, or
+  // settlePending() when the kernel dies / restarts.
+  const reply = awaitReply(id, null);
+  userExecs.add(id);
+  syncBusy();
   try {
     await invoke<string>("execute", { code, opts: { workspace: true, include_hidden: get().showHidden, msg_id: id } });
   } catch (e) {
     sinks.delete(id);
+    consoleMarks.delete(id);
+    userExecs.delete(id);
+    syncBusy();
     const p = pending.get(id); if (p) { pending.delete(id); p.reject(new Error(String(e))); }
     pushConsole({ kind: "info", text: `Cannot execute: ${e}` });
     reply.catch(() => {});
@@ -284,7 +377,9 @@ export async function execute(code: string, { echo = true, sink, history = true 
   }
   if (echo) pushConsole({ kind: "input", code, count: get().execCount + 1, msgId: id });
   if (history) addHistory(code);
-  return reply;
+  // Many callers fire and forget: report an aborted execution (kernel died / restarted) as an
+  // error reply instead of rejecting, like a failed send above.
+  return reply.catch((e) => ({ status: "error", error: String(e?.message ?? e) }));
 }
 
 export async function runSilent(code: string): Promise<any> {
@@ -302,14 +397,6 @@ export async function fetchDetail(path: string, win: { row0: number; row1: numbe
   const id = await invoke<string>("variable_detail", { path, win });
   const reply = await awaitReply(id);
   const ue = reply.user_expressions?.detail;
-  if (ue?.status === "error") throw new Error(`${ue.ename}: ${ue.evalue}`);
-  return ue.data["application/x-pide+json"];
-}
-
-export async function fetchPlotData(path: string): Promise<any> {
-  const id = await invoke<string>("plot_data", { path });
-  const reply = await awaitReply(id);
-  const ue = reply.user_expressions?.plot;
   if (ue?.status === "error") throw new Error(`${ue.ename}: ${ue.evalue}`);
   return ue.data["application/x-pide+json"];
 }
@@ -357,7 +444,17 @@ export async function replyInput(value: string) {
 export async function setCwd(path: string) {
   if (!get().remote && !get().connectionFile) localStorage.setItem("pide.cwd", path);
   set({ cwd: path });
-  if (get().kernel === "idle") await runSilent(`import os as _os; _os.chdir(${JSON.stringify(path)})`);
+  // The language servers' workspace root follows the cwd (no-op when the root is unchanged).
+  startLsp().catch(() => {});
+  // Also while busy: shell requests run in order, so the chdir lands after the running cell.
+  // Not awaited past sending (that could take as long as the cell).
+  if (get().kernel !== "idle" && get().kernel !== "busy") return;
+  try {
+    const id = await invoke<string>("execute", { code: `import os as _os; _os.chdir(${JSON.stringify(path)})`, opts: { silent: true, store_history: false, workspace: false } });
+    awaitReply(id, null).catch(() => {});
+  } catch (e) {
+    pushConsole({ kind: "info", text: `chdir: ${e}` });
+  }
 }
 
 export function setPython(p: string) {

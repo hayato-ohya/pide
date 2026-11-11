@@ -41,7 +41,10 @@ export async function readText(path: string): Promise<string> {
 
 export async function writeText(path: string, content: string): Promise<void> {
   if (!isRemote()) return invoke("write_text_file", { path, content });
-  const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(content)));
+  const bytes = new TextEncoder().encode(content);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000) as unknown as number[]);
+  const b64 = btoa(bin);
   await evalHelper(`fs_write(${JSON.stringify(path)}, ${JSON.stringify(b64)})`);
 }
 

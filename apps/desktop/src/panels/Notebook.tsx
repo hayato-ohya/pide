@@ -4,12 +4,14 @@ import * as monaco from "monaco-editor";
 import type { IDockviewPanelProps } from "dockview";
 import { readText, savePath, writeText } from "../fs";
 import { marked } from "marked";
-import { execute, interrupt, type OutputItem } from "../kernel";
-import { pushConsole, set as setStore, setDirtyPanel, useStore } from "../store";
+import { execute, interrupt, registerDisplay, type OutputItem } from "../kernel";
+import { appendStreamText, pushConsole, set as setStore, setDirtyPanel, streamDisplay, useStore } from "../store";
 import { Output, ansi } from "./Console";
 import { safeHtml } from "../sanitize";
 import { changeNotebookCell, closeNotebookDoc, formatDocument, openNotebookDoc, queueDocumentChange, syncNotebookStructure } from "../lsp";
-import { debugCell, editorPathFor, toggleBreakpoint, type Breakpoint } from "../debug";
+import { debugCell, editorPathFor, syncBreakpointLines, toggleBreakpoint, type Breakpoint } from "../debug";
+import { confirmAsync } from "../dialogs";
+import { reloaders } from "../reload";
 import { bpTitle } from "./Editor";
 import { scheduleLint } from "../tools";
 
@@ -29,6 +31,8 @@ interface Cell {
   metadata: Mime;
   execution_count?: number | null;
   outputs?: NbOutput[];
+  /** The cell as read from disk; unknown fields (attachments, ...) survive a save. */
+  raw?: Record<string, unknown>;
   /** UI only */
   editing?: boolean;
   running?: boolean;
@@ -36,7 +40,7 @@ interface Cell {
   collapsed?: boolean;
 }
 
-interface Notebook { cells: Cell[]; metadata: Mime; nbformat: number; nbformat_minor: number }
+interface Notebook { cells: Cell[]; metadata: Mime; nbformat: number; nbformat_minor: number; /** unknown top-level fields */ extra?: Record<string, unknown> }
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const joinSrc = (s: unknown) => (Array.isArray(s) ? s.join("") : String(s ?? ""));
@@ -46,15 +50,16 @@ function parseNotebook(text: string): Notebook {
   const nb = text.trim() ? JSON.parse(text) : {};
   const cells: Cell[] = (nb.cells ?? []).map((c: any) => ({
     id: c.id ?? uid(),
+    raw: c,
     cell_type: c.cell_type ?? "code",
     source: joinSrc(c.source),
     metadata: c.metadata ?? {},
     execution_count: c.execution_count ?? null,
     collapsed: !!(c.metadata?.collapsed || c.metadata?.jupyter?.outputs_hidden),
-    outputs: (c.outputs ?? []).map((o: any) => (o.output_type === "stream" ? { ...o, text: joinSrc(o.text) } : o.output_type === "error" ? o : { ...o, data: Object.fromEntries(Object.entries(o.data ?? {}).map(([k, v]) => [k, k.startsWith("image/") || k === "application/json" ? (Array.isArray(v) ? v.join("") : v) : joinSrc(v)])) })),
+    outputs: (c.outputs ?? []).map((o: any) => (o.output_type === "stream" ? { ...o, text: joinSrc(o.text) } : o.output_type === "error" ? o : { ...o, data: Object.fromEntries(Object.entries(o.data ?? {}).map(([k, v]) => [k, k.startsWith("image/") || k === "application/json" ? (Array.isArray(v) ? v.join("") : v) : Array.isArray(v) ? v.join("") : v])) })),
   }));
   if (!cells.length) cells.push({ id: uid(), cell_type: "code", source: "", metadata: {}, execution_count: null, outputs: [] });
-  return { cells, metadata: nb.metadata ?? { kernelspec: { name: "python3", display_name: "Python 3", language: "python" }, language_info: { name: "python" } }, nbformat: nb.nbformat ?? 4, nbformat_minor: nb.nbformat_minor ?? 5 };
+  return { cells, metadata: nb.metadata ?? { kernelspec: { name: "python3", display_name: "Python 3", language: "python" }, language_info: { name: "python" } }, nbformat: nb.nbformat ?? 4, nbformat_minor: nb.nbformat_minor ?? 5, extra: Object.fromEntries(Object.entries(nb).filter(([k]) => !["cells", "metadata", "nbformat", "nbformat_minor"].includes(k))) };
 }
 
 function serializeNotebook(nb: Notebook): string {
@@ -64,19 +69,23 @@ function serializeNotebook(nb: Notebook): string {
       if (c.collapsed) { metadata.collapsed = true; metadata.jupyter = { ...(metadata.jupyter ?? {}), outputs_hidden: true }; }
       else { delete metadata.collapsed; if (metadata.jupyter) { delete metadata.jupyter.outputs_hidden; if (!Object.keys(metadata.jupyter).length) delete metadata.jupyter; } }
     }
-    const base: any = { cell_type: c.cell_type, id: c.id, metadata, source: splitSrc(c.source) };
+    const base: any = { ...c.raw, cell_type: c.cell_type, id: c.id, metadata, source: splitSrc(c.source) };
+    if (c.cell_type !== "code") { delete base.execution_count; delete base.outputs; }
     if (c.cell_type === "code") {
       base.execution_count = c.execution_count ?? null;
       base.outputs = (c.outputs ?? []).map((o) => {
         if (o.output_type === "stream") return { output_type: "stream", name: o.name, text: splitSrc(o.text) };
         if (o.output_type === "error") return o;
         const data = Object.fromEntries(Object.entries(o.data).map(([k, v]) => [k, typeof v === "string" && !k.startsWith("image/") ? splitSrc(v) : v]));
-        return o.output_type === "execute_result" ? { output_type: "execute_result", data, metadata: o.metadata ?? {}, execution_count: o.execution_count ?? null } : { output_type: "display_data", data, metadata: o.metadata ?? {} };
+        const { display_id: _transient, ...metadata } = (o.metadata ?? {}) as Mime; // display_id is runtime-only
+        return o.output_type === "execute_result" ? { output_type: "execute_result", data, metadata, execution_count: o.execution_count ?? null } : { output_type: "display_data", data, metadata };
       });
     }
     return base;
   });
-  return JSON.stringify({ cells, metadata: nb.metadata, nbformat: nb.nbformat, nbformat_minor: nb.nbformat_minor }, null, 1) + "\n";
+  // Cell ids are written, which needs nbformat >= 4.5.
+  const minor = nb.nbformat === 4 ? Math.max(5, nb.nbformat_minor) : nb.nbformat_minor;
+  return JSON.stringify({ ...nb.extra, cells, metadata: nb.metadata, nbformat: nb.nbformat, nbformat_minor: minor }, null, 1) + "\n";
 }
 
 /** Apply a kernel output item to a cell's output list (nbformat shape). */
@@ -85,14 +94,15 @@ function applyOutput(outputs: NbOutput[], it: OutputItem): NbOutput[] {
     case "clear": return [];
     case "stream": {
       const last = outputs[outputs.length - 1];
-      if (last && last.output_type === "stream" && last.name === it.name) return [...outputs.slice(0, -1), { ...last, text: last.text + it.text }];
-      return [...outputs, { output_type: "stream", name: it.name, text: it.text }];
+      if (last && last.output_type === "stream" && last.name === it.name) return [...outputs.slice(0, -1), { ...last, text: appendStreamText(last.text, it.text) }];
+      return [...outputs, { output_type: "stream", name: it.name, text: appendStreamText("", it.text) }];
     }
     case "result": return [...outputs, { output_type: "execute_result", data: it.data, metadata: {}, execution_count: it.count }];
     case "display": {
       if (it.update && it.displayId) {
         const i = outputs.findIndex((o) => o.output_type === "display_data" && (o.metadata as any)?.display_id === it.displayId);
-        if (i >= 0) return outputs.map((o, j) => (j === i ? { ...o, data: it.data } : o));
+        // Updates only replace: an unknown display_id is another cell's (or gone), never a new output.
+        return i >= 0 ? outputs.map((o, j) => (j === i ? { ...o, data: it.data } : o)) : outputs;
       }
       return [...outputs, { output_type: "display_data", data: it.data, metadata: it.displayId ? { display_id: it.displayId } : {} }];
     }
@@ -120,7 +130,7 @@ function CellOutputs({ outputs, collapsed, onToggle }: { outputs: NbOutput[]; co
       <button className="nb-collapse" onClick={onToggle} title="Collapse outputs" aria-label="Collapse outputs">▾</button>
       {long && <div className="nb-long-note" onClick={() => setExpandedLong(true)}>{lines} lines · click to show all</div>}
       {outputs.map((o, i) => {
-        if (o.output_type === "stream") return <pre key={i} className={`c-stream ${o.name}`} dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(o.text) }} />;
+        if (o.output_type === "stream") return <pre key={i} className={`c-stream ${o.name}`} dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(streamDisplay(o.text)) }} />;
         if (o.output_type === "error") return <pre key={i} className="c-error" dangerouslySetInnerHTML={{ __html: ansi.ansi_to_html(o.traceback.join("\n") || `${o.ename}: ${o.evalue}`) }} />;
         return <div key={i} className={o.output_type === "execute_result" ? "c-result" : "c-display"}><Output data={o.data} /></div>;
       })}
@@ -156,6 +166,10 @@ function CodeEditor({ uri, value, theme, onChange, onMount, focused }: { uri: st
     const resize = () => setH(Math.max(2 * LINE_H, editor.getContentHeight()) + 12);
     editor.onDidContentSizeChange(resize);
     resize();
+    editor.onDidChangeModelContent((ev) => {
+      const ranges = ev.isFlush ? null : bpDec.current?.getRanges();
+      if (ranges) syncBreakpointLines(uri, ranges.map((r) => r.startLineNumber));
+    });
     editor.onMouseDown((ev) => {
       if (ev.target.type !== m.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || !ev.target.position) return;
       if (ev.event.rightButton || ev.event.altKey) setStore({ bpEdit: { uri, line: ev.target.position.lineNumber } });
@@ -180,8 +194,8 @@ function MarkdownEditor({ value, theme, onChange, onDone, onMount, render }: { v
     const resize = () => setH(Math.max(3 * LINE_H, editor.getContentHeight()) + 12);
     editor.onDidContentSizeChange(resize);
     resize();
-    editor.addCommand(m.KeyMod.Shift | m.KeyCode.Enter, onDone);
-    editor.addCommand(m.KeyCode.Escape, onDone);
+    editor.addAction({ id: "pide.nb.mdDoneShiftEnter", label: "Finish Markdown Edit", keybindings: [m.KeyMod.Shift | m.KeyCode.Enter], run: () => onDone() });
+    editor.addAction({ id: "pide.nb.mdDoneEscape", label: "Finish Markdown Edit (Esc)", keybindings: [m.KeyCode.Escape], precondition: "!suggestWidgetVisible && !findWidgetVisible", run: () => onDone() });
     onMount(editor);
     editor.focus();
   };
@@ -209,6 +223,12 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const [loadError, setLoadError] = useState<string | null>(null);
   const [nb, setNb] = useState<Notebook | null>(null);
   const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+  const editVer = useRef(0); // bumped on every user edit; a save only clears dirty if it did not move
+  const savedText = useRef<string | null>(null);
+  const saving = useRef(false);
+  const checking = useRef(false);
   const [sel, setSel] = useState<string | null>(null);
   const theme = useStore((s) => s.theme);
   const kernel = useStore((s) => s.kernel);
@@ -216,7 +236,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const nbRef = useRef<Notebook | null>(null);
   nbRef.current = nb;
   // Stable notebook URI for the LSP; cells get vscode-notebook-cell:<path>#<id> like VS Code.
-  const nbUriRef = useRef<string>(path ? monaco.Uri.file(path).toString() : `untitled:Untitled-${Date.now()}.ipynb`);
+  const nbUriRef = useRef<string>(path ? monaco.Uri.file(path).toString() : `untitled:${/^nb:\/Untitled-/.test(props.api.id) ? props.api.id.slice(4) : `Untitled-${Date.now()}.ipynb`}`);
   const nbUri = nbUriRef.current;
   const cellUri = (id: string) => `vscode-notebook-cell:${nbUri.replace(/^file:\/\//, "").replace(/^untitled:/, "/")}#${id}`;
 
@@ -225,6 +245,15 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   useEffect(() => { if (nb) openNotebookDoc(nbUri, codeCells(nb)); return () => closeNotebookDoc(nbUri); }, [nb === null]);
   const structureKey = nb ? nb.cells.map((c) => c.cell_type[0] + c.id).join(",") : "";
   useEffect(() => { if (nb) syncNotebookStructure(nbUri, codeCells(nb)); }, [structureKey]);
+  // update_display_data updates every output with that display_id, in any cell. Registrations follow
+  // the outputs: they change (or are removed on unmount) whenever the set of ids does.
+  const displayIds = (nb?.cells ?? []).flatMap((c) => (c.outputs ?? []).flatMap((o) => (o.output_type === "display_data" && (o.metadata as any)?.display_id ? [String((o.metadata as any).display_id)] : []))).join("\n");
+  useEffect(() => {
+    const offs = [...new Set(displayIds ? displayIds.split("\n") : [])].map((id) => registerDisplay(id, (data) => {
+      setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.outputs?.length ? { ...c, outputs: applyOutput(c.outputs, { kind: "display", data, displayId: id, update: true }) } : c)) } : n));
+    }));
+    return () => offs.forEach((off) => off());
+  }, [displayIds]);
 
   // Debugger / go-to: reveal a cell line when asked.
   useEffect(() => {
@@ -240,16 +269,16 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   }, []);
 
   useEffect(() => {
-    if (path) readText(path).then((t) => { try { setNb(parseNotebook(t)); } catch (e) { setLoadError(`not a valid notebook: ${e}`); } }).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setLoadError(String(e)); });
+    if (path) readText(path).then((t) => { try { setNb(parseNotebook(t)); savedText.current = t; } catch (e) { setLoadError(`not a valid notebook: ${e}`); } }).catch((e) => { pushConsole({ kind: "info", text: String(e) }); setLoadError(String(e)); });
     else setNb(parseNotebook(""));
   }, []);
   useEffect(() => { props.api.setTitle((path ? path.split("/").pop()! : "untitled.ipynb") + (dirty ? " *" : "")); }, [path, dirty]);
   useEffect(() => { if (nb && !sel) setSel(nb.cells[0]?.id ?? null); }, [nb]);
 
-  const update = useCallback((fn: (nb: Notebook) => Notebook) => { setNb((n) => (n ? fn(n) : n)); setDirty(true); }, []);
+  const update = useCallback((fn: (nb: Notebook) => Notebook) => { setNb((n) => (n ? fn(n) : n)); editVer.current++; setDirty(true); }, []);
   const patchCell = useCallback((id: string, p: Partial<Cell>, markDirty = true) => {
     setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, ...p } : c)) } : n));
-    if (markDirty) setDirty(true);
+    if (markDirty) { editVer.current++; setDirty(true); }
   }, []);
 
   const doSave = async () => {
@@ -261,23 +290,58 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
       if (!p) return;
       setPath(p);
     }
-    try { await writeText(p, serializeNotebook(cur)); } catch (e) { pushConsole({ kind: "info", text: `Save failed: ${e}` }); return; }
-    setDirty(false);
+    const ver = editVer.current;
+    const text = serializeNotebook(cur);
+    saving.current = true;
+    try { await writeText(p, text); } catch (e) { pushConsole({ kind: "info", text: `Save failed: ${e}` }); return; } finally { saving.current = false; }
+    savedText.current = text;
+    if (editVer.current === ver) setDirty(false);
     pushConsole({ kind: "info", text: `Saved ${p}` });
   };
+
+  /** Compare disk with the last saved text; reload a clean notebook, ask for a dirty one. */
+  const checkReload = async () => {
+    const p = pathRef.current;
+    const cur = nbRef.current;
+    if (!p || !cur || savedText.current === null || saving.current || checking.current || cur.cells.some((c) => c.running)) return;
+    checking.current = true;
+    try {
+      const disk = await readText(p);
+      if (saving.current || disk === savedText.current) return;
+      if (disk === serializeNotebook(cur)) { savedText.current = disk; setDirty(false); return; }
+      let next: Notebook;
+      try { next = parseNotebook(disk); } catch { return; }
+      if (dirtyRef.current) {
+        savedText.current = disk; // ask once per external change
+        if (!(await confirmAsync(`${p.split("/").pop()} changed on disk. Reload and discard your unsaved edits?`))) return;
+      }
+      savedText.current = disk;
+      setNb(next);
+      editVer.current++;
+      setDirty(false);
+    } finally {
+      checking.current = false;
+    }
+  };
+  useEffect(() => { reloaders.set(props.api.id, checkReload); return () => { reloaders.delete(props.api.id); }; });
 
   const runCell = async (id: string, advance = false) => {
     const cell = nbRef.current?.cells.find((c) => c.id === id);
     if (!cell) return;
-    if (cell.cell_type === "markdown") { patchCell(id, { source: editors.current.get(id)?.getValue() ?? cell.source, editing: false }, false); if (advance) selectNext(id); return; }
+    if (cell.cell_type === "markdown") { patchCell(id, { source: cell.editing ? editors.current.get(id)?.getValue() ?? cell.source : cell.source, editing: false }, false); if (advance) selectNext(id); return "ok"; }
+    if (cell.cell_type !== "code") { if (advance) selectNext(id); return "ok"; }
     const code = editors.current.get(id)?.getValue() ?? cell.source;
     patchCell(id, { source: code, outputs: [], running: true, execution_count: null });
     if (advance) selectNext(id, true);
     try {
-      await execute(code, { echo: false, history: false, sink: (it) => {
+      const reply = await execute(code, { echo: false, history: false, sink: (it) => {
         if (it.kind === "count") patchCell(id, { execution_count: it.count, running: false }, false);
         else setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, outputs: applyOutput(c.outputs ?? [], it) } : c)) } : n));
       } });
+      return (reply?.status ?? "ok") as string;
+    } catch (e) {
+      pushConsole({ kind: "info", text: `Cell execution failed: ${e}` });
+      return "error";
     } finally {
       patchCell(id, { running: false }, false);
     }
@@ -316,8 +380,8 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   };
   const toggleAllOutputs = () => { const anyOpen = (nbRef.current?.cells ?? []).some((c) => c.cell_type === "code" && (c.outputs?.length ?? 0) > 0 && !c.collapsed); update((n) => ({ ...n, cells: n.cells.map((c) => (c.cell_type === "code" ? { ...c, collapsed: anyOpen } : c)) })); };
 
-  const runAll = async () => { for (const c of nbRef.current?.cells ?? []) await runCell(c.id); };
-  const runAbove = async (id: string) => { for (const c of nbRef.current?.cells ?? []) { if (c.id === id) break; await runCell(c.id); } };
+  const runAll = async () => { for (const c of nbRef.current?.cells ?? []) if ((await runCell(c.id)) !== "ok") break; };
+  const runAbove = async (id: string) => { for (const c of nbRef.current?.cells ?? []) { if (c.id === id) break; if ((await runCell(c.id)) !== "ok") break; } };
 
   const selectNext = (id: string, createIfLast = false) => {
     const cells = nbRef.current?.cells ?? [];
@@ -354,16 +418,18 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
 
   const onEditorMount = (id: string) => (editor: monaco.editor.IStandaloneCodeEditor) => {
     editors.current.set(id, editor);
+    editor.onDidDispose(() => { if (editors.current.get(id) === editor) editors.current.delete(id); });
     const lint = () => { const model = editor.getModel(); if (model) scheduleLint(monaco, model, "cell.py"); };
     lint();
     editor.onDidChangeModelContent(() => { queueDocumentChange(cellUri(id), () => editor.getValue(), (t) => changeNotebookCell(nbUri, cellUri(id), t)); lint(); });
     editor.onDidFocusEditorText(() => setSel(id));
-    editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => runCell(id, true));
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCell(id, false));
-    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.Enter, () => { runCell(id, false); addCell("code", id, "below"); });
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => doSave());
-    editor.addCommand(monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF, () => formatCellById(id));
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO, () => { const c = nbRef.current?.cells.find((x) => x.id === id); if (c) patchCell(id, { collapsed: !c.collapsed }); });
+    const act = (aid: string, label: string, keybindings: number[], run: () => unknown) => editor.addAction({ id: aid, label, keybindings, run: () => { run(); } });
+    act("pide.nb.runAdvance", "Run Cell and Advance", [monaco.KeyMod.Shift | monaco.KeyCode.Enter], () => runCell(id, true));
+    act("pide.nb.run", "Run Cell", [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter], () => runCell(id, false));
+    act("pide.nb.runInsert", "Run Cell and Insert Below", [monaco.KeyMod.Alt | monaco.KeyCode.Enter], () => { runCell(id, false); addCell("code", id, "below"); });
+    act("pide.nb.save", "Save Notebook", [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS], () => doSave());
+    act("pide.nb.formatCell", "Format Cell", [monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF], () => formatCellById(id));
+    act("pide.nb.toggleOutputs", "Toggle Cell Outputs", [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO], () => { const c = nbRef.current?.cells.find((x) => x.id === id); if (c) patchCell(id, { collapsed: !c.collapsed }); });
   };
 
   const md = useMemo(() => (src: string) => safeHtml(marked.parse(src, { async: false }) as string), []);
@@ -413,7 +479,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
               ) : c.cell_type === "markdown" && (c.editing || !c.source.trim()) ? (
                 <MarkdownEditor value={c.source} theme={monacoTheme} render={md}
                   onChange={(v) => patchCell(c.id, { source: v })}
-                  onMount={(e) => editors.current.set(c.id, e)}
+                  onMount={(e) => { editors.current.set(c.id, e); e.onDidDispose(() => { if (editors.current.get(c.id) === e) editors.current.delete(c.id); }); }}
                   onDone={() => { patchCell(c.id, { editing: false }, false); if (nbRef.current?.cells.find((x) => x.id === c.id)?.source.trim()) selectNext(c.id, true); }} />
               ) : c.editing || !c.source.trim() ? (
                 <textarea className="nb-md-edit" value={c.source} autoFocus placeholder="Raw cell" rows={Math.max(2, c.source.split("\n").length)}

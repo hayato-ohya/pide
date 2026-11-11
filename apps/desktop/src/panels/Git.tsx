@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { pushConsole, useStore } from "../store";
+import { reloadOpenFiles } from "../reload";
 import { gitCall, layoutGraph, refreshGit, type Commit, type FileDiff, type StatusEntry } from "../git";
 import { openConflict, openDiff } from "../layout";
 import { usePanelVisible } from "../visibility";
@@ -24,13 +25,13 @@ function Section({ title, entries, actions, onOpen }: { title: string; entries: 
     <div className="git-section">
       <div className="git-section-h" onClick={() => setOpen(!open)}>
         <span role="button" tabIndex={0} aria-expanded={open} onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); setOpen(!open); } }}>{open ? "▾" : "▸"} {title} <span className="muted">({entries.length})</span></span>
-        <span className="git-actions">{actions.map((a) => <button key={a.label} className={a.danger ? "danger" : ""} onClick={(ev) => { ev.stopPropagation(); a.fn(entries.map((e) => e.path)); }}>{a.label} all</button>)}</span>
+        <span className="git-actions">{actions.map((a) => <button key={a.label} className={a.danger ? "danger" : ""} onClick={(ev) => { ev.stopPropagation(); a.fn(entries.flatMap((e) => (e.old_path ? [e.old_path, e.path] : [e.path]))); }}>{a.label} all</button>)}</span>
       </div>
       {open && entries.map((e) => (
         <div key={e.area + e.path} className="git-file" tabIndex={0} onDoubleClick={() => onOpen(e)} onKeyDown={(ev) => { if (ev.key === "Enter") onOpen(e); }}>
           <span className={`git-code c-${e.code[0]}`}>{e.code}</span>
-          <span className="git-path" title={e.path}>{e.path}</span>
-          <span className="git-actions">{actions.map((a) => <button key={a.label} className={a.danger ? "danger" : ""} onClick={() => a.fn([e.path])}>{a.label}</button>)}</span>
+          <span className="git-path" title={e.old_path ? `${e.old_path} → ${e.path}` : e.path}>{e.old_path ? `${e.old_path} → ${e.path}` : e.path}</span>
+          <span className="git-actions">{actions.map((a) => <button key={a.label} className={a.danger ? "danger" : ""} onClick={() => a.fn(e.old_path ? [e.old_path, e.path] : [e.path])}>{a.label}</button>)}</span>
         </div>
       ))}
     </div>
@@ -64,6 +65,7 @@ export default function Git(props: IDockviewPanelProps) {
     } finally {
       setBusy(null);
       refreshGit();
+      reloadOpenFiles();
     }
   };
   const addRemote = async () => {
@@ -96,10 +98,11 @@ export default function Git(props: IDockviewPanelProps) {
       }
     }
     refreshGit();
+    reloadOpenFiles();
   };
   const mergeBranch = async () => {
-    await loadBranches();
-    const name = await promptAsync("Merge branch into " + (st?.branch ?? "HEAD"), "", branches.find((b) => !b.current && !b.remote)?.name ?? "");
+    const bs = await loadBranches();
+    const name = await promptAsync("Merge branch into " + (st?.branch ?? "HEAD"), "", bs.find((b) => !b.current && !b.remote)?.name ?? "");
     if (name) net(`merge ${name}`, "git_merge", { branch: name });
   };
   const opLabel = { merge: "Merge", rebase: "Rebase", cherrypick: "Cherry-pick", revert: "Revert", bisect: "Bisect", other: "Operation", clean: "" }[st?.state ?? "clean"];
@@ -112,14 +115,28 @@ export default function Git(props: IDockviewPanelProps) {
   };
   const selectCommit = async (c: Commit) => {
     setSel(c.id);
-    setFiles(await invoke<FileDiff[]>("git_commit_diff", { cwd, id: c.id }).catch(() => []));
+    const req = ++selReq.current;
+    const f = await invoke<FileDiff[]>("git_commit_diff", { cwd, id: c.id }).catch(() => []);
+    if (req === selReq.current) setFiles(f);
   };
+  const selReq = useRef(0);
+  const committing = useRef(false);
+  const canCommit = st?.state === "clean" && (staged.length > 0 || amend);
   const commit = async () => {
-    if (!msg.trim() && !amend) return;
-    const id = await gitCall<string>("git_commit", { message: msg, amend });
-    if (id) { setMsg(""); setAmend(false); }
+    if (committing.current || !canCommit || (!msg.trim() && !amend)) return;
+    committing.current = true;
+    try {
+      const id = await gitCall<string>("git_commit", { message: msg, amend });
+      if (id) { setMsg(""); setAmend(false); }
+    } finally {
+      committing.current = false;
+    }
   };
-  const loadBranches = async () => setBranches((await invoke<any[]>("git_branches", { cwd }).catch(() => [])) ?? []);
+  const loadBranches = async () => {
+    const bs = (await invoke<any[]>("git_branches", { cwd }).catch(() => [])) ?? [];
+    setBranches(bs);
+    return bs as { name: string; remote: boolean; current: boolean }[];
+  };
 
   const remoteKernel = useStore((s) => !!(s.remote || s.connectionFile));
   if (remoteKernel) return <div className="git"><div className="center muted">Git is not available while a remote kernel is selected (the Current Folder shows the remote machine).</div></div>;
@@ -152,7 +169,7 @@ export default function Git(props: IDockviewPanelProps) {
           ) : (
             <>
               <button disabled={!!busy} onClick={() => net("fetch", "git_fetch")} title="git fetch --all --prune">{busy === "fetch" ? "…" : "⇣ Fetch"}</button>
-              <button disabled={!!busy || !st?.upstream} onClick={() => net("pull", "git_pull", { rebase: false })} title={st?.upstream ? "git pull --ff-only (Shift-click: --rebase)" : "No upstream branch"}
+              <button disabled={!!busy || !st?.upstream} onClick={() => net("pull", "git_pull", { rebase: false })} title={st?.upstream ? "git pull --ff-only (right-click: --rebase)" : "No upstream branch"}
                 onContextMenu={(e) => { e.preventDefault(); net("pull --rebase", "git_pull", { rebase: true }); }}>{busy?.startsWith("pull") ? "…" : `⇩ Pull${st?.behind ? ` ${st.behind}` : ""}`}</button>
               <button disabled={!!busy} onClick={() => net(st?.upstream ? "push" : "push -u", "git_push", { setUpstream: st?.upstream ? null : st?.branch, force: false })}
                 title={st?.upstream ? "git push (right-click: --force-with-lease)" : `Publish ${st?.branch} to origin`}
@@ -185,7 +202,7 @@ export default function Git(props: IDockviewPanelProps) {
               onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) commit(); }} />
             <div className="git-commit-row">
               <label><input type="checkbox" checked={amend} onChange={(e) => setAmend(e.target.checked)} /> amend</label>
-              <button className="primary" disabled={!staged.length && !amend} onClick={commit}>Commit{staged.length ? ` ${staged.length} file${staged.length > 1 ? "s" : ""}` : ""}</button>
+              <button className="primary" disabled={!canCommit} title={st && st.state !== "clean" ? "Use Continue in the banner above to finish the operation" : undefined} onClick={commit}>Commit{staged.length ? ` ${staged.length} file${staged.length > 1 ? "s" : ""}` : ""}</button>
             </div>
           </div>
           <div className="git-lists">

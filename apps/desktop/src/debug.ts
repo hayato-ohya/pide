@@ -42,7 +42,7 @@ export interface DebugState {
   /** Details when stopped on an exception. */
   exceptionInfo: { id: string; description: string; details?: string } | null;
   /** DAP temp file (dumpCell) → { uri, startLine } so stops map back to the editor */
-  cellFiles: Record<string, { uri: string; path: string | null; startLine: number }>;
+  cellFiles: Record<string, { uri: string; path: string | null; startLine: number; lineCount: number }>;
   scopes: { name: string; variablesReference: number }[];
   variables: DapVar[];
 }
@@ -60,8 +60,15 @@ export async function dap(command: string, args: Record<string, unknown> = {}): 
 }
 
 /** Start debugpy inside the kernel and push all known breakpoints. */
-export async function startDebugger() {
-  if (get().debug.active) return;
+let starting: Promise<void> | null = null;
+export function startDebugger(): Promise<void> {
+  if (get().debug.active) return Promise.resolve();
+  // Shared in-flight start: a double click must not send initialize / attach twice.
+  if (!starting) starting = startDebuggerInner().finally(() => (starting = null));
+  return starting;
+}
+
+async function startDebuggerInner() {
   if (get().kernel === "stopped" || get().kernel === "dead") { const k = await import("./kernel"); await k.startKernel(); }
   try {
     await dap("initialize", { clientID: "pide", clientName: "Pide", adapterID: "python", pathFormat: "path", linesStartAt1: true, columnsStartAt1: true, supportsVariableType: true, supportsRunInTerminalRequest: false, locale: "en" });
@@ -105,13 +112,36 @@ export function setExceptionFilters(ex: { uncaught: boolean; raised: boolean }) 
   if (get().debug.active) pushExceptionFilters();
 }
 
+/** Breakpoints of an editor buffer that fall inside a dumped cell, in the cell file's own line numbers. */
+function cellBreakpoints(editorPath: string, startLine: number, lineCount: number): Breakpoint[] {
+  return (get().debug.breakpoints[editorPath] ?? []).filter((b) => b.line >= startLine && b.line < startLine + lineCount).map((b) => ({ ...b, line: b.line - startLine + 1 }));
+}
+/** Keep breakpoints of cells currently tracked as debugpy temp files in sync with the editor. */
+function pushCellBreakpoints(editorPath: string) {
+  for (const [file, c] of Object.entries(get().debug.cellFiles)) {
+    if (c.uri === editorPath) pushBreakpoints(file, cellBreakpoints(editorPath, c.startLine, c.lineCount)).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
+  }
+}
+
 function saveBreakpoints(editorPath: string, list: Breakpoint[]) {
   const bp = { ...get().debug.breakpoints };
   if (list.length) bp[editorPath] = [...list].sort((a, b) => a.line - b.line); else delete bp[editorPath];
   patch({ breakpoints: bp });
   const persist = Object.fromEntries(Object.entries(bp).filter(([k]) => !k.startsWith("untitled:") && !k.includes("/Untitled-")));
   localStorage.setItem("pide.breakpoints", JSON.stringify(persist));
-  if (get().debug.active && !editorPath.startsWith("untitled:") && !editorPath.startsWith("vscode-notebook-cell:")) pushBreakpoints(editorPath, bp[editorPath] ?? []).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
+  if (!get().debug.active) return;
+  if (!editorPath.startsWith("untitled:") && !editorPath.startsWith("vscode-notebook-cell:")) pushBreakpoints(editorPath, bp[editorPath] ?? []).catch((e) => pushConsole({ kind: "info", text: `breakpoints: ${e}` }));
+  pushCellBreakpoints(editorPath);
+}
+
+/** Follow edits: `lines[i]` is the tracked (decoration) line of the i-th stored breakpoint. */
+export function syncBreakpointLines(editorPath: string, lines: number[]) {
+  const list = get().debug.breakpoints[editorPath];
+  if (!list || list.length !== lines.length || list.every((b, i) => b.line === lines[i])) return;
+  const seen = new Set<number>();
+  const next: Breakpoint[] = [];
+  list.forEach((b, i) => { if (!seen.has(lines[i])) { seen.add(lines[i]); next.push({ ...b, line: lines[i] }); } });
+  saveBreakpoints(editorPath, next);
 }
 
 export function toggleBreakpoint(editorPath: string, line: number) {
@@ -132,6 +162,7 @@ export function getBreakpoint(editorPath: string, line: number): Breakpoint | un
 
 export function clearBreakpoints() {
   for (const p of Object.keys(get().debug.breakpoints)) if (get().debug.active && !p.startsWith("untitled:") && !p.startsWith("vscode-notebook-cell:")) pushBreakpoints(p, []).catch(() => {});
+  if (get().debug.active) for (const f of Object.keys(get().debug.cellFiles)) pushBreakpoints(f, []).catch(() => {});
   patch({ breakpoints: {} });
   localStorage.setItem("pide.breakpoints", "{}");
 }
@@ -148,10 +179,15 @@ export async function debugFile(path: string) {
 export async function debugCell(code: string, editorPath: string, startLine: number, sink?: (item: import("./kernel").OutputItem) => void) {
   await startDebugger();
   if (!get().debug.active) return;
-  const { sourcePath } = await dap("dumpCell", { code });
-  const bps = (get().debug.breakpoints[editorPath] ?? []).filter((b) => b.line >= startLine && b.line < startLine + code.split("\n").length).map((b) => ({ ...b, line: b.line - startLine + 1 }));
-  patch({ cellFiles: { ...get().debug.cellFiles, [sourcePath]: { uri: editorPath, path: uriToPath(editorPath), startLine } } });
-  await pushBreakpoints(sourcePath, bps);
+  try {
+    const { sourcePath } = await dap("dumpCell", { code });
+    const lineCount = code.split("\n").length;
+    patch({ cellFiles: { ...get().debug.cellFiles, [sourcePath]: { uri: editorPath, path: uriToPath(editorPath), startLine, lineCount } } });
+    await pushBreakpoints(sourcePath, cellBreakpoints(editorPath, startLine, lineCount));
+  } catch (e) {
+    pushConsole({ kind: "info", text: `Debug cell: ${e}` });
+    return;
+  }
   await execute(code, sink ? { echo: false, history: false, sink } : {});
 }
 
@@ -180,11 +216,13 @@ export function frameLabel(path: string | null, line: number): string {
 }
 
 export async function selectFrame(frameId: number) {
+  const gen = stopGen;
   patch({ frameId });
   try {
     const { scopes } = await dap("scopes", { frameId });
     const locals = scopes.find((s: any) => /local/i.test(s.name)) ?? scopes[0];
     const vars = locals ? await fetchVariables(locals.variablesReference) : [];
+    if (gen !== stopGen || get().debug.frameId !== frameId) return; // resumed or another frame chosen meanwhile
     patch({ scopes, variables: vars });
   } catch (e) {
     pushConsole({ kind: "info", text: `scopes: ${e}` });
@@ -196,29 +234,37 @@ export async function fetchVariables(ref: number): Promise<DapVar[]> {
   return (variables as DapVar[]).filter((v) => !["special variables", "function variables", "class variables"].includes(v.name));
 }
 
+/** Bumped on every stop / resume: async work for an older stop discards its results. */
+let stopGen = 0;
+const stale = (gen: number) => gen !== stopGen || !get().debug.active;
+
 /** Called from the kernel bridge for every iopub debug_event. */
 export async function onDebugEvent(ev: { event: string; body: any }) {
   const d = get().debug;
   switch (ev.event) {
     case "stopped": {
+      const gen = ++stopGen;
       const threadId = ev.body.threadId ?? d.threadId ?? 1;
       try {
         const { stackFrames } = await dap("stackTrace", { threadId });
+        if (stale(gen)) return;
         const frames: Frame[] = (stackFrames as any[]).map((f) => ({ id: f.id, name: f.name, path: f.source?.path ?? null, line: f.line, column: f.column }));
         let exceptionInfo: DebugState["exceptionInfo"] = null;
         if (ev.body.reason === "exception") {
           const info = await dap("exceptionInfo", { threadId }).catch(() => null);
           if (info) exceptionInfo = { id: (info.details?.typeName ?? info.exceptionId ?? "Exception").split(" ")[0], description: info.description ?? "", details: info.details?.stackTrace };
+          if (stale(gen)) return;
           pushConsole({ kind: "info", text: `Stopped on exception: ${exceptionInfo?.id ?? ""} ${exceptionInfo?.description ?? ""}`.trim() });
         }
         patch({ stopped: true, threadId, reason: ev.body.reason, frames, exceptionInfo });
         if (frames[0]) {
           await selectFrame(frames[0].id);
+          if (stale(gen)) return;
           const m = editorPathFor(frames[0].path);
           if (m) import("./layout").then((l) => l.revealInEditor(m.uri, m.line(frames[0].line)));
         }
       } catch (e) {
-        pushConsole({ kind: "info", text: `stackTrace: ${e}` });
+        if (!stale(gen)) pushConsole({ kind: "info", text: `stackTrace: ${e}` });
       }
       return;
     }
@@ -230,10 +276,12 @@ export async function onDebugEvent(ev: { event: string; body: any }) {
       return;
     }
     case "continued":
-      patch({ stopped: false, frames: [], frameId: null, variables: [], exceptionInfo: null });
+      stopGen++;
+      patch({ stopped: false, threadId: null, frames: [], frameId: null, variables: [], exceptionInfo: null });
       return;
     case "terminated":
     case "exited":
+      stopGen++;
       patch({ active: false, stopped: false, frames: [], frameId: null, variables: [] });
       return;
   }

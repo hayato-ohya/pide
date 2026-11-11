@@ -14,6 +14,7 @@
   --muted: #9a9aa3;
   --changed-bg: #3a2f1a;
   --changed-fg: #f0b35a;
+  --renamed-fg: #c792ea;
   --error: #ff6b6b;
   --ok: #7cd67c;
   --debug-line: #4a3f1a;
@@ -39,6 +40,7 @@
   --muted: #6b6b6b;
   --changed-bg: #fff7e6;
   --changed-fg: #b35a00;
+  --renamed-fg: #6a1b9a;
   --error: #b00020;
   --ok: #2e7d32;
   --debug-line: #fff3cd;
@@ -221,7 +223,7 @@ button, select, input { font: inherit; }
 .git-actions button { font-size: 10.5px; padding: 1px 6px; border: 1px solid var(--border); background: var(--panel); border-radius: 3px; cursor: pointer; }
 .git-actions button.danger { color: var(--error); }
 .git-code { font-family: var(--mono); font-weight: 700; width: 16px; text-align: center; }
-.c-M { color: var(--changed-fg); } .c-A { color: var(--ok); } .c-D { color: var(--error); } .c-R { color: #6a1b9a; } .c-\? { color: var(--ok); } .c-U { color: var(--error); }
+.c-M { color: var(--changed-fg); } .c-A { color: var(--ok); } .c-D { color: var(--error); } .c-R { color: var(--renamed-fg); } .c-\? { color: var(--ok); } .c-U { color: var(--error); }
 .git-badge { margin-left: 6px; font-family: var(--mono); font-weight: 700; font-size: 11px; }
 .git-log { flex: 1; overflow: auto; }
 .git-row { display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 6px; white-space: nowrap; cursor: default; }

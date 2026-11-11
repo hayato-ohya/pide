@@ -33,6 +33,15 @@ export default function ImageView({ path, generation }: { path: string; generati
   const [hover, setHover] = useState<string>("");
   const canvas = useRef<HTMLCanvasElement>(null);
   const wrap = useRef<HTMLDivElement>(null);
+  const [wrapSize, setWrapSize] = useState({ w: 600, h: 400 });
+  useEffect(() => {
+    const el = wrap.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setWrapSize({ w: el.clientWidth, h: el.clientHeight }));
+    ro.observe(el);
+    setWrapSize({ w: el.clientWidth, h: el.clientHeight });
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     setError(null);
@@ -73,13 +82,12 @@ export default function ImageView({ path, generation }: { path: string; generati
       }
     }
     ctx.putImageData(out, 0, 0);
-  }, [img, bytes, cmap]);
+  }, [img, bytes, cmap, error]);
 
   const scale = useMemo(() => {
     if (!img || zoom !== "fit") return typeof zoom === "number" ? zoom : 1;
-    const w = wrap.current?.clientWidth ?? 600, h = wrap.current?.clientHeight ?? 400;
-    return Math.max(0.05, Math.min((w - 20) / img.w, (h - 20) / img.h));
-  }, [img, zoom]);
+    return Math.max(0.05, Math.min((wrapSize.w - 20) / img.w, (wrapSize.h - 20) / img.h));
+  }, [img, zoom, wrapSize]);
 
   const onMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!img || !bytes) return;
@@ -94,24 +102,25 @@ export default function ImageView({ path, generation }: { path: string; generati
     setHover(`[${y * s}, ${x * s}] ${val}`);
   };
 
-  if (error) return <div className="vv-error">{error}</div>;
-  if (!img) return <div className="vv-loading">Rendering {path}…</div>;
+  const layoutSel = <label>layout <select value={layout} onChange={(e) => { setLayout(e.target.value); setIndex([]); }}><option value="auto">auto</option><option value="HW">HW</option><option value="HWC">HWC</option><option value="CHW">CHW</option></select></label>;
   return (
     <div className="imgview">
       <div className="panel-toolbar">
-        <span className="muted">{img.shape.join("×")} {img.dtype} · {img.layout}{img.step > 1 ? ` · ↓${img.step}` : ""}</span>
-        <label>layout <select value={layout} onChange={(e) => { setLayout(e.target.value); setIndex([]); }}><option value="auto">auto</option><option value="HW">HW</option><option value="HWC">HWC</option><option value="CHW">CHW</option></select></label>
-        {img.channels === 1 && <label>cmap <select value={cmap} onChange={(e) => setCmap(e.target.value)}>{Object.keys(STOPS).map((k) => <option key={k}>{k}</option>)}</select></label>}
-        <label>min <input className="small" value={range.vmin} placeholder={img.vmin.toPrecision(4)} onChange={(e) => setRange({ ...range, vmin: e.target.value })} /></label>
-        <label>max <input className="small" value={range.vmax} placeholder={img.vmax.toPrecision(4)} onChange={(e) => setRange({ ...range, vmax: e.target.value })} /></label>
+        {img && <span className="muted">{img.shape.join("×")} {img.dtype} · {img.layout}{img.step > 1 ? ` · ↓${img.step}` : ""}</span>}
+        {layoutSel}
+        {img && img.channels === 1 && <label>cmap <select value={cmap} onChange={(e) => setCmap(e.target.value)}>{Object.keys(STOPS).map((k) => <option key={k}>{k}</option>)}</select></label>}
+        <label>min <input className="small" value={range.vmin} placeholder={img ? img.vmin.toPrecision(4) : ""} onChange={(e) => setRange({ ...range, vmin: e.target.value })} /></label>
+        <label>max <input className="small" value={range.vmax} placeholder={img ? img.vmax.toPrecision(4) : ""} onChange={(e) => setRange({ ...range, vmax: e.target.value })} /></label>
         <label>zoom <select value={String(zoom)} onChange={(e) => setZoom(e.target.value === "fit" ? "fit" : Number(e.target.value))}><option value="fit">fit</option><option value="0.5">50%</option><option value="1">100%</option><option value="2">200%</option><option value="4">400%</option><option value="8">800%</option></select></label>
-        {img.extra.map((n, i) => (
+        {img?.extra.map((n, i) => (
           <label key={i} className="vv-dim">axis {i}: <input type="number" min={0} max={n - 1} value={index[i] ?? 0} onChange={(e) => { const ni = [...index]; while (ni.length < img.extra.length) ni.push(0); ni[i] = Math.max(0, Math.min(n - 1, +e.target.value)); setIndex(ni); }} /><span className="muted">/{n}</span></label>
         ))}
         <span className="muted hover">{hover}</span>
       </div>
       <div className="imgview-wrap" ref={wrap}>
-        <canvas ref={canvas} onMouseMove={onMove} onMouseLeave={() => setHover("")} style={{ width: img.w * scale, height: img.h * scale, imageRendering: scale >= 2 ? "pixelated" : "auto" }} />
+        {error ? <div className="vv-error">{error}</div>
+          : !img ? <div className="vv-loading">Rendering {path}…</div>
+          : <canvas ref={canvas} onMouseMove={onMove} onMouseLeave={() => setHover("")} style={{ width: img.w * scale, height: img.h * scale, imageRendering: scale >= 2 ? "pixelated" : "auto" }} />}
       </div>
     </div>
   );

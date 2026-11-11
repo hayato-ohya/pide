@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { setCwd } from "../kernel";
 import { useStore } from "../store";
 import { openFile } from "../layout";
@@ -35,16 +35,22 @@ export default function Files(props: IDockviewPanelProps) {
   const [cursor, setCursor] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const reqId = useRef(0);
+  const [draft, setDraft] = useState<string | null>(null); // path being typed; committed on Enter/blur
   const load = async () => {
     if (!cwd) return;
     if (isRemote() && kernel !== "idle") return; // remote listing needs the kernel
+    const my = ++reqId.current;
     try {
-      setEntries(await listDir(cwd));
+      const list = await listDir(cwd);
+      if (my !== reqId.current) return; // a newer request superseded this one
+      setEntries(list);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      if (my === reqId.current) setError(String(e));
     }
   };
+  const commitPath = () => { if (draft !== null && draft !== cwd && draft.trim()) setCwd(draft.trim()); setDraft(null); };
   useEffect(() => {
     if (!active) return; // hidden panels do not poll; reload on reveal
     load();
@@ -64,7 +70,8 @@ export default function Files(props: IDockviewPanelProps) {
       <div className="files-path">
         {(remote || connectionFile) && <span className="files-remote" title="Browsing the kernel's machine">{remote?.host ?? "remote"}</span>}
         <button onClick={up} title="Up one level" aria-label="Up one level">↑</button>
-        <input aria-label="Current folder" value={cwd ?? ""} onChange={(e) => setCwd(e.target.value)} spellCheck={false} />
+        <input aria-label="Current folder" value={draft ?? cwd ?? ""} onChange={(e) => setDraft(e.target.value)} onBlur={commitPath}
+          onKeyDown={(e) => { if (e.nativeEvent.isComposing || e.keyCode === 229) return; if (e.key === "Enter") { e.preventDefault(); commitPath(); } else if (e.key === "Escape") setDraft(null); }} spellCheck={false} />
       </div>
       {error && <div className="c-info">{error}</div>}
       <table className="grid" aria-label="Files" onKeyDown={(e) => {

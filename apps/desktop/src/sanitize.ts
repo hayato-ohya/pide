@@ -5,7 +5,7 @@ import DOMPurify from "dompurify";
 
 const cfg = {
   USE_PROFILES: { html: true, svg: true, svgFilters: true, mathMl: true },
-  FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
+  FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link", "style"],
   FORBID_ATTR: ["srcdoc", "formaction"],
   ADD_ATTR: ["target"],
   ALLOW_UNKNOWN_PROTOCOLS: false,
