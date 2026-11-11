@@ -69,6 +69,12 @@ pub struct Kernel {
 impl Drop for Kernel {
     fn drop(&mut self) {
         self.cancel.cancel();
+        // kill_on_drop only reaches the kernel itself; take its process group with it.
+        if !self.remote {
+            if let Some(pid) = self.child.get_mut().as_ref().and_then(|c| c.id()) {
+                platform::kill_group(pid);
+            }
+        }
     }
 }
 
@@ -86,6 +92,7 @@ impl Kernel {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         platform::quiet(&mut cmd);
+        platform::own_process_group(&mut cmd);
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -116,8 +123,9 @@ impl Kernel {
     /// Start a kernel on a remote host over SSH and tunnel its ports.
     ///
     /// 1. upload the `pide_kernel` helper (single file) to `~/.pide`
-    /// 2. run a bootstrap that picks free ports, prints the connection info
-    ///    and execs ipykernel (that SSH session stays open for its lifetime)
+    /// 2. run a bootstrap that picks free ports, starts ipykernel, prints the
+    ///    connection info once it listens and supervises it (that SSH session,
+    ///    with its stdin held open by us, stays open for the kernel's lifetime)
     /// 3. open a second SSH session with `-L` forwards for the five ports
     pub async fn launch_remote(spec: launch::RemoteSpec, helper_src: &str) -> Result<Arc<Kernel>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -129,6 +137,7 @@ impl Kernel {
             let mut a = vec![
                 "-o".into(), "BatchMode=yes".into(),
                 "-o".into(), "ServerAliveInterval=15".into(),
+                "-o".into(), "ServerAliveCountMax=3".into(),
                 "-o".into(), "ConnectTimeout=15".into(),
             ];
             if let Some(p) = s.port { a.push("-p".into()); a.push(p.to_string()); }
@@ -153,31 +162,21 @@ impl Kernel {
             anyhow::bail!("ssh upload failed ({}): {}", st.status, String::from_utf8_lossy(&st.stderr).trim());
         }
 
-        // 2. remote bootstrap: free ports → connection file → exec ipykernel
+        // 2. remote bootstrap: free ports → connection file → ipykernel as its child.  The
+        // bootstrap stays alive as the kernel's parent: it prints PIDE_CONN only once the
+        // kernel listens, and stops the kernel and removes the connection file when its
+        // stdin (our ssh session) reaches EOF — also when the app crashes, since OpenSSH
+        // does not end the remote command on its own.
         let cwd = spec.cwd.clone().unwrap_or_else(|| "~".into());
-        let bootstrap = r#"import json,os,socket,sys,uuid
-ls=[socket.socket() for _ in range(5)]
-for s in ls: s.bind(("127.0.0.1",0))
-ports=[s.getsockname()[1] for s in ls]
-for s in ls: s.close()
-info={"transport":"tcp","ip":"127.0.0.1","shell_port":ports[0],"iopub_port":ports[1],"stdin_port":ports[2],"control_port":ports[3],"hb_port":ports[4],"key":uuid.uuid4().hex,"signature_scheme":"hmac-sha256","kernel_name":"python3"}
-d=os.path.expanduser("~/.pide/run"); os.makedirs(d,exist_ok=True)
-f=os.path.join(d,"kernel-%d.json"%os.getpid()); json.dump(info,open(f,"w"))
-print("PIDE_CONN:"+json.dumps(info),flush=True)
-os.environ["PYTHONPATH"]=os.path.expanduser("~/.pide")+os.pathsep+os.environ.get("PYTHONPATH","")
-os.environ.setdefault("MPLBACKEND","module://matplotlib_inline.backend_inline")
-# Let ipykernel's ParentPollerUnix exit the kernel as soon as its parent (the SSH session shell,
-# or the app when this bootstrap runs locally) goes away, however the parent dies.
-os.environ["JPY_PARENT_PID"]=str(os.getppid())
-os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
-        let b64 = b64encode(bootstrap.as_bytes());
+        let b64 = b64encode(REMOTE_BOOTSTRAP.as_bytes());
         // cwd is handed to Python (expanduser + chdir) so no shell quoting of user paths is needed.
         let cwd_b64 = b64encode(cwd.as_bytes());
-        // `exec` replaces the login shell with Python so the kernel is a direct child of the SSH
-        // session: no intermediate `sh` survives to keep an orphaned kernel alive.
+        // `exec` replaces the login shell with Python so no intermediate shell survives.  Values
+        // travel as argv (base64 is shell-safe) and the code has no `$`, `!` or backquotes, so
+        // this parses the same in sh/bash/zsh, csh/tcsh and fish login shells.
         let remote_cmd = format!(
-            "PIDE_CWD_B64={} exec {} -c \"import base64,os;os.chdir(os.path.expanduser(base64.b64decode(os.environ['PIDE_CWD_B64']).decode()));exec(base64.b64decode('{}'))\"",
-            cwd_b64, shell_quote(&spec.python), b64
+            "exec {} -c \"import base64,os,sys;os.chdir(os.path.expanduser(base64.b64decode(sys.argv[1]).decode()));exec(base64.b64decode(sys.argv[2]))\" {} {}",
+            shell_quote(&spec.python), cwd_b64, b64
         );
         let mut run = Command::new(&ssh);
         run.args(base_args(&spec)).arg("--").arg(&spec.host).arg(&remote_cmd)
@@ -223,17 +222,20 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         let mut tun = Command::new(&ssh);
         // ExitOnForwardFailure: a port that cannot be forwarded ends ssh instead of leaving a
         // tunnel that silently drops that channel.
-        tun.args(base_args(&spec)).args(["-o", "ExitOnForwardFailure=yes", "-N"]);
+        tun.args(base_args(&spec)).args(["-o", "ExitOnForwardFailure=yes"]);
         for (l, r) in pairs {
             tun.arg("-L").arg(format!("127.0.0.1:{l}:127.0.0.1:{r}"));
         }
-        tun.arg("--").arg(&spec.host).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+        // Not `-N`: a remote `cat` that ends on stdin EOF ties the tunnel to the stdin pipe we
+        // keep open in `tun_child`, so it also goes away when the app dies (an `ssh -N` would
+        // be orphaned and keep running).
+        tun.arg("--").arg(&spec.host).arg("cat >/dev/null")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut tun_child = platform::quiet(&mut tun).spawn().context("ssh (tunnel)")?;
         if let Some(err) = tun_child.stderr.take() {
             tokio::spawn(pipe_log("tunnel.stderr", err, None));
         }
-        // give the tunnel a moment to bind
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // No fixed sleep: connect_channels retries until the tunnel forwards.
 
         let info = ConnectionInfo { key: remote_info.key.clone(), signature_scheme: remote_info.signature_scheme.clone(), ..local };
         Self::connect_inner(info, Some((kernel_child, tail)), vec![tun_child], true, true, None, Default::default()).await
@@ -274,8 +276,6 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         let (events, _) = broadcast::channel(65_536);
         let cancel = CancellationToken::new();
 
-        let link_dead = Arc::new(AtomicBool::new(false));
-
         // A kernel bound to all interfaces is reached over loopback.
         let host = match info.ip.as_str() {
             "0.0.0.0" | "*" => "127.0.0.1",
@@ -286,20 +286,49 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         // Dealer sockets (shell / control / stdin): a send half fed by an mpsc
         // and a recv half pumped into the broadcast channel.  zeromq retries a
         // refused connect for up to 30 s, so race it against the kernel dying.
-        let setup = async {
-            let d = |port: u16, channel: Channel| {
-                dealer(ep(port), channel, &session, signer.clone(), events.clone(), cancel.clone(), link_dead.clone())
-            };
-            let shell_tx = d(info.shell_port, Channel::Shell).await?;
-            let control_tx = d(info.control_port, Channel::Control).await?;
-            let stdin_tx = d(info.stdin_port, Channel::Stdin).await?;
-            // IOPub subscriber.
-            let mut sub = SubSocket::new();
-            sub.connect(&ep(info.iopub_port)).await.context("connect iopub")?;
-            sub.subscribe("").await?;
-            anyhow::Ok((shell_tx, control_tx, stdin_tx, sub))
+        let attempt = || async {
+            // Per attempt, so pumps of a failed attempt can neither linger nor mark the
+            // link of the next one dead.
+            let cancel = cancel.child_token();
+            let link_dead = Arc::new(AtomicBool::new(false));
+            let r = async {
+                let d = |port: u16, channel: Channel| {
+                    dealer(ep(port), channel, &session, signer.clone(), events.clone(), cancel.clone(), link_dead.clone())
+                };
+                let shell_tx = d(info.shell_port, Channel::Shell).await?;
+                let control_tx = d(info.control_port, Channel::Control).await?;
+                let stdin_tx = d(info.stdin_port, Channel::Stdin).await?;
+                // IOPub subscriber.
+                let mut sub = SubSocket::new();
+                sub.connect(&ep(info.iopub_port)).await.context("connect iopub")?;
+                sub.subscribe("").await?;
+                anyhow::Ok((shell_tx, control_tx, stdin_tx, sub))
+            }
+            .await;
+            if r.is_err() {
+                cancel.cancel();
+            }
+            r.map(|(a, b, c, d)| (a, b, c, d, link_dead))
         };
-        let (shell_tx, control_tx, stdin_tx, mut sub) = tokio::select! {
+        // Through an SSH tunnel (or a proxy such as docker's) the local TCP connect is
+        // accepted even while nothing listens behind it; the far side then closes and
+        // zeromq reports the handshake EOF as a hard error.  Retry until a deadline.
+        let setup = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut delay = std::time::Duration::from_millis(100);
+            loop {
+                match attempt().await {
+                    Ok(v) => return Ok(v),
+                    Err(e) if remote && tokio::time::Instant::now() + delay < deadline => {
+                        tracing::debug!("kernel connect failed, retrying in {delay:?}: {e:#}");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_secs(2));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+        let (shell_tx, control_tx, stdin_tx, mut sub, link_dead) = tokio::select! {
             r = setup => r?,
             e = exited(&mut child, &mut extra) => return Err(e),
         };
@@ -560,15 +589,23 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         }
         let mut child = self.child.lock().await;
         if let Some(mut c) = child.take() {
+            let pid = c.id();
             // Let the kernel exit cleanly (flush files) before forcing it.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-            while tokio::time::Instant::now() < deadline {
-                if matches!(c.try_wait(), Ok(Some(_))) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut exited = wait_exit(&mut c, std::time::Duration::from_secs(3)).await;
+            // Remote: closing the SSH session's stdin makes the bootstrap stop the kernel
+            // (terminate, then kill after 3 s) and remove its connection file.
+            if c.stdin.take().is_some() && !exited {
+                exited = wait_exit(&mut c, std::time::Duration::from_secs(4)).await;
             }
-            let _ = c.start_kill();
+            if !self.remote {
+                // Also reap what user code left running in the kernel's process group.
+                if let Some(pid) = pid {
+                    platform::kill_group(pid);
+                }
+            }
+            if !exited {
+                let _ = c.start_kill();
+            }
             let _ = c.wait().await;
         }
         for mut c in self.extra.lock().await.drain(..) {
@@ -600,19 +637,33 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
         self.cancel.cancelled().await
     }
 
+    /// Ready means a shell kernel_info_reply *and* an iopub message (the
+    /// busy/idle status) for one of our kernel_info requests: only then is the
+    /// SUB subscription known to be live, so the first cell's output is not lost.
     async fn wait_ready(&self, timeout: std::time::Duration) -> Result<()> {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut ids: Vec<String> = vec![];
+        let (mut shell, mut iopub) = (false, false);
         loop {
             if tokio::time::Instant::now() > deadline {
                 anyhow::bail!("kernel did not become ready within {timeout:?}");
             }
-            let id = self.kernel_info().await?;
+            // A fresh request each round: its iopub status is published after the
+            // subscription may have become active, unlike the earlier ones.
+            ids.push(self.kernel_info().await?);
             let wait = tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 loop {
                     match rx.recv().await {
-                        Ok(ev) if ev.channel == Channel::Shell && ev.msg.parent_id() == Some(id.as_str()) => {
-                            return true;
+                        Ok(ev) if ev.msg.parent_id().is_some_and(|p| ids.iter().any(|i| i == p)) => {
+                            match ev.channel {
+                                Channel::Shell => shell = true,
+                                Channel::IoPub => iopub = true,
+                                _ => {}
+                            }
+                            if shell && iopub {
+                                return true;
+                            }
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -628,6 +679,79 @@ os.execvp(sys.executable,[sys.executable,"-m","ipykernel_launcher","-f",f])"#;
                 anyhow::bail!("kernel process exited during startup");
             }
         }
+    }
+}
+
+/// Remote bootstrap (see `launch_remote`).  Run as `python -c ... <cwd_b64> <self_b64>`.
+const REMOTE_BOOTSTRAP: &str = r#"import json,os,select,signal,socket,subprocess,sys,time,uuid
+d=os.path.expanduser("~/.pide/run"); os.makedirs(d,mode=0o700,exist_ok=True)
+# Sweep connection files of bootstraps that no longer exist (e.g. after a host reboot).
+for n in os.listdir(d):
+    if n.startswith("kernel-") and n.endswith(".json"):
+        try:
+            os.kill(int(n[7:-5]),0)
+        except ProcessLookupError:
+            try: os.remove(os.path.join(d,n))
+            except OSError: pass
+        except (ValueError,OSError):
+            pass
+ls=[socket.socket() for _ in range(5)]
+for s in ls: s.bind(("127.0.0.1",0))
+ports=[s.getsockname()[1] for s in ls]
+for s in ls: s.close()
+info={"transport":"tcp","ip":"127.0.0.1","shell_port":ports[0],"iopub_port":ports[1],"stdin_port":ports[2],"control_port":ports[3],"hb_port":ports[4],"key":uuid.uuid4().hex,"signature_scheme":"hmac-sha256","kernel_name":"python3"}
+f=os.path.join(d,"kernel-%d.json"%os.getpid())
+with os.fdopen(os.open(f,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),"w") as fh: json.dump(info,fh)
+env=dict(os.environ)
+env["PYTHONPATH"]=os.path.expanduser("~/.pide")+os.pathsep+env.get("PYTHONPATH","")
+env.setdefault("MPLBACKEND","module://matplotlib_inline.backend_inline")
+# ipykernel's ParentPollerUnix exits the kernel if this bootstrap dies, however it dies.
+env["JPY_PARENT_PID"]=str(os.getpid())
+def bye(*_): raise SystemExit(1)
+for sg in (signal.SIGTERM,signal.SIGHUP): signal.signal(sg,bye)
+k=None
+try:
+    # Kernel stdout goes to our stderr: our stdout carries only the PIDE_CONN line.  Its own
+    # session/process group lets interrupt_request (killpg) reach children of user code.
+    k=subprocess.Popen([sys.executable,"-m","ipykernel_launcher","-f",f],env=env,stdin=subprocess.DEVNULL,stdout=2,start_new_session=True)
+    def up(p):
+        try: socket.create_connection(("127.0.0.1",p),0.5).close(); return True
+        except OSError: return False
+    t0=time.time()
+    while not all(up(p) for p in ports):
+        if k.poll() is not None: sys.exit(k.returncode or 1)
+        if time.time()-t0>60: sys.exit("kernel did not listen within 60 s")
+        time.sleep(0.1)
+    print("PIDE_CONN:"+json.dumps(info),flush=True)
+    # EOF on stdin: the app closed the session, or it / its ssh client died.
+    while k.poll() is None:
+        if select.select([0],[],[],0.5)[0] and not os.read(0,65536): break
+finally:
+    signal.signal(signal.SIGTERM,signal.SIG_IGN); signal.signal(signal.SIGHUP,signal.SIG_IGN)
+    if k is not None:
+        def sig(s):
+            try: os.killpg(k.pid,s)
+            except OSError: pass
+        if k.poll() is None:
+            sig(signal.SIGTERM)
+            try: k.wait(3)
+            except subprocess.TimeoutExpired: pass
+        sig(signal.SIGKILL); k.wait()
+    try: os.remove(f)
+    except OSError: pass
+"#;
+
+/// Poll `c` until it exits or `timeout` passes; true when it has exited.
+async fn wait_exit(c: &mut Child, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if matches!(c.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

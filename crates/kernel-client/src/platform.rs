@@ -5,6 +5,10 @@
 //! event only trips Python's eval loop (`_thread.interrupt_main`), so a cell
 //! blocked in a C call such as `time.sleep()` stops when that call returns;
 //! this matches Jupyter's behaviour there.
+//!
+//! On Unix a local kernel runs in its own process group so that an interrupt
+//! (and a forced kill) also reaches processes started by user code, e.g.
+//! `subprocess.run(["sleep", "30"])`.
 
 use tokio::process::Command;
 
@@ -16,6 +20,32 @@ pub fn quiet(cmd: &mut Command) -> &mut Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Put a local kernel in a new process group of its own (Unix; no-op elsewhere).
+/// The group id is the kernel's pid, which `interrupt` / `kill_group` signal.
+/// It also keeps a terminal's Ctrl+C (e.g. under `tauri dev`) away from the kernel.
+pub fn own_process_group(cmd: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
+/// SIGKILL every process left in the kernel's process group (Unix; no-op
+/// elsewhere).  Safe after the leader has been reaped: a group id is not
+/// reused while any member is alive, and an empty group just yields ESRCH.
+pub fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        kill(-(pid as i32), 9);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Per-kernel handles needed to interrupt it / let it watch us.
@@ -65,10 +95,9 @@ impl KernelHandles {
     pub fn interrupt(&self, pid: u32) -> bool {
         #[cfg(unix)]
         {
-            extern "C" {
-                fn kill(pid: i32, sig: i32) -> i32;
-            }
-            unsafe { kill(pid as i32, 2) == 0 }
+            // SIGINT the whole group (kernel + children of user code); fall back to the
+            // process alone if it is not a group leader.
+            unsafe { kill(-(pid as i32), 2) == 0 || kill(pid as i32, 2) == 0 }
         }
         #[cfg(windows)]
         {
