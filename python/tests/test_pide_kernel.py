@@ -284,7 +284,8 @@ def test_array_stats_skips_memmap_and_noncontiguous_huge(tmp_path):
     assert k._array_stats(mm) is None
     assert k._array_stats(mm[10:20]) is None  # base is a memmap
     huge = np.ones((12_000_000, 2), dtype="int8")[:, 0]  # non-contiguous view, > cap
-    assert k._array_stats(huge) is None
+    st = k._array_stats(huge)  # sampled through a strided view
+    assert st["approx"] is True and st["max"] == 1
     assert k._array_stats(np.array([], dtype="float64")) is None
     assert k._array_stats(np.array(["a", "b"])) is None
 
@@ -488,7 +489,7 @@ def test_polars_detail_and_stats(ns):
     assert r["rows"] == [["a", "Int64"]] and "note" in r
     ns["s"] = ns["df"]["c"]
     v = by_name(payload(k.snapshot()))
-    assert v["s"]["stats"] == {"min": 1.0, "max": 4.0, "mean": pytest.approx(8 / 3), "nan": 1}
+    assert v["s"]["stats"] == {"min": 1.0, "max": 4.0, "mean": pytest.approx(8 / 3), "nan": 0, "null": 1}
     assert v["lz"]["kind"] == "object"
     assert k._polars_series_stats(ns["df"]["b"]) is None
 
@@ -535,3 +536,194 @@ def test_everything_in_snapshot_and_detail_is_json(ns):
         payload(k.detail(name))
     payload(k.fs_info())
     payload(k.fs_list(os.path.dirname(__file__)))
+
+
+def test_fs_crlf_roundtrip_nonutf8_and_atomic_write(tmp_path):
+    import base64, os, stat
+    f = tmp_path / "crlf.txt"
+    f.write_bytes(b"a\r\nb\r\n")
+    text = payload(k.fs_read(str(f)))["text"]
+    assert text == "a\r\nb\r\n"
+    f.chmod(0o640)
+    assert payload(k.fs_write(str(f), base64.b64encode(text.encode()).decode()))["ok"] is True
+    assert f.read_bytes() == b"a\r\nb\r\n"
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o640
+    assert [p.name for p in tmp_path.iterdir()] == ["crlf.txt"]  # no temp left behind
+    bad = tmp_path / "latin.txt"
+    bad.write_bytes(b"caf\xe9")
+    assert "UTF-8" in payload(k.fs_read(str(bad)))["error"]
+
+
+# ----------------------------------------------------------------------------
+# review round: stale stats, bounded reprs, image slicing, PIL modes, masks
+# ----------------------------------------------------------------------------
+
+def test_stats_see_inplace_edits_and_noncontiguous(ns):
+    a = np.zeros(1000)
+    ns["a"] = a
+    assert by_name(payload(k.snapshot()))["a"]["stats"]["max"] == 0
+    a[5] = 100
+    assert by_name(payload(k.snapshot()))["a"]["stats"]["max"] == 100
+    m = np.zeros((100, 100))
+    ns["v"] = m[:, ::2]
+    assert by_name(payload(k.snapshot()))["v"]["stats"]["max"] == 0
+    m[3, 4] = 7
+    assert by_name(payload(k.snapshot()))["v"]["stats"]["max"] == 7
+    s = pd.Series(np.zeros(500))
+    ns["s"] = s
+    by_name(payload(k.snapshot()))
+    s.iloc[7] = 9.0
+    assert by_name(payload(k.snapshot()))["s"]["stats"]["max"] == 9.0
+
+
+def test_big_array_fingerprint_detects_edit_at_sample_point(ns):
+    a = np.zeros(2_000_000)
+    ns["a"] = a
+    by_name(payload(k.snapshot()))
+    a[:] = 1.0
+    assert by_name(payload(k.snapshot()))["a"]["stats"]["min"] == 1.0
+
+
+def test_bounded_reprs(ns):
+    import array
+    import collections
+    ba = bytearray(20_000_000)
+    ns.update({
+        "ba": ba,
+        "arr": array.array("i", range(100_000)),
+        "keys": dict.fromkeys(range(100_000)).keys(),
+        "ul": collections.UserList(range(100_000)),
+        "ud": collections.UserDict({i: i for i in range(100_000)}),
+        "mp": types.MappingProxyType({i: i for i in range(100_000)}),
+        "dq": collections.deque(range(100_000)),
+    })
+
+    class Big:
+        def __len__(self):
+            return 10**9
+
+        def __repr__(self):
+            raise AssertionError("repr must not be called")
+
+    ns["big"] = Big()
+    t0 = time.time()
+    v = by_name(payload(k.snapshot()))
+    assert time.time() - t0 < 2
+    for n in ("ba", "arr", "keys", "ul", "ud", "mp", "dq", "big"):
+        assert len(v[n]["value"]) <= 200, n
+    assert v["dq"]["kind"] == "sequence"
+    assert "items" in v["big"]["value"]
+    payload(k.detail("dq", row0=5, row1=8))
+    assert payload(k.detail("dq", row0=5, row1=8))["rows"] == [[5], [6], [7]]
+    assert len(payload(k.detail("ba"))["repr"]) <= 4000
+
+
+def test_slow_repr_type_is_skipped_after_first_time(ns):
+    class Slow:
+        calls = 0
+
+        def __repr__(self):
+            Slow.calls += 1
+            time.sleep(0.08)
+            return "slow!"
+
+    k._SLOW_REPR.discard(Slow)
+    ns["a"], ns["b"] = Slow(), Slow()
+    v = by_name(payload(k.snapshot()))
+    assert Slow.calls == 1  # b is skipped because a already proved slow
+    assert v["b"]["value"] == "<Slow>" or "Slow" in v["b"]["value"]
+    k.snapshot()
+    assert Slow.calls == 1
+    k._SLOW_REPR.discard(Slow)
+
+
+def test_torch_conj_and_neg_bits(ns):
+    torch = pytest.importorskip("torch")
+    t = torch.tensor([[1 + 2j, 3 - 1j]]).conj()
+    assert np.allclose(k._as_numpy(t), np.array([[1 - 2j, 3 + 1j]]))
+    ns["t"] = t
+    r = payload(k.detail("t"))
+    assert "error" not in r
+    tn = torch.tensor([[1.0, -2.0]]).conj_physical()
+    ns["tn"] = tn
+    assert "error" not in payload(k.detail("tn"))
+
+
+def test_torch_int64_stats_exact(ns):
+    torch = pytest.importorskip("torch")
+    big = 2**62 + 1
+    ns["t"] = torch.tensor([big, 5], dtype=torch.int64)
+    st = by_name(payload(k.snapshot()))["t"]["stats"]
+    assert st["max"] == str(big) and st["min"] == 5
+
+
+def test_image_slices_before_converting(ns):
+    torch = pytest.importorskip("torch")
+    t = torch.arange(3 * 4 * 6 * 6, dtype=torch.float32).reshape(3, 4, 6, 6)
+    ns["t"] = t
+    r = payload(k.image("t", index=[2, 1]))
+    assert r["h"] == 6 and r["w"] == 6 and r["dtype"] == "float32"
+    r = payload(k.image("t", index=[2, 1], max_px=9))
+    assert r["step"] == 2 and r["h"] == 3
+
+
+def test_pil_modes(ns):
+    Image = pytest.importorskip("PIL.Image")
+    ns["la"] = Image.new("LA", (5, 4), (10, 200))
+    ns["cmyk"] = Image.new("CMYK", (5, 4), (0, 0, 0, 255))
+    ns["p"] = Image.new("P", (5, 4), 3)
+    ns["ycc"] = Image.new("YCbCr", (5, 4))
+    ns["l"] = Image.new("L", (5, 4), 7)
+    r = payload(k.image("la"))
+    assert r["shape"] == [4, 5, 4] and r["channels"] == 3
+    assert payload(k.detail("la"))["shape"] == [4, 5, 4]
+    assert payload(k.image("cmyk"))["shape"] == [4, 5, 3]
+    assert payload(k.image("p"))["shape"] == [4, 5, 3]
+    assert payload(k.image("ycc"))["shape"] == [4, 5, 3]
+    assert payload(k.image("l"))["channels"] == 1
+
+
+def test_guess_layout():
+    assert k._guess_layout((4, 28, 28)) == ("HW", 1)  # gray batch, not RGBA
+    assert k._guess_layout((3, 28, 28)) == ("CHW", 0)
+    assert k._guess_layout((1, 28, 28)) == ("CHW", 0)
+    assert k._guess_layout((10, 4, 28, 28)) == ("CHW", 1)
+    assert k._guess_layout((28, 28, 3)) == ("HWC", 0)
+    assert k._guess_layout((5, 8, 9)) == ("HW", 1)
+
+
+def test_masked_array_cells_are_none(ns):
+    m = np.ma.masked_array([[1.0, 2.0], [3.0, 4.0]], mask=[[0, 1], [0, 0]])
+    ns["m"] = m
+    assert payload(k.detail("m"))["rows"] == [[1.0, None], [3.0, 4.0]]
+    ns["m1"] = np.ma.masked_array([1, 2, 3], mask=[0, 0, 1])
+    assert payload(k.detail("m1"))["rows"] == [[1], [2], [None]]
+    ns["m0"] = np.ma.masked_array(5, mask=True)
+    assert payload(k.detail("m0"))["rows"] == [[None]]
+
+
+def test_xarray_dataset_nonstr_names(ns):
+    xr = pytest.importorskip("xarray")
+    ds = xr.Dataset({1: ("x", [1, 2, 3]), 2: ("x", [4, 5, 6])})
+    ns["ds"] = ds
+    r = payload(k.detail("ds"))
+    for c in r["children"]:
+        assert k._resolve("ds" + c["name"]) is not None
+
+
+def test_plot_payload_contract(ns):
+    idx = pd.date_range("2020-01-01", periods=10, freq="D")
+    ns["s"] = pd.Series(np.arange(10.0), index=idx)
+    r = payload(k.plot_data("s", max_points=4))
+    assert r["step"] == 3 and len(r["y"]) == 4 and len(r["x"]) == 4  # ceil: <= max_points
+    ns["wide"] = pd.DataFrame(np.zeros((3, 2500)), columns=[f"c{i}" for i in range(2500)])
+    r = payload(k.plot_data("wide"))
+    assert len(r["columns"]) == len(r["z"][0]) and r["step1"] == 3
+    ns["c"] = np.array([1 + 1j, 2 + 0j])
+    assert payload(k.plot_data("c"))["y"] == [1.0, 2.0]
+
+
+def test_longdouble_cell(ns):
+    ns["x"] = np.longdouble("1.5")
+    assert by_name(payload(k.snapshot()))["x"]["value"] == "1.5"
+    assert payload(k.detail("x"))["rows"] == [[1.5]]
