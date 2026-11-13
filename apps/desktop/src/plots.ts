@@ -1,7 +1,7 @@
 // Plot builders shared by the Plots tab, Workspace context menu and viewers.
 import { fetchPlotExpr } from "./kernel";
 import { addFigure, pushConsole } from "./store";
-import { dockApi } from "./layout";
+import { showFigures } from "./layout";
 
 export type PlotKind = "line" | "scatter" | "bar" | "histogram" | "heatmap" | "subplots";
 
@@ -67,7 +67,7 @@ export async function plotExprs(exprs: string[], kind: PlotKind) {
       }
     }
     addFigure({ title: `${title} (${kind})`, kind: "plotly", data, layout });
-    dockApi()?.getPanel("figures")?.api.setActive();
+    showFigures();
   } catch (e) {
     pushConsole({ kind: "info", text: `plot failed: ${e}` });
   }

@@ -47,7 +47,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
     let python = std::env::args().nth(1).unwrap_or_else(|| if cfg!(windows) { "python".into() } else { "python3".into() });
     let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/../../python");
-    let k = Kernel::launch(LaunchSpec { python: python.into(), cwd: None, env: vec![("PYTHONPATH".into(), helper.into())] }).await?;
+    // A working folder of its own, holding a module the kernel must be able to import.
+    let cwd = std::env::temp_dir().join(format!("pide-smoke-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::write(cwd.join("pide_smoke_mod.py"), "X = 41\n")?;
+    let k = Kernel::launch(LaunchSpec { python: python.into(), cwd: Some(cwd.clone()), env: vec![("PYTHONPATH".into(), helper.into())] }).await?;
     println!("launched; shell port {}", k.info.shell_port);
     let mut rx = k.subscribe();
 
@@ -61,6 +65,13 @@ async fn main() -> anyhow::Result<()> {
     let names: Vec<&str> = vars.iter().filter_map(|v| v["name"].as_str()).collect();
     anyhow::ensure!(names.contains(&"x") && names.contains(&"y"), "snapshot missing variables: {names:?}");
     println!("snapshot ok: {names:?}");
+
+    // Modules in the working folder are importable (IPython >= 9.7 drops the cwd from
+    // sys.path under PYTHONSAFEPATH, which the launcher therefore must not set).
+    let id = k.execute("import pide_smoke_mod\nassert pide_smoke_mod.X == 41", false, false, HashMap::new(), false).await?;
+    let reply = wait_reply(&mut rx, &id, 30).await?;
+    anyhow::ensure!(reply["status"] == "ok", "cannot import a module from the working folder: {reply}");
+    println!("cwd import ok");
 
     let id = k.execute(DIAG, false, false, HashMap::new(), false).await?;
     let reply = wait_reply(&mut rx, &id, 30).await?;
@@ -86,5 +97,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     anyhow::ensure!(!k.is_alive().await, "kernel still alive after shutdown");
     println!("shutdown ok");
+    let _ = std::fs::remove_dir_all(&cwd);
     Ok(())
 }

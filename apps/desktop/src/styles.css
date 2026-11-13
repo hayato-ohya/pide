@@ -126,6 +126,9 @@ button, select, input { font: inherit; }
 .c-info { color: var(--muted); font-style: italic; margin: 2px 0; }
 .out-img { max-width: 100%; max-height: 420px; }
 .out-note { color: var(--muted); font-style: italic; }
+/* Kernel / notebook HTML keeps inline styles (pandas, rich reprs): `contain: paint` clips it and
+   makes it the containing block of position:fixed, so it cannot draw over the app UI. */
+.out-html, .out-img { contain: paint; overflow: auto; }
 .out-html table { border-collapse: collapse; font-size: 12px; }
 .out-html td, .out-html th { border: 1px solid var(--border-soft); padding: 2px 6px; }
 .console-input { display: flex; gap: 6px; padding: 4px 10px; border-top: 1px solid var(--border-soft); align-items: flex-start; }

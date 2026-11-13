@@ -52,6 +52,11 @@ pub struct LaunchSpec {
     pub env: Vec<(String, String)>,
 }
 
+/// The pid in `kernel-<pid>-<uuid>.json` (None for other / older names).
+fn owner_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("kernel-")?.split('-').next()?.parse().ok()
+}
+
 /// Temporary connection file; removed on drop.
 pub struct ConnFile(PathBuf);
 
@@ -74,17 +79,19 @@ impl ConnFile {
             }
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        // Sweep files left behind by crashed sessions (older than a day).
+        // Sweep files left behind by crashed sessions (older than a day), but not the file of
+        // a kernel another running Pide started more than a day ago: names carry the owner's pid.
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 if let Ok(md) = e.metadata() {
-                    if md.modified().ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() > 86_400).unwrap_or(false) {
+                    let old = md.modified().ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() > 86_400).unwrap_or(false);
+                    if old && owner_pid(&e.file_name().to_string_lossy()).and_then(crate::platform::process_alive) != Some(true) {
                         let _ = std::fs::remove_file(e.path());
                     }
                 }
             }
         }
-        let path = dir.join(format!("kernel-{}.json", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("kernel-{}-{}.json", std::process::id(), uuid::Uuid::new_v4()));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -120,4 +127,18 @@ pub struct RemoteSpec {
     pub ssh: Option<String>,
     #[serde(default)]
     pub ssh_args: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_pid_from_file_name() {
+        assert_eq!(owner_pid("kernel-4242-0b1c2d3e-aaaa-bbbb-cccc-000000000000.json"), Some(4242));
+        // Files written before the pid was added start with the uuid: swept by age alone.
+        assert_eq!(owner_pid("kernel-0b1c2d3e-aaaa-bbbb-cccc-000000000000.json"), None);
+        assert_eq!(owner_pid("other.json"), None);
+        assert_eq!(crate::platform::process_alive(std::process::id()).unwrap_or(true), true);
+    }
 }

@@ -5,8 +5,25 @@ import { pushConsole, streamDisplay, useStore } from "../store";
 import type { ConsoleItem, Mime } from "../types";
 import { safeHtml } from "../sanitize";
 
-export const ansi = new AnsiUp();
-ansi.use_classes = false;
+/** Rough stand-in for is_complete while the kernel cannot answer: a block opener, a line
+ * continuation or an unclosed bracket means more input follows. */
+function looksIncomplete(line: string): boolean {
+  const t = line.replace(/#.*$/, "").trimEnd();
+  if (t.endsWith(":") || t.endsWith("\\")) return true;
+  let depth = 0;
+  for (const ch of t) { if ("([{".includes(ch)) depth++; else if (")]}".includes(ch)) depth--; }
+  return depth > 0;
+}
+
+/** ANSI → HTML with a converter per call: AnsiUp keeps colours and a partial escape
+ * sequence between calls, which would leak one item's unterminated colour into the next. */
+export const ansi = {
+  ansi_to_html(text: string): string {
+    const a = new AnsiUp();
+    a.use_classes = false;
+    return a.ansi_to_html(text);
+  },
+};
 
 export function Output({ data }: { data: Mime }) {
   if (data["text/html"]) return <div className="out-html" dangerouslySetInnerHTML={safeHtml(data["text/html"])} />;
@@ -128,8 +145,11 @@ export default function Console() {
       const multiline = code.includes("\n");
       if (!multiline && !inputReq) {
         e.preventDefault();
-        const st = await isComplete(code);
-        if (st === "incomplete") setCode(codeRef.current + "\n");
+        // A busy (or paused) kernel answers is_complete only after the running cell, i.e.
+        // after the 3 s timeout: decide locally then, so the line is queued at once.
+        const st = kernel === "busy" || stopped ? (looksIncomplete(code) ? "incomplete" : "unknown") : await isComplete(code);
+        if (codeRef.current !== code) return; // edited while waiting: do not send that
+        if (st === "incomplete") setCode(code + "\n");
         else await submit();
         return;
       }

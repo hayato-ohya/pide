@@ -5,6 +5,7 @@ import { set, useStore } from "../store";
 import ImageView from "./ImageView";
 import type { DetailWindow } from "../types";
 import { openVariable } from "../layout";
+import { usePanelVisible } from "../visibility";
 
 const ROW_H = 22;
 const COL_W = 110;
@@ -26,7 +27,8 @@ function fmt(v: unknown): string {
 export default function VariableViewer(props: IDockviewPanelProps<{ path: string; mode?: "table" | "image" }>) {
   const path = props.params.path;
   const variables = useStore((s) => s.variables);
-  const changedSet = useStore((s) => s.changed);
+  const wsTick = useStore((s) => s.wsTick);
+  const visible = usePanelVisible(props.api);
   const [meta, setMeta] = useState<DetailWindow | null>(null);
   const [index, setIndex] = useState<number[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -46,27 +48,31 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
   const root = path.split(/[.\[]/)[0];
   const rootVar = variables.find((v) => v.name === root);
   const generation = `${rootVar?.id ?? ""}:${rootVar?.value ?? ""}:${(rootVar?.shape ?? []).join("x")}`;
-  void changedSet;
 
-  // (Re)load the first block whenever the variable changes.
+  // (Re)load the first block after every workspace snapshot (an in-place edit such as
+  // `a[0] = 1` changes neither id nor shape) and when the slice changes.  What is shown
+  // stays until the new block arrives, so scroll position and input focus survive; a
+  // hidden viewer waits until it is shown again.
+  const loadKey = `${path}|${index.join(",")}|${wsTick}`;
+  const loadedKey = useRef<string | null>(null);
   useEffect(() => {
-    blocks.current.clear();
-    inflight.current.clear();
-    genRef.current++;
-    setMeta(null);
-    setError(null);
+    if (!visible || loadedKey.current === loadKey) return;
     let cancelled = false;
     fetchDetail(path, { row0: 0, row1: BLOCK_R, col0: 0, col1: BLOCK_C, index: index.length ? index : undefined })
       .then((d) => {
         if (cancelled) return;
-        if (d.error) setError(d.error);
-        setMeta(d);
+        loadedKey.current = loadKey;
+        genRef.current++; // replies to block requests sent for the old contents are dropped
+        blocks.current.clear();
+        inflight.current.clear();
         blocks.current.set("0:0", d);
+        setError(d.error ?? null);
+        setMeta(d);
         bump((x) => x + 1);
       })
-      .catch((e) => { if (!cancelled) setError(String(e)); });
+      .catch((e) => { if (!cancelled) { loadedKey.current = loadKey; setError(String(e)); } });
     return () => { cancelled = true; };
-  }, [path, index.join(","), generation, variables.length]);
+  }, [loadKey, visible]);
 
   // Map insertion order doubles as LRU order: touch on read, evict oldest on insert.
   const getBlock = (key: string) => {
@@ -79,7 +85,8 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
     blocks.current.set(key, d);
     while (blocks.current.size > MAX_BLOCKS) {
       const oldest = blocks.current.keys().next().value as string;
-      if (oldest === "0:0") { blocks.current.delete(oldest); blocks.current.set(oldest, blocks.current.get(oldest)!); continue; }
+      // Keep the first block (it is `meta`): move it to the young end instead.
+      if (oldest === "0:0") { const first = blocks.current.get(oldest)!; blocks.current.delete(oldest); blocks.current.set(oldest, first); continue; }
       blocks.current.delete(oldest);
     }
   };
@@ -94,20 +101,30 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
       .finally(() => { if (gen === genRef.current) inflight.current.delete(key); });
   };
 
+  // The scroller only exists once the table is shown (not while loading / in image mode).
+  const tableShown = !!meta && !error && mode === "table";
   useEffect(() => {
     const el = scroller.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setScroll((s) => ({ ...s, h: el.clientHeight, w: el.clientWidth })));
+    // Hidden tabs measure 0×0: keep the last size.  Unchanged sizes do not re-render.
+    const measure = () => setScroll((s) => (!el.clientHeight || (s.h === el.clientHeight && s.w === el.clientWidth) ? s : { ...s, h: el.clientHeight, w: el.clientWidth }));
+    measure();
+    // Applied on the next frame: re-rendering inside the observer callback can change the
+    // scroller's size again (scrollbars) and makes the browser report a "ResizeObserver loop".
+    let raf = 0;
+    const ro = new ResizeObserver(() => { cancelAnimationFrame(raf); raf = requestAnimationFrame(measure); });
     ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
+    return () => { cancelAnimationFrame(raf); ro.disconnect(); };
+  }, [tableShown]);
 
   const imageable = !!meta && (["ndarray", "tensor", "jax", "xarray"].includes(meta.kind) || props.params.path.length > 0 && meta.type === "Image") && (meta.shape?.length ?? 0) >= 2;
 
   // Column selection → expression for the Plots tab (MATLAB variable editor style).
   const colExpr = (cols: number[]) => {
     if (!meta || !cols.length) return null;
-    if (meta.kind === "dataframe" || meta.kind === "polars") {
+    // pandas: by position (labels may be ints, tuples, dates or duplicated).
+    if (meta.kind === "dataframe") return cols.length === 1 ? `${path}.iloc[:, ${cols[0]}]` : `${path}.iloc[:, [${cols.join(", ")}]]`;
+    if (meta.kind === "polars") {
       const names = cols.map((c) => colLabel(c));
       return names.length === 1 ? `${path}[${JSON.stringify(names[0])}]` : `${path}[[${names.map((n) => JSON.stringify(n)).join(", ")}]]`;
     }
@@ -146,11 +163,11 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
     const b = getBlock(`0:${Math.floor(c / BLOCK_C)}`) ?? getBlock(`${Math.floor(r0 / BLOCK_R)}:${Math.floor(c / BLOCK_C)}`);
     return b?.columns?.[c - Math.floor(c / BLOCK_C) * BLOCK_C] ?? String(c);
   };
-  const rowLabel = (r: number) => {
-    const b = getBlock(`${Math.floor(r / BLOCK_R)}:0`);
-    return b?.index_labels?.[r - Math.floor(r / BLOCK_R) * BLOCK_R] ?? String(r);
-  };
-  const childAt = (r: number) => getBlock(`${Math.floor(r / BLOCK_R)}:0`)?.children?.[r - Math.floor(r / BLOCK_R) * BLOCK_R];
+  // Row labels / children come with every block of the row: column block 0 is not loaded
+  // once the view is scrolled to the right.
+  const rowBlock = (r: number) => getBlock(`${Math.floor(r / BLOCK_R)}:0`) ?? getBlock(`${Math.floor(r / BLOCK_R)}:${Math.floor(c0 / BLOCK_C)}`);
+  const rowLabel = (r: number) => rowBlock(r)?.index_labels?.[r - Math.floor(r / BLOCK_R) * BLOCK_R] ?? String(r);
+  const childAt = (r: number) => rowBlock(r)?.children?.[r - Math.floor(r / BLOCK_R) * BLOCK_R];
   const hasChildren = !!meta.children;
   const leadDims = meta.shape && meta.shape.length > 2 ? meta.shape.slice(0, -2) : [];
 
@@ -195,7 +212,7 @@ export default function VariableViewer(props: IDockviewPanelProps<{ path: string
         )}
         {selCols.length > 0 && <span className="muted">{selCols.length} col selected → PLOTS tab</span>}
       </div>
-      {mode === "image" ? <ImageView path={path} generation={generation} /> : <>
+      {mode === "image" ? <ImageView path={path} generation={`${generation}:${wsTick}`} /> : <>
       <div className="vv-header" style={{ transform: `translateX(${-scroll.left}px)` }}>
         <div className="vv-cell vv-idx vv-corner" style={{ left: 0, width: IDX_W }} />
         {Array.from({ length: c1 - c0 }, (_, i) => c0 + i).map((c) => (

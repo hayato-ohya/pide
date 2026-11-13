@@ -48,6 +48,21 @@ pub fn kill_group(pid: u32) {
     let _ = pid;
 }
 
+/// Whether a process with this pid exists (Unix); None where that cannot be told cheaply.
+pub fn process_alive(pid: u32) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        // Signal 0 only checks: EPERM means it exists but belongs to someone else.
+        let ok = unsafe { kill(pid as i32, 0) } == 0;
+        Some(ok || std::io::Error::last_os_error().raw_os_error() == Some(1))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Per-kernel handles needed to interrupt it / let it watch us.
 #[derive(Debug, Default)]
 pub struct KernelHandles {

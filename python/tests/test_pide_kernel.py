@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import types
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -174,6 +175,143 @@ def test_resolve_errors_are_value_errors(ns):
     for bad in ("nope", 'd["zz"]', "d.a[5]", 'd["a"].missing', "d[", "d[#9]", 'd["a"]["x"]'):
         with pytest.raises(ValueError):
             k._resolve(bad)
+
+
+def test_resolve_never_inserts_into_defaultdict(ns):
+    import collections
+
+    ns["d"] = collections.defaultdict(list, a=[1])
+    for bad in ('d["gone"]', "d.foo", "d[5]", "d.7"):
+        with pytest.raises(ValueError):
+            k._resolve(bad)
+    assert dict(ns["d"]) == {"a": [1]}
+    assert k._resolve('d["a"]') == [1] and k._resolve("d.a") == [1]
+
+
+def test_torch_stats_not_reused_for_a_new_tensor(ns):
+    torch = pytest.importorskip("torch")
+    for _ in range(30):  # a freed tensor's id / data pointer are usually handed out again
+        ns["x"] = torch.randn(1000)
+        s = k._tensor_stats(ns["x"])
+        assert abs(float(s["max"]) - ns["x"].max().item()) < 1e-5
+
+
+def test_detail_huge_int_and_uninitialized_parameters(ns):
+    ns["big"] = [10**5000, 10**20000]
+    rows = payload(k.detail("big", 0, 10, 0, 5, None))["rows"]
+    assert json.dumps(rows)
+    torch = pytest.importorskip("torch")
+    ns["m"] = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.LazyLinear(4))
+    d = payload(k.detail("m", 0, 10, 0, 6, None))
+    assert d["nrows"] == 4 and any(r[1] == "<uninitialized>" for r in d["rows"])
+
+
+def test_snapshot_masked_array_is_silent_and_long_numpy_str_is_cut(ns, recwarn):
+    ns["m"] = np.ma.masked_all(5)
+    ns["s"] = np.str_("a" * 100_000)
+    snap = by_name(payload(k.snapshot()))
+    assert len(snap["s"]["value"]) <= 120
+    assert not [w for w in recwarn.list if "masked" in str(w.message)]
+
+
+def test_plot_expr_sees_user_variables_in_lambdas(ns):
+    ns["a"], ns["kk"] = [1.0, 2.0, 3.0], 2
+    d = payload(k.plot_expr("list(map(lambda i: a[i] * kk, range(3)))"))
+    assert "error" not in d
+    assert "np" not in ns  # evaluated on a copy
+
+
+def test_plot_thins_before_converting(ns):
+    n = 100_000
+    ns["df"] = pd.DataFrame({"a": np.arange(n, dtype=float), "b": np.arange(n) * 2.0}, index=pd.date_range("2024-01-01", periods=n, freq="s"))
+    ns["s"] = ns["df"]["a"]
+    d = payload(k.plot_data("df", 1000))
+    assert d["shape"] == [n, 2] and d["step"] == 100 and len(d["z"]) == 1000
+    assert d["z"][1] == [100.0, 200.0] and len(d["x"]) == 1000
+    s = payload(k.plot_data("s", 1000))
+    assert s["shape"] == [n] and s["step"] == 100 and s["y"][:3] == [0.0, 100.0, 200.0]
+    pl = pytest.importorskip("polars")
+    ns["p"] = pl.DataFrame({"a": np.arange(n, dtype=float)})
+    assert payload(k.plot_data("p", 1000))["z"][2] == [200.0]
+    torch = pytest.importorskip("torch")
+    ns["t"] = torch.arange(n, dtype=torch.float32)
+    assert payload(k.plot_data("t", 1000))["y"][:2] == [0.0, 100.0]
+
+
+def test_dataframe_size_matches_memory_usage(ns):
+    df = pd.DataFrame({"a": np.arange(10), "b": list("abcdefghij"), "c": pd.Categorical(list("aabbccddee")), "d": pd.array(range(10), dtype="Int64")})
+    assert k._nbytes(df) == int(df.memory_usage(deep=False).sum())
+
+
+def test_subclass_and_element_reprs_are_bounded(ns):
+    import collections
+    import dataclasses
+
+    calls = []
+
+    @dataclasses.dataclass
+    class Slow:
+        n: int = 0
+
+        def __repr__(self):
+            calls.append(1)
+            time.sleep(0.06)
+            return "Slow()"
+
+    P = collections.namedtuple("P", "data n")
+    ns["d"] = collections.defaultdict(list, a=list(range(100_000)))
+    ns["p"] = P(list(range(100_000)), 1)
+    ns["l"] = [Slow()]
+    snap = by_name(payload(k.snapshot()))
+    assert snap["d"]["value"].startswith("defaultdict({'a': [0, 1,") and len(snap["d"]["value"]) <= 120
+    assert snap["p"]["value"].startswith("P(data=[0, 1,") and "n=1" in snap["p"]["value"]
+    payload(k.snapshot())
+    assert len(calls) == 1  # slow element repr is latched, not repeated every snapshot
+    ns["o"] = Slow()
+    payload(k.snapshot())
+    n = len(calls)
+    payload(k.detail("o"))
+    assert len(calls) == n
+
+
+def test_detail_does_not_leak_warnings(ns, recwarn):
+    class Old:
+        @property
+        def legacy(self):
+            warnings.warn("legacy is deprecated", DeprecationWarning, stacklevel=2)
+            return 1
+
+        def __init__(self):
+            self.x = 1
+
+    ns["o"] = Old()
+    payload(k.detail("o"))
+    payload(k.detail("o.legacy"))
+    assert not recwarn.list
+
+
+def test_small_edge_cases(ns, tmp_path):
+    big = 2**63 - 1
+    assert k._pandas_series_stats(pd.Series([big, None, 5], dtype="Int64"))["max"] == str(big)  # beyond 2**53: sent as text
+    ns["e"] = np.zeros((0, 4, 4))
+    d = payload(k.detail("e"))
+    assert "error" not in d and d["rows"] == [] and d["nrows"] == 0
+    torch = pytest.importorskip("torch")
+    with torch.inference_mode():
+        ns_t = torch.ones(10)
+    assert k._tensor_stats(ns_t)["max"] == 1.0
+    if os.name == "posix":
+        assert payload(k.fs_read("/dev/zero"))["error"] == "not a regular file"
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        assert payload(k.fs_read(str(fifo)))["error"] == "not a regular file"
+
+
+def test_bool_image_uses_zero_one_range(ns):
+    np = pytest.importorskip("numpy")
+    ns["mask"] = np.eye(4, dtype=bool)
+    d = payload(k.image("mask", None, None, None, "auto"))
+    assert (d["vmin"], d["vmax"]) == (0.0, 1.0)
 
 
 # ----------------------------------------------------------------------------

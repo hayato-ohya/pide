@@ -165,8 +165,10 @@ impl Kernel {
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
-        // Never let a user's PYTHONPATH/cwd shadow stdlib modules the kernel imports.
-        cmd.env("PYTHONSAFEPATH", "1");
+        // No PYTHONSAFEPATH: IPython >= 9.7 would then keep the working folder off sys.path
+        // (`import mymodule` fails) and scripts started by user code would inherit it.
+        // ipykernel_launcher already drops the cwd while the kernel imports its own modules,
+        // and IPython puts it back after the standard library.
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }

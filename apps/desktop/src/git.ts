@@ -8,15 +8,26 @@ export interface GitStatus { state: "clean" | "merge" | "rebase" | "cherrypick" 
 export interface Commit { id: string; short: string; parents: string[]; summary: string; body: string; author: string; email: string; time: number; refs: string[] }
 export interface FileDiff { path: string; old_path: string | null; code: string; old: string | null; new: string | null; binary: boolean; additions: number; deletions: number }
 
+/** Refreshes overlap (poll, window focus, every git action): only the newest one may write
+ * the store, or a slower, older answer would put back the state from before a stage / cwd change. */
+let gitSeq = 0;
+let gitSig = "";
 export async function refreshGit() {
+  const my = ++gitSeq;
   const cwd = get().cwd;
-  if (!cwd || get().remote || get().connectionFile) { if (get().git.status) set({ git: { status: null, log: [], error: null } }); return; }
+  if (!cwd || get().remote || get().connectionFile) { gitSig = ""; if (get().git.status) set({ git: { status: null, log: [], error: null } }); return; }
   try {
     const status = await invoke<GitStatus>("git_status", { cwd });
     const log = await invoke<Commit[]>("git_log", { cwd, limit: 300, all: true });
+    if (my !== gitSeq) return;
+    // The 4 s poll usually finds nothing new: keep the old objects then, so the Git and
+    // Files panels (and the commit graph layout) are not recomputed every time.
+    const sig = JSON.stringify([status, log.length, log[0]?.id, log.map((c) => c.refs.join(",")).join(";")]);
+    if (sig === gitSig && get().git.status && !get().git.error) return;
+    gitSig = sig;
     set({ git: { status, log, error: null } });
   } catch (e) {
-    set({ git: { status: null, log: [], error: String(e) } });
+    if (my === gitSeq) { gitSig = ""; set({ git: { status: null, log: [], error: String(e) } }); }
   }
 }
 

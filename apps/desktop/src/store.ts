@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { ConsoleItem, Figure, KernelState, VarInfo } from "./types";
+import type { ConsoleItem, Figure, KernelState, Mime, VarInfo } from "./types";
 
 /** Safe localStorage JSON read (corrupt values must never blank the window). */
 export function readJson<T>(key: string, fallback: T): T {
@@ -27,6 +27,8 @@ export interface State {
   pythons: string[];
   variables: VarInfo[];
   changed: Set<string>;
+  /** Bumped with every workspace snapshot: open viewers reload (in-place edits keep id / shape). */
+  wsTick: number;
   selectedVar: string | null;
   selectedVars: string[];
   /** Expression chosen in a Variable Viewer (e.g. df[['a','b']]), used by the Plots tab. */
@@ -59,6 +61,7 @@ let state: State = {
   pythons: [],
   variables: [],
   changed: new Set(),
+  wsTick: 0,
   selectedVar: null,
   selectedVars: [],
   plotExpr: null,
@@ -111,6 +114,13 @@ export function uid() {
   return nextId++;
 }
 
+/** Rough size of a rich output (inline PNGs are base64 strings of megabytes). */
+function mimeSize(data: Mime): number {
+  let n = 200;
+  for (const v of Object.values(data)) if (typeof v === "string") n += v.length;
+  return n;
+}
+
 const MAX_CONSOLE = 5000;
 /** A single stream item never grows past this; a new item is started instead (keeps re-render cost bounded). */
 const MAX_STREAM_ITEM = 64 * 1024;
@@ -159,7 +169,7 @@ export function pushConsole(item: NewItem) {
     let bytes = 0;
     for (let i = next.length - 1; i >= 0; i--) {
       const it = next[i];
-      bytes += it.kind === "stream" ? it.text.length : it.kind === "error" ? it.traceback.join("").length : 200;
+      bytes += it.kind === "stream" ? it.text.length : it.kind === "error" ? it.traceback.join("").length : it.kind === "result" || it.kind === "display" ? mimeSize(it.data) : 200;
       if (bytes > MAX_CONSOLE_BYTES) { next = next.slice(i + 1); break; }
     }
     return { console: next };

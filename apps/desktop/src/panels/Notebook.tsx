@@ -46,6 +46,22 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const joinSrc = (s: unknown) => (Array.isArray(s) ? s.join("") : String(s ?? ""));
 const splitSrc = (s: string) => { const lines = s.split("\n"); return lines.map((l, i) => (i < lines.length - 1 ? l + "\n" : l)).filter((l, i, a) => !(i === a.length - 1 && l === "")); };
 
+/** nbformat: `application/json` and `application/*+json` values are JSON as is (object, list,
+ * string), never a multiline string split into lines. */
+const isJsonMime = (k: string) => /^application\/(.*\+)?json$/.test(k);
+
+/** Cap on one stream output of a cell (the console has its own): a runaway print loop must
+ * not grow the notebook, and its re-rendering, without bound.  The tail is kept. */
+const MAX_CELL_STREAM = 1024 * 1024;
+const TRUNCATED = "[… earlier output truncated …]\n";
+function capStream(text: string): string {
+  if (text.length <= MAX_CELL_STREAM) return text;
+  const body = text.startsWith(TRUNCATED) ? text.slice(TRUNCATED.length) : text;
+  const from = body.length - MAX_CELL_STREAM / 2;
+  const nl = body.indexOf("\n", from);
+  return TRUNCATED + body.slice(nl >= 0 ? nl + 1 : from);
+}
+
 function parseNotebook(text: string): Notebook {
   const nb = text.trim() ? JSON.parse(text) : {};
   const cells: Cell[] = (nb.cells ?? []).map((c: any) => ({
@@ -56,7 +72,7 @@ function parseNotebook(text: string): Notebook {
     metadata: c.metadata ?? {},
     execution_count: c.execution_count ?? null,
     collapsed: !!(c.metadata?.collapsed || c.metadata?.jupyter?.outputs_hidden),
-    outputs: (c.outputs ?? []).map((o: any) => (o.output_type === "stream" ? { ...o, text: joinSrc(o.text) } : o.output_type === "error" ? o : { ...o, data: Object.fromEntries(Object.entries(o.data ?? {}).map(([k, v]) => [k, k.startsWith("image/") || k === "application/json" ? (Array.isArray(v) ? v.join("") : v) : Array.isArray(v) ? v.join("") : v])) })),
+    outputs: (c.outputs ?? []).map((o: any) => (o.output_type === "stream" ? { ...o, text: joinSrc(o.text) } : o.output_type === "error" ? o : { ...o, data: Object.fromEntries(Object.entries(o.data ?? {}).map(([k, v]) => [k, isJsonMime(k) ? v : Array.isArray(v) ? v.join("") : v])) })),
   }));
   if (!cells.length) cells.push({ id: uid(), cell_type: "code", source: "", metadata: {}, execution_count: null, outputs: [] });
   return { cells, metadata: nb.metadata ?? { kernelspec: { name: "python3", display_name: "Python 3", language: "python" }, language_info: { name: "python" } }, nbformat: nb.nbformat ?? 4, nbformat_minor: nb.nbformat_minor ?? 5, extra: Object.fromEntries(Object.entries(nb).filter(([k]) => !["cells", "metadata", "nbformat", "nbformat_minor"].includes(k))) };
@@ -76,7 +92,7 @@ function serializeNotebook(nb: Notebook): string {
       base.outputs = (c.outputs ?? []).map((o) => {
         if (o.output_type === "stream") return { output_type: "stream", name: o.name, text: splitSrc(o.text) };
         if (o.output_type === "error") return o;
-        const data = Object.fromEntries(Object.entries(o.data).map(([k, v]) => [k, typeof v === "string" && !k.startsWith("image/") ? splitSrc(v) : v]));
+        const data = Object.fromEntries(Object.entries(o.data).map(([k, v]) => [k, typeof v === "string" && !k.startsWith("image/") && !isJsonMime(k) ? splitSrc(v) : v]));
         const { display_id: _transient, ...metadata } = (o.metadata ?? {}) as Mime; // display_id is runtime-only
         return o.output_type === "execute_result" ? { output_type: "execute_result", data, metadata, execution_count: o.execution_count ?? null } : { output_type: "display_data", data, metadata };
       });
@@ -94,8 +110,8 @@ function applyOutput(outputs: NbOutput[], it: OutputItem): NbOutput[] {
     case "clear": return [];
     case "stream": {
       const last = outputs[outputs.length - 1];
-      if (last && last.output_type === "stream" && last.name === it.name) return [...outputs.slice(0, -1), { ...last, text: appendStreamText(last.text, it.text) }];
-      return [...outputs, { output_type: "stream", name: it.name, text: appendStreamText("", it.text) }];
+      if (last && last.output_type === "stream" && last.name === it.name) return [...outputs.slice(0, -1), { ...last, text: capStream(appendStreamText(last.text, it.text)) }];
+      return [...outputs, { output_type: "stream", name: it.name, text: capStream(appendStreamText("", it.text)) }];
     }
     case "result": return [...outputs, { output_type: "execute_result", data: it.data, metadata: {}, execution_count: it.count }];
     case "display": {
@@ -250,6 +266,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
   const displayIds = (nb?.cells ?? []).flatMap((c) => (c.outputs ?? []).flatMap((o) => (o.output_type === "display_data" && (o.metadata as any)?.display_id ? [String((o.metadata as any).display_id)] : []))).join("\n");
   useEffect(() => {
     const offs = [...new Set(displayIds ? displayIds.split("\n") : [])].map((id) => registerDisplay(id, (data) => {
+      editVer.current++; setDirty(true);
       setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.outputs?.length ? { ...c, outputs: applyOutput(c.outputs, { kind: "display", data, displayId: id, update: true }) } : c)) } : n));
     }));
     return () => offs.forEach((off) => off());
@@ -289,6 +306,7 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
       p = await savePath("untitled.ipynb", [{ name: "Notebook", extensions: ["ipynb"] }]);
       if (!p) return;
       setPath(p);
+      props.api.updateParameters({ path: p }); // the saved layout restores this panel from its params
     }
     const ver = editVer.current;
     const text = serializeNotebook(cur);
@@ -330,13 +348,16 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
     if (!cell) return;
     if (cell.cell_type === "markdown") { patchCell(id, { source: cell.editing ? editors.current.get(id)?.getValue() ?? cell.source : cell.source, editing: false }, false); if (advance) selectNext(id); return "ok"; }
     if (cell.cell_type !== "code") { if (advance) selectNext(id); return "ok"; }
+    // Already running (or queued): a second run would interleave both runs' outputs in the cell.
+    if (cell.running) { if (advance) selectNext(id, true); return "ok"; }
     const code = editors.current.get(id)?.getValue() ?? cell.source;
     patchCell(id, { source: code, outputs: [], running: true, execution_count: null });
     if (advance) selectNext(id, true);
     try {
       const reply = await execute(code, { echo: false, history: false, sink: (it) => {
-        if (it.kind === "count") patchCell(id, { execution_count: it.count, running: false }, false);
-        else setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, outputs: applyOutput(c.outputs ?? [], it) } : c)) } : n));
+        // Outputs are part of the file: one that arrives after a save makes it dirty again.
+        if (it.kind === "count") patchCell(id, { execution_count: it.count, running: false }, it.count != null);
+        else { editVer.current++; setDirty(true); setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, outputs: applyOutput(c.outputs ?? [], it) } : c)) } : n)); }
       } });
       return (reply?.status ?? "ok") as string;
     } catch (e) {
@@ -353,8 +374,9 @@ export default function NotebookPanel(props: IDockviewPanelProps<{ path: string 
     patchCell(id, { source: code, outputs: [], running: true, execution_count: null });
     try {
       await debugCell(code, cellUri(id), 1, (it) => {
-        if (it.kind === "count") patchCell(id, { execution_count: it.count, running: false }, false);
-        else setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, outputs: applyOutput(c.outputs ?? [], it) } : c)) } : n));
+        // Outputs are part of the file: one that arrives after a save makes it dirty again.
+        if (it.kind === "count") patchCell(id, { execution_count: it.count, running: false }, it.count != null);
+        else { editVer.current++; setDirty(true); setNb((n) => (n ? { ...n, cells: n.cells.map((c) => (c.id === id ? { ...c, outputs: applyOutput(c.outputs ?? [], it) } : c)) } : n)); }
       });
     } finally {
       patchCell(id, { running: false }, false);

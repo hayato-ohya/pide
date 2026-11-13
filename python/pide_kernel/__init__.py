@@ -14,15 +14,19 @@ from __future__ import annotations
 
 import array
 import collections
+import functools
 import inspect
 import itertools
 import json
 import math
 import os
 import reprlib
+import stat
 import sys
 import time
 import types
+import warnings
+import weakref
 import zlib
 
 MIME = "application/x-pide+json"
@@ -207,6 +211,8 @@ def _safe(fn, default=None):
 
 
 def _finite(x):
+    if type(x).__name__ == "MaskedConstant":  # float(np.ma.masked) warns into the user's cell
+        return None
     try:
         f = float(x)
     except Exception:  # noqa: BLE001
@@ -232,11 +238,31 @@ def _py_scalar(v):
     return v
 
 
+def _quiet(fn):
+    """Entry points run with warnings off: inspecting objects (deprecated attributes, masked
+    values, lossy casts) must not print warnings into the user's cell output."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+def _df_nbytes(obj):
+    """``memory_usage(deep=False).sum()`` without the per-column Series it builds (0.25 s for
+    100k columns, on every snapshot): the blocks hold the same buffers."""
+    try:
+        return int(sum(b.values.nbytes for b in obj._mgr.blocks) + obj.index.memory_usage())
+    except Exception:  # noqa: BLE001  (private API moved)
+        return int(_safe(lambda: obj.memory_usage(deep=False).sum(), 0))
+
+
 def _nbytes(obj):
     if _is_numpy(obj):
         return int(obj.nbytes)
     if _is_pandas_df(obj):
-        return int(_safe(lambda: obj.memory_usage(deep=False).sum(), 0))
+        return _df_nbytes(obj)
     if _is_pandas_series(obj):
         return int(_safe(lambda: obj.memory_usage(deep=False), 0))
     if _is_polars_df(obj) or _is_polars_series(obj):
@@ -309,13 +335,40 @@ class _Repr(reprlib.Repr):
             return self.repr_dict(x, level)
         if isinstance(x, _DICT_VIEWS):
             return self._items(x, level, self.maxlist, f"{t.__name__}([", "])")
-        if t not in self._BASES and isinstance(x, self._BASES) and _safe(lambda: len(x), 0) > 200:
-            # a big subclass (OrderedDict, defaultdict, ...): never call its own __repr__
+        if t not in self._BASES and isinstance(x, self._BASES):
+            # A subclass (OrderedDict, defaultdict, namedtuple, ...): never call its own
+            # __repr__, which formats every element in full however few items it has.
+            if isinstance(x, tuple) and isinstance(getattr(t, "_fields", None), tuple):  # namedtuple
+                if level <= 0:
+                    return f"{t.__name__}(...)"
+                pieces = [f"{f}={self.repr1(v, level - 1)}" for f, v in itertools.islice(zip(t._fields, x), self.maxtuple)]
+                if len(x) > self.maxtuple:
+                    pieces.append("...")
+                return f"{t.__name__}({', '.join(pieces)})"
+            big = _safe(lambda: len(x), 0) > 200
             for base, meth in ((dict, self.repr_dict), (list, self.repr_list), (tuple, self.repr_tuple),
                                (set, self.repr_set), (frozenset, self.repr_frozenset)):
                 if isinstance(x, base):
-                    return meth(x, level)
+                    return meth(x, level) if big else f"{t.__name__}({meth(x, level)})"
         return super().repr1(x, level)
+
+    def repr_instance(self, x, level):
+        # Elements of containers (dataclasses, user objects): reprlib would call repr(x) in
+        # full on every snapshot.  Same latch as _short_repr for types that are slow.
+        t = type(x)
+        if t in _SLOW_REPR:
+            return f"<{t.__qualname__}>"
+        t0 = time.perf_counter()
+        try:
+            s = repr(x)
+        except Exception:  # noqa: BLE001
+            return f"<{t.__qualname__} instance>"
+        if time.perf_counter() - t0 > _SLOW_REPR_S:
+            _SLOW_REPR.add(t)
+        if len(s) > self.maxother:
+            i = max(0, (self.maxother - 3) // 2)
+            s = s[:i] + "..." + s[len(s) - (self.maxother - 3 - i):]
+        return s
 
 
 _DICT_VIEWS = (type({}.keys()), type({}.values()), type({}.items()))
@@ -364,8 +417,14 @@ def _full_repr(obj, n):
     """repr for detail(): full for ordinary objects, bounded for big containers."""
     if isinstance(obj, _CONTAINERS) or isinstance(obj, (str, bytes, bytearray, memoryview)):
         return _short_repr(obj, n)
+    t = type(obj)
+    if t in _SLOW_REPR:  # latched by a snapshot: do not pay for it on every viewer refresh
+        return f"<{t.__qualname__}>"
     try:
+        t0 = time.perf_counter()
         s = repr(obj)
+        if time.perf_counter() - t0 > _SLOW_REPR_S:
+            _SLOW_REPR.add(t)
     except Exception as e:  # noqa: BLE001
         s = f"<repr failed: {e!r}>"
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -396,6 +455,21 @@ def _cache_put(key, val):
     _STATS_CACHE.move_to_end(key)
     while len(_STATS_CACHE) > _STATS_CACHE_MAX:
         _STATS_CACHE.popitem(last=False)
+
+
+def _obj_cache_get(key, obj):
+    """Cached stats of ``obj`` itself.  ``id()`` and data pointers are reused once an object
+    is freed (``x = torch.randn(n)`` run twice), so the entry also remembers which object
+    it was computed for."""
+    ent = _cache_get(key)
+    return ent[1] if ent is not None and ent[0]() is obj else None
+
+
+def _obj_cache_put(key, obj, res):
+    try:
+        _cache_put(key, (weakref.ref(obj), res))
+    except TypeError:  # not weak-referenceable: do not cache
+        pass
 
 
 def _memmap_backed(np, arr):
@@ -542,8 +616,9 @@ def _tensor_stats(t):
         dev = t.device.type
         if dev != "cpu" and n > _DEVICE_STATS_MAX:
             return None
-        key = ("torch", id(t), t.data_ptr(), t._version, tuple(t.shape), str(t.dtype))
-        hit = _cache_get(key)
+        ver = _safe(lambda: t._version)  # raises for inference-mode tensors: computed, not cached
+        key = ("torch", id(t), t.data_ptr(), ver, tuple(t.shape), str(t.dtype))
+        hit = _obj_cache_get(key, t) if ver is not None else None
         if hit is not None:
             return hit
         if not _budget_ok():
@@ -559,7 +634,8 @@ def _tensor_stats(t):
             res["approx"] = True
             if res.get("nan"):
                 res["nan"] = int(res["nan"]) * k
-        _cache_put(key, res)
+        if ver is not None:
+            _obj_cache_put(key, t, res)
         return res
     except Exception:  # noqa: BLE001
         return None
@@ -598,7 +674,7 @@ def _jax_stats(obj):
         if n > _STATS_MAX:
             return None
         key = ("jax", id(obj), _safe(lambda: obj.unsafe_buffer_pointer()), tuple(obj.shape), str(obj.dtype))
-        hit = _cache_get(key)
+        hit = _obj_cache_get(key, obj)
         if hit is not None:
             return hit
         if not _budget_ok():
@@ -620,7 +696,7 @@ def _jax_stats(obj):
             res = {"min": int(vals[0]), "max": int(vals[1]), "mean": _finite(vals[2]), "true": int(vals[3]), "nan": 0}
         else:
             res = {"min": _int_stat(vals[0]), "max": _int_stat(vals[1]), "mean": _finite(vals[2]), "nan": 0}
-        _cache_put(key, res)
+        _obj_cache_put(key, obj, res)
         return res
     except Exception:  # noqa: BLE001
         return None
@@ -640,10 +716,16 @@ def _pandas_series_stats(s):
             if not _budget_ok():
                 return None
             k = -(-len(s) // _STATS_SAMPLE) if len(s) > _STATS_NOCACHE_MAX else 1
-            a = (s.iloc[::k] if k > 1 else s).to_numpy(dtype="float64", na_value=np.nan)
+            part = s.iloc[::k] if k > 1 else s
+            a = part.to_numpy(dtype="float64", na_value=np.nan)
             if not a.size:
                 return None
             res = _np_stats(np, a, "f", None, k)
+            if dt.kind in "iu" and res.get("min") is not None:
+                # float64 rounds integers beyond 2**53 (ids, timestamps in ns): exact min / max.
+                lo, hi = _safe(lambda: part.min()), _safe(lambda: part.max())
+                if isinstance(lo, (int, np.integer)) and isinstance(hi, (int, np.integer)):
+                    res["min"], res["max"] = _int_stat(lo), _int_stat(hi)
             if k > 1:
                 res["approx"] = True
             return res
@@ -786,7 +868,10 @@ def summarize(name, obj):
         if _is_numpy_scalar(obj):
             info["dtype"] = str(obj.dtype)
             plain = str(obj) if obj.dtype.kind in "MmSUOV" else _safe(lambda: _py_scalar(obj), obj)
-            info["value"] = plain if isinstance(plain, str) else _short_repr(plain)
+            if isinstance(plain, str):  # np.str_ / np.bytes_ can be arbitrarily long
+                info["value"] = plain if len(plain) <= 120 else plain[:119] + "…"
+            else:
+                info["value"] = _short_repr(plain)
         else:
             info["value"] = _short_repr(obj)
     else:
@@ -814,6 +899,7 @@ def _is_ipy_hidden(name, obj):
     return name in hidden and hidden[name] is obj
 
 
+@_quiet
 def snapshot(include_hidden=False):
     """Summaries for every object in the user namespace.  Called via user_expressions."""
     out = []
@@ -890,17 +976,25 @@ def _parse_path(path):
     return root, segs
 
 
+def _getitem(obj, key):
+    """``obj[key]`` that never inserts: a missing key of a dict with ``__missing__``
+    (defaultdict) raises KeyError instead of being created in the user's object."""
+    if isinstance(obj, dict) and key not in obj:
+        raise KeyError(key)
+    return obj[key]
+
+
 def _step_attr(obj, name):
     try:
         return getattr(obj, name)
     except AttributeError:
         if name.isdigit():  # legacy ``path.0.weight`` (nn.Sequential, lists)
             try:
-                return obj[int(name)]
+                return _getitem(obj, int(name))
             except (TypeError, IndexError, KeyError):
                 pass
         try:
-            return obj[name]  # ModuleDict / dict with str keys
+            return _getitem(obj, name)  # ModuleDict / dict with str keys
         except (TypeError, IndexError, KeyError):
             pass
         raise
@@ -908,7 +1002,7 @@ def _step_attr(obj, name):
 
 def _step_key(obj, key):
     try:
-        return obj[key]
+        return _getitem(obj, key)
     except (KeyError, IndexError, TypeError):
         if isinstance(key, str):
             return getattr(obj, key)
@@ -977,7 +1071,10 @@ def _to_cell(v):
     if isinstance(v, str):
         return v if len(v) <= _CELL_STR_MAX else v[:_CELL_STR_MAX] + "…"
     if isinstance(v, int):
-        return v if abs(v) < 2**53 else str(v)
+        if abs(v) < 2**53:
+            return v
+        # str() of an int beyond sys.get_int_max_str_digits() (4300 digits) raises.
+        return str(v) if v.bit_length() < 14000 else f"<int, {v.bit_length()} bits>"
     if isinstance(v, float):
         return None if v != v else _finite(v)
     return _short_repr(v, 60)
@@ -1045,6 +1142,7 @@ def _property_stub(name):
     return {"name": name, "kind": "object", "type": "property", "value": "<property>", "size": 0}
 
 
+@_quiet
 def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
     """A 2-D window of a variable, for the virtualized table viewer.
 
@@ -1068,9 +1166,14 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
         rows, children = [], []
         for name, p in itertools.islice(itertools.chain(params, bufs), row0, row1):
             is_buf = len(rows) + row0 >= len(params)
-            rows.append([name + (" (buffer)" if is_buf else ""), f"{tuple(p.shape)}", str(p.dtype).replace("torch.", ""),
-                         bool(p.requires_grad) and not is_buf, str(p.device), int(p.numel())])
-            children.append(summarize(name, p))
+            label = name + (" (buffer)" if is_buf else "")
+            try:
+                rows.append([label, f"{tuple(p.shape)}", str(p.dtype).replace("torch.", ""),
+                             bool(p.requires_grad) and not is_buf, str(p.device), int(p.numel())])
+                children.append(summarize(name, p))
+            except Exception:  # noqa: BLE001  (LazyLinear etc.: shape of an uninitialized parameter raises)
+                rows.append([label, "<uninitialized>", "", False, "", 0])
+                children.append(None)
         res["nrows"], res["ncols"] = n, 6
         res["columns"] = ["parameter", "shape", "dtype", "grad", "device", "numel"]
         res["rows"] = rows
@@ -1095,6 +1198,9 @@ def detail(path, row0=0, row1=200, col0=0, col1=50, index=None):
                 res["nrows"], res["ncols"] = shape[0], 1
                 res["rows"] = _cells_1d(_window_np(obj, kind, (slice(row0, row1),)))
             else:
+                if 0 in shape[:-2]:  # e.g. (0, 4, 4): there is no slice to show, which is not an error
+                    res["index"], res["nrows"], res["ncols"], res["rows"] = [], 0, shape[-1], []
+                    return _Payload(res)
                 lead = tuple(int(i) for i in (index or [0] * (ndim - 2)))
                 if len(lead) != ndim - 2 or any(not (0 <= i < s) for i, s in zip(lead, shape)):
                     res["error"] = f"index {list(lead)} out of range for shape {list(shape)}"
@@ -1309,8 +1415,22 @@ def _plot_payload(label, obj, max_points, heat_max=1000):
         idx = _safe(lambda: obj.index.to_numpy())
         if idx is not None and getattr(idx.dtype, "kind", "") == "M":
             x = _dt_to_ms(np, idx)
+    # Line plots keep at most max_points rows: take them from the native object first, so a
+    # huge frame / tensor is not converted (and copied off its device) just to be thinned.
+    pre, full_shape = 1, None
+    if kind in ("dataframe", "series", "polars", "tensor"):
+        shp = _safe(lambda: tuple(int(n) for n in obj.shape))
+        if shp and (len(shp) == 1 or (len(shp) == 2 and shp[1] <= 64)) and shp[0] > max_points:
+            pre = -(-shp[0] // max_points)
+            thin = _safe(lambda: obj.iloc[::pre] if kind in ("dataframe", "series") and not _is_polars_series(obj) else obj[::pre])
+            if thin is not None and _safe(lambda: thin.shape[0]) == -(-shp[0] // pre):
+                obj, full_shape = thin, shp
+                if x is not None:
+                    x = x[::pre]
+            else:
+                pre = 1
     arr = _as_numpy(obj)
-    res = {"path": label, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+    res = {"path": label, "shape": list(full_shape or arr.shape), "dtype": str(arr.dtype)}
     if arr.dtype.kind in "Mm":
         arr = _dt_to_ms(np, arr)
     elif arr.dtype.kind not in "biuf":
@@ -1349,9 +1469,12 @@ def _plot_payload(label, obj, max_points, heat_max=1000):
             res["columns"] = cols
     else:
         res["error"] = f"{arr.ndim}-D arrays: select a 2-D slice first"
+    if pre > 1 and "step" in res:
+        res["step"] *= pre
     return _Payload(res)
 
 
+@_quiet
 def plot_data(path, max_points=20000):
     """Numeric payload for quick plots from the workspace panel."""
     try:
@@ -1383,6 +1506,7 @@ def _guess_layout(shape):
     return "HW", n - 2
 
 
+@_quiet
 def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_000):
     """Normalized uint8 pixels for the image viewer.
 
@@ -1440,7 +1564,8 @@ def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_00
         elif chans == 4:
             view = view[..., :3]
     view = np.asarray(view)
-    if view.dtype == bool:
+    was_bool = view.dtype == bool
+    if was_bool:
         view = view.astype(np.uint8)
     if view.dtype.kind not in "biuf":
         return _Payload({"path": path, "error": f"dtype {view.dtype} is not numeric"})
@@ -1449,7 +1574,7 @@ def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_00
     lo = float(np.nanmin(f[finite])) if vmin is None and finite.any() else (vmin if vmin is not None else 0.0)
     hi = float(np.nanmax(f[finite])) if vmax is None and finite.any() else (vmax if vmax is not None else 1.0)
     # uint8 images: keep the natural 0..255 range
-    if vmin is None and vmax is None and view.dtype == np.uint8:
+    if vmin is None and vmax is None and view.dtype == np.uint8 and not was_bool:  # bool: 0..1
         lo, hi = 0.0, 255.0
     if hi <= lo:
         hi = lo + 1.0
@@ -1475,9 +1600,14 @@ def image(path, index=None, vmin=None, vmax=None, layout="auto", max_px=4_000_00
 
 
 def _ns_eval(expr):
-    return eval(expr, {"np": __import__("numpy")}, _namespace())  # noqa: S307 (user's own kernel)
+    # The namespace as *globals* (a copy, so nothing is written to it): as locals, lambdas
+    # and nested scopes inside the expression could not see the user's variables.
+    g = dict(_namespace())
+    g.setdefault("np", __import__("numpy"))
+    return eval(expr, g)  # noqa: S307 (user's own kernel)
 
 
+@_quiet
 def plot_expr(expr, max_points=20000):
     """Like plot_data, but for an arbitrary expression such as df[['a','b']] or x[:, 2]."""
     try:
@@ -1538,7 +1668,10 @@ def fs_list(path):
 def fs_read(path):
     try:
         p = os.path.expanduser(path)
-        size = os.path.getsize(p)
+        st = os.stat(p)
+        if not stat.S_ISREG(st.st_mode):  # /dev/zero, a FIFO: size 0, but reading never ends
+            return _Payload({"path": path, "error": "not a regular file"})
+        size = st.st_size
         if size > _FS_READ_MAX:
             return _Payload({"path": path, "error": f"file is {size:,} bytes; limit is {_FS_READ_MAX:,}"})
         with open(p, encoding="utf-8", newline="") as f:  # newline="": keep CRLF as-is

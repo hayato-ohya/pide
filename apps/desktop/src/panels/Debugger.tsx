@@ -42,7 +42,7 @@ export default function Debugger() {
       {bps.flatMap(([path, list]) => list.map((b) => (
         <div key={path + b.line} className="git-file" onDoubleClick={() => revealInEditor(path, b.line)} title="Double-click to go to; click ✎ to edit">
           <span className={`bp-dot ${b.logMessage ? "log" : b.condition || b.hitCondition ? "cond" : ""}`} onClick={() => toggleBreakpoint(path, b.line)} title="Remove" />
-          <span className="git-path">{path.startsWith("vscode-notebook-cell:") ? decodeURIComponent(new URL(path).pathname).split("/").pop() + " cell" : path.split("/").pop()}:{b.line}</span>
+          <span className="git-path">{path.startsWith("vscode-notebook-cell:") ? decodeURIComponent(new URL(path).pathname).split("/").pop() + " cell" : decodeURIComponent(path.split("/").pop() ?? "")}:{b.line}</span>
           <span className="muted bp-meta">{b.condition ? `if ${b.condition}` : ""}{b.hitCondition ? ` hit ${b.hitCondition}` : ""}{b.logMessage ? ` log "${b.logMessage}"` : ""}</span>
           <button className="mini" onClick={() => set({ bpEdit: { uri: path, line: b.line } })}>✎</button>
         </div>

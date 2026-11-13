@@ -58,6 +58,8 @@ export default function Figures() {
   const f = figures.find((x) => x.id === active) ?? figures[figures.length - 1];
   const floatOut = () => {
     if (!f) return;
+    const open = dockApi()?.getPanel(`fig:${f.id}`);
+    if (open) { open.api.setActive(); return; } // already floating: a second panel with this id throws
     dockApi()?.addPanel({ id: `fig:${f.id}`, component: "figwindow", title: f.title, params: { figId: f.id }, floating: { width: 640, height: 480 } });
   };
   return (
