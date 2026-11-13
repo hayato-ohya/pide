@@ -28,7 +28,14 @@ export default function ImageView({ path, generation }: { path: string; generati
   const [cmap, setCmap] = useState("viridis");
   const [layout, setLayout] = useState("auto");
   const [index, setIndex] = useState<number[]>([]);
+  // `rangeDraft` follows the inputs; `range` (what is fetched) follows 300 ms after typing
+  // stops, so a full image is not rendered and transferred for every keystroke.
   const [range, setRange] = useState<{ vmin: string; vmax: string }>({ vmin: "", vmax: "" });
+  const [rangeDraft, setRangeDraft] = useState(range);
+  useEffect(() => {
+    const t = setTimeout(() => setRange((r) => (r.vmin === rangeDraft.vmin && r.vmax === rangeDraft.vmax ? r : rangeDraft)), 300);
+    return () => clearTimeout(t);
+  }, [rangeDraft.vmin, rangeDraft.vmax]);
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const [hover, setHover] = useState<string>("");
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -109,8 +116,8 @@ export default function ImageView({ path, generation }: { path: string; generati
         {img && <span className="muted">{img.shape.join("×")} {img.dtype} · {img.layout}{img.step > 1 ? ` · ↓${img.step}` : ""}</span>}
         {layoutSel}
         {img && img.channels === 1 && <label>cmap <select value={cmap} onChange={(e) => setCmap(e.target.value)}>{Object.keys(STOPS).map((k) => <option key={k}>{k}</option>)}</select></label>}
-        <label>min <input className="small" value={range.vmin} placeholder={img ? img.vmin.toPrecision(4) : ""} onChange={(e) => setRange({ ...range, vmin: e.target.value })} /></label>
-        <label>max <input className="small" value={range.vmax} placeholder={img ? img.vmax.toPrecision(4) : ""} onChange={(e) => setRange({ ...range, vmax: e.target.value })} /></label>
+        <label>min <input className="small" value={rangeDraft.vmin} placeholder={img ? img.vmin.toPrecision(4) : ""} onChange={(e) => setRangeDraft({ ...rangeDraft, vmin: e.target.value })} /></label>
+        <label>max <input className="small" value={rangeDraft.vmax} placeholder={img ? img.vmax.toPrecision(4) : ""} onChange={(e) => setRangeDraft({ ...rangeDraft, vmax: e.target.value })} /></label>
         <label>zoom <select value={String(zoom)} onChange={(e) => setZoom(e.target.value === "fit" ? "fit" : Number(e.target.value))}><option value="fit">fit</option><option value="0.5">50%</option><option value="1">100%</option><option value="2">200%</option><option value="4">400%</option><option value="8">800%</option></select></label>
         {img?.extra.map((n, i) => (
           <label key={i} className="vv-dim">axis {i}: <input type="number" min={0} max={n - 1} value={index[i] ?? 0} onChange={(e) => { const ni = [...index]; while (ni.length < img.extra.length) ni.push(0); ni[i] = Math.max(0, Math.min(n - 1, +e.target.value)); setIndex(ni); }} /><span className="muted">/{n}</span></label>

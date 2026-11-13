@@ -176,15 +176,23 @@ async fn start_kernel(
         // Remote kernel over SSH: ship the helper package with it.
         #[cfg(debug_assertions)]
         if r.ssh.is_none() { r.ssh = std::env::var("PIDE_SSH").ok(); }
-        let helper_src = std::fs::read_to_string(helper.join("pide_kernel/__init__.py")).map_err(|e| format!("helper source: {e}"))?;
-        Kernel::launch_remote_cancellable(r, &helper_src, &cancel).await
+        // Errors here go through `launched` like launch failures, so the UI is told "dead"
+        // instead of being left in "starting".
+        match std::fs::read_to_string(helper.join("pide_kernel/__init__.py")) {
+            Ok(helper_src) => Kernel::launch_remote_cancellable(r, &helper_src, &cancel).await.map_err(|e| format!("{e:#}")),
+            Err(e) => Err(format!("helper source: {e}")),
+        }
     } else if let Some(cf) = connection_file {
         // Attach to a running kernel (needs pide_kernel importable there).
-        let txt = std::fs::read_to_string(&cf).map_err(|e| format!("connection file: {e}"))?;
-        let info: kernel_client::ConnectionInfo = serde_json::from_str(&txt).map_err(|e| format!("connection file: {e}"))?;
-        Kernel::connect_cancellable(info, &cancel).await
+        let info = std::fs::read_to_string(&cf)
+            .map_err(|e| format!("connection file: {e}"))
+            .and_then(|txt| serde_json::from_str::<kernel_client::ConnectionInfo>(&txt).map_err(|e| format!("connection file: {e}")));
+        match info {
+            Ok(info) => Kernel::connect_cancellable(info, &cancel).await.map_err(|e| format!("{e:#}")),
+            Err(e) => Err(e),
+        }
     } else {
-        Kernel::launch_cancellable(spec, &cancel).await
+        Kernel::launch_cancellable(spec, &cancel).await.map_err(|e| format!("{e:#}"))
     };
     let k = match launched {
         // Cancelled (stop / restart / app exit): a kernel that came up anyway goes again.
@@ -199,8 +207,8 @@ async fn start_kernel(
         }
         Ok(k) => k,
         Err(e) => {
-            emit_status(&app, "dead", Some(python.clone()), cwd.clone(), Some(format!("{e:#}")));
-            return Err(format!("{e:#}"));
+            emit_status(&app, "dead", Some(python.clone()), cwd.clone(), Some(e.clone()));
+            return Err(e);
         }
     };
 
@@ -514,7 +522,8 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
 
 /// Write to a sibling temp file and rename, so a crash never leaves a truncated file.
 /// Symlinks are written through (the real file is replaced, not the link); if the rename
-/// fails (e.g. the target is locked on Windows) fall back to a direct write.
+/// fails (e.g. the target is locked on Windows), or the temp file cannot be created (read-only
+/// folder), fall back to a direct write.
 fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -538,9 +547,11 @@ fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
         }
         Ok(())
     })();
-    if let Err(e) = staged {
+    if staged.is_err() {
+        // No temp file possible (a writable file in a folder we cannot create files in, a
+        // full disk, ...): write in place, which reports the real error if that fails too.
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.to_string());
+        return std::fs::write(p, bytes).map_err(|e| e.to_string());
     }
     match std::fs::rename(&tmp, p) {
         Ok(()) => Ok(()),
@@ -776,4 +787,23 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn write_atomic_writes_in_place_when_the_folder_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pide-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.py");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = super::write_atomic(&file.to_string_lossy(), b"new");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((res, text.as_str()), (Ok(()), "new"));
+    }
 }

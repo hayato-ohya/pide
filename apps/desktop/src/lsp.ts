@@ -132,6 +132,15 @@ class LspClient {
     }, 1000 * 2 ** (n - 1));
   }
 
+  /** One message at a time: separate invokes run as independent backend tasks, so a small
+   * request could overtake the (large) didChange sent just before it. */
+  private sendQueue: Promise<unknown> = Promise.resolve();
+  private send(msg: Json): Promise<unknown> {
+    const p = this.sendQueue.then(() => invoke("lsp_send", { name: this.name, msg }));
+    this.sendQueue = p.catch(() => {});
+    return p;
+  }
+
   request(method: string, params: Json, timeoutMs = 15000, token?: Monaco.CancellationToken): Promise<Json> {
     flushPendingChanges();
     const id = this.nextId++;
@@ -141,21 +150,21 @@ class LspClient {
         this.notify("$/cancelRequest", { id });
         reject(new Error(why));
       };
-      this.pending.set(id, { resolve, reject });
-      setTimeout(() => cancel(`${this.name} ${method} timed out`), timeoutMs);
+      const timer = setTimeout(() => cancel(`${this.name} ${method} timed out`), timeoutMs);
+      this.pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
       token?.onCancellationRequested(() => cancel(`${this.name} ${method} cancelled`));
     });
-    invoke("lsp_send", { name: this.name, msg: { jsonrpc: "2.0", id, method, params } }).catch((e) => {
+    this.send({ jsonrpc: "2.0", id, method, params }).catch((e) => {
       const q = this.pending.get(id);
       if (q) { this.pending.delete(id); q.reject(new Error(String(e))); }
     });
     return p;
   }
   notify(method: string, params: Json) {
-    invoke("lsp_send", { name: this.name, msg: { jsonrpc: "2.0", method, params } }).catch(() => {});
+    this.send({ jsonrpc: "2.0", method, params }).catch(() => {});
   }
   private respond(id: Json, result: Json) {
-    invoke("lsp_send", { name: this.name, msg: { jsonrpc: "2.0", id, result } }).catch(() => {});
+    this.send({ jsonrpc: "2.0", id, result }).catch(() => {});
   }
 
   handle(msg: Json) {
@@ -294,7 +303,7 @@ export function saveDocument(uri: string) {
   for (const c of clients.values()) if (c.state === "running") c.notify("textDocument/didSave", { textDocument: { uri } });
 }
 export function closeDocument(uri: string) {
-  docs.delete(uri);
+  if (!docs.delete(uri)) return; // already closed (save-as closes, then the unmount does)
   for (const c of clients.values()) if (c.state === "running") c.notify("textDocument/didClose", { textDocument: { uri } });
   const m = monacoRef?.editor.getModel(monacoRef.Uri.parse(uri));
   if (m && monacoRef) for (const owner of ["pyright", "ruff"]) monacoRef.editor.setModelMarkers(m, owner, []);

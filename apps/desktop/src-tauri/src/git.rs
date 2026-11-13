@@ -20,6 +20,29 @@ fn rel(repo: &Repository, path: &str) -> PathBuf {
     PathBuf::from(r.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/"))
 }
 
+/// The repository root as the caller spells it.  libgit2 reports the resolved path, while
+/// the UI compares the root with paths derived from its own working folder: under a symlink
+/// (`/tmp` → `/private/tmp`, a linked projects folder) the two would never match.
+fn caller_spelling(root: &Path, cwd: &str) -> String {
+    let plain = || {
+        let s = root.to_string_lossy().replace('\\', "/");
+        s.trim_end_matches('/').to_string()
+    };
+    let (Ok(root_c), Ok(cwd_c)) = (std::fs::canonicalize(root), std::fs::canonicalize(cwd)) else { return plain() };
+    // cwd is the root or a folder below it: drop as many trailing components from the
+    // caller's cwd as it lies below the root.
+    let Ok(below) = cwd_c.strip_prefix(&root_c) else { return plain() };
+    let mut p = PathBuf::from(cwd);
+    for _ in below.components() {
+        if !p.pop() { return plain(); }
+    }
+    // Only if that really is the same folder (`..` or links inside cwd would break the count).
+    match std::fs::canonicalize(&p) {
+        Ok(c) if c == root_c => { let s = p.to_string_lossy().replace('\\', "/"); s.trim_end_matches('/').to_string() }
+        _ => plain(),
+    }
+}
+
 fn workdir(repo: &Repository) -> Result<PathBuf, String> {
     repo.workdir().map(|p| p.to_path_buf()).ok_or_else(|| "bare repository has no working tree".to_string())
 }
@@ -52,7 +75,7 @@ pub struct GitStatus {
 #[tauri::command(async)]
 pub fn git_status(cwd: String) -> Result<GitStatus, String> {
     let repo = open(&cwd)?;
-    let root = repo.workdir().map(|p| p.to_string_lossy().trim_end_matches('/').to_string()).unwrap_or_default();
+    let root = repo.workdir().map(|p| caller_spelling(p, &cwd)).unwrap_or_default();
     let head = repo.head().ok();
     let branch = head.as_ref().and_then(|h| h.shorthand().map(|s| s.to_string()));
     let head_oid = head.as_ref().and_then(|h| h.target()).map(|o| o.to_string());
@@ -513,7 +536,8 @@ pub fn git_resolve(cwd: String, path: String, side: String, allow_markers: bool)
             if !allow_markers && abs.exists() {
                 let bytes = std::fs::read(&abs).map_err(|e| e.to_string())?;
                 let text = String::from_utf8_lossy(&bytes);
-                if text.lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "=======") {
+                // A lone `=======` is not a marker: Markdown / reST underline headings with it.
+                if text.lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ")) {
                     return Err("file still contains conflict markers".into());
                 }
             }
@@ -693,6 +717,22 @@ mod tests {
         git_checkout(cwd.clone(), "origin/feat".into()).unwrap();
         assert_eq!(repo.head().unwrap().name(), Some("refs/heads/feat"));
         assert!(!repo.head_detached().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_root_keeps_the_callers_spelling() {
+        let (dir, _cwd, _repo) = temp_repo("spelling");
+        std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        let link = dir.with_file_name(format!("pide-git-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let l = link.to_string_lossy().to_string();
+        assert_eq!(git_status(l.clone()).unwrap().root, l);
+        assert_eq!(git_status(format!("{l}/sub/deep")).unwrap().root, l);
+        assert_eq!(git_status(format!("{l}/")).unwrap().root, l);
+        let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

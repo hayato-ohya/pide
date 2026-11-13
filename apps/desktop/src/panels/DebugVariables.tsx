@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { copyToGlobals, fetchVariables, frameLabel, selectFrame, type DapVar } from "../debug";
-import { useStore } from "../store";
+import { get, useStore } from "../store";
 
 /** Workspace contents while the debugger is stopped: the selected frame's variables (expandable). */
 export default function DebugVariables() {
@@ -12,8 +12,10 @@ export default function DebugVariables() {
   const toggle = async (v: DapVar) => {
     if (!v.variablesReference) return;
     if (open[v.variablesReference]) { const o = { ...open }; delete o[v.variablesReference]; setOpen(o); return; }
+    const shown = get().debug.variables;
     const kids = await fetchVariables(v.variablesReference).catch(() => []);
-    setOpen({ ...open, [v.variablesReference]: kids });
+    if (get().debug.variables !== shown) return; // stepped meanwhile: references are reissued per stop
+    setOpen((o) => ({ ...o, [v.variablesReference]: kids })); // not the `open` captured before the await
   };
   const render = (vars: DapVar[], depth: number): JSX.Element[] =>
     vars.flatMap((v) => [

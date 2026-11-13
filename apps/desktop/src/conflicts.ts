@@ -15,7 +15,8 @@ export function parseConflicts(text: string): ConflictBlock[] {
   const out: ConflictBlock[] = [];
   let cur: Partial<ConflictBlock> | null = null;
   for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
+    // CRLF files: the marker lines end in "\r" too.
+    const l = lines[i].endsWith("\r") ? lines[i].slice(0, -1) : lines[i];
     if (l.startsWith("<<<<<<< ") || l === "<<<<<<<") { cur = { start: i + 1, base: null, oursLabel: l.slice(8).trim() }; }
     else if (cur && (l.startsWith("||||||| ") || l === "|||||||") && cur.mid === undefined) cur.base = i + 1;
     else if (cur && l === "=======" && cur.mid === undefined) cur.mid = i + 1;

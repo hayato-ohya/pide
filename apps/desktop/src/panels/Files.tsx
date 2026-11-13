@@ -16,7 +16,10 @@ function fmtSize(n: number) {
 }
 
 export default function Files(props: IDockviewPanelProps) {
-  const active = usePanelVisible(props.api) && usePageVisible();
+  // Both hooks on every render (`a && b()` would skip the second one while hidden).
+  const panelVisible = usePanelVisible(props.api);
+  const pageVisible = usePageVisible();
+  const active = panelVisible && pageVisible;
   const cwd = useStore((s) => s.cwd);
   const kernel = useStore((s) => s.kernel);
   const remote = useStore((s) => s.remote);
@@ -25,7 +28,7 @@ export default function Files(props: IDockviewPanelProps) {
   const badges = statusMap();
   const root = git.status?.root;
   const badge = (p: string, isDir: boolean) => {
-    if (!root || !p.startsWith(root)) return null;
+    if (!root || !(p === root || p.startsWith(root + "/"))) return null;
     const rel = p.slice(root.length + 1);
     if (!isDir) return badges.get(rel) ?? null;
     for (const k of badges.keys()) if (k.startsWith(rel + "/")) return "•";

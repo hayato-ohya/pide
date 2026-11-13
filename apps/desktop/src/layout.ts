@@ -27,7 +27,6 @@ export function buildDefaultLayout(a: DockviewApi) {
   editor.api.setActive();
 }
 
-export const revealRequests = new Map<string, number>();
 export function openNotebook(path: string | null) {
   if (!api) return;
   const id = path ? `nb:${path}` : `nb:/Untitled-${Date.now()}.ipynb`;
@@ -39,9 +38,11 @@ export function openNotebook(path: string | null) {
 
 export function openFile(path: string, line?: number) {
   if (!api) return;
+  // One spelling per file (Windows: `c:\\x\\a.py` from a URI vs `C:/x/a.py` from the file
+  // tree), or the same file opens in two tabs sharing one Monaco model.
+  path = path.replace(/\\/g, "/").replace(/^([a-z]):\//, (_m, d: string) => `${d.toUpperCase()}:/`);
   if (path.endsWith(".ipynb")) { openNotebook(path); return; }
   const id = `editor:${path}`;
-  if (line) revealRequests.set(path, line);
   const existing = api.getPanel(id);
   if (existing) {
     existing.api.setActive();
@@ -124,4 +125,13 @@ export async function plotVariable(name: string, kind: import("./plots").PlotKin
 
 export function selectedVariable() {
   return get().selectedVar;
+}
+
+/** Bring the Figures panel to the front, re-creating it if it was closed. */
+export function showFigures() {
+  if (!api) return;
+  const p = api.getPanel("figures");
+  if (p) { p.api.setActive(); return; }
+  const ref = api.panels.find((x) => x.id.startsWith("editor:"));
+  api.addPanel({ id: "figures", component: "figures", title: "Figures", position: ref ? { referencePanel: ref, direction: "within" } : undefined });
 }

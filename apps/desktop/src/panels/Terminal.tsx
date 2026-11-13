@@ -63,10 +63,13 @@ function TermView({ tab, onExit, onTitle }: { tab: Tab; onExit: () => void; onTi
       unlistenExit = await listen<{ id: number; code: number | null }>("pty-exit", (e) => { if (early) early.push(() => onPtyExit(e.payload.id, e.payload.code)); else onPtyExit(e.payload.id, e.payload.code); });
       if (disposed) { unlistenData(); unlistenExit(); return; }
       try {
-        const id = await invoke<number>("pty_spawn", { cols: term.cols, rows: term.rows, cwd: remote ? null : get().cwd, command, env: { PIDE_PYTHON: get().python ?? "" } });
+        const spawned = { cols: term.cols, rows: term.rows };
+        const id = await invoke<number>("pty_spawn", { ...spawned, cwd: remote ? null : get().cwd, command, env: { PIDE_PYTHON: get().python ?? "" } });
         // Unmounted while spawning: the cleanup saw no id, so kill it here.
         if (disposed) { invoke("pty_kill", { id }).catch(() => {}); return; }
         ptyRef.current = id;
+        // A fit() while the spawn was in flight had no PTY to resize yet.
+        if (term.cols !== spawned.cols || term.rows !== spawned.rows) invoke("pty_resize", { id, cols: term.cols, rows: term.rows }).catch(() => {});
         const queued = early;
         early = null;
         for (const f of queued) f();
@@ -77,7 +80,10 @@ function TermView({ tab, onExit, onTitle }: { tab: Tab; onExit: () => void; onTi
       }
     })();
 
-    const onData = term.onData((d) => { if (ptyRef.current != null) invoke("pty_write", { id: ptyRef.current, data: d }).catch(() => {}); });
+    // Chunks are written one after the other: independent invokes could reach the PTY out of
+    // order during a paste or fast typing.
+    let writes: Promise<unknown> = Promise.resolve();
+    const onData = term.onData((d) => { const id = ptyRef.current; if (id != null) writes = writes.then(() => invoke("pty_write", { id, data: d })).catch(() => {}); });
     const onResize = term.onResize(({ cols, rows }) => { if (ptyRef.current != null) invoke("pty_resize", { id: ptyRef.current, cols, rows }).catch(() => {}); });
     const ro = new ResizeObserver(() => { if (el.clientHeight > 0) { try { fit.fit(); } catch { /* hidden */ } } });
     ro.observe(el);

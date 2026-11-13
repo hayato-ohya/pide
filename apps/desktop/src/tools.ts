@@ -19,7 +19,8 @@ export function saveToolSettings(t: ToolSettings) {
 export const toolSettings = () => get().tools;
 
 interface ToolResult { found: boolean; code: number | null; stdout: string; stderr: string }
-const splitArgs = (s: string) => s.trim() ? s.trim().split(/\s+/) : [];
+/** Split on whitespace, keeping quoted parts together: `--ignore "E501, W503"`. */
+const splitArgs = (s: string) => (s.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map((a) => a.replace(/"([^"]*)"|'([^']*)'/g, (_m, d, q) => d ?? q));
 const warnedMissing = new Set<string>();
 
 async function run(tool: string, args: string[], stdin: string): Promise<ToolResult | null> {
@@ -88,6 +89,8 @@ export function applyLint(monaco: typeof Monaco, model: Monaco.editor.ITextModel
 
 /** Debounced per-model linting for the CLI linters. */
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
+/** Latest lint run per model: a slow earlier run must not overwrite a newer one's markers. */
+const lintRuns = new Map<string, number>();
 export function scheduleLint(monaco: typeof Monaco, model: Monaco.editor.ITextModel, displayName: string) {
   const key = model.uri.toString();
   const t = toolSettings();
@@ -95,7 +98,10 @@ export function scheduleLint(monaco: typeof Monaco, model: Monaco.editor.ITextMo
   if (timers.has(key)) clearTimeout(timers.get(key)!);
   timers.set(key, setTimeout(async () => {
     timers.delete(key);
+    if (model.isDisposed()) { lintRuns.delete(key); return; } // tab closed within the debounce
+    const run = (lintRuns.get(key) ?? 0) + 1;
+    lintRuns.set(key, run);
     const items = await lintWithTool(model.getValue(), displayName).catch(() => null);
-    if (!model.isDisposed()) applyLint(monaco, model, items);
+    if (!model.isDisposed() && lintRuns.get(key) === run) applyLint(monaco, model, items);
   }, 600));
 }

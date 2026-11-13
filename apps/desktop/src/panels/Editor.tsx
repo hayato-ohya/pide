@@ -5,7 +5,7 @@ import type { IDockviewPanelProps } from "dockview";
 import { parseConflicts, resolveBlockLines, type ConflictBlock, type Side } from "../conflicts";
 import { refreshGit } from "../git";
 import { invoke } from "@tauri-apps/api/core";
-import { readText, savePath, writeText } from "../fs";
+import { isRemote, readText, savePath, writeText } from "../fs";
 import { scheduleLint } from "../tools";
 import { execute } from "../kernel";
 import { get, pushConsole, setDirtyPanel, useStore } from "../store";
@@ -22,7 +22,7 @@ initLsp(monaco);
 type Editor = Parameters<OnMount>[0];
 
 /** Registry so the toolstrip can act on the active editor. */
-export const editors = new Map<string, { run: () => void; runCell: () => void; save: () => Promise<void>; format: () => void; debug: () => void; debugCell: () => void; path: string | null }>();
+export const editors = new Map<string, { run: () => void; runCell: () => void; save: () => Promise<boolean>; format: () => void; debug: () => void; debugCell: () => void; path: string | null }>();
 export let activeEditorId: string | null = null;
 let untitledCounter = 0;
 export function bpTitle(b: Breakpoint) {
@@ -48,6 +48,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const [path, setPath] = useState<string | null>(props.params.path);
   const [content, setContent] = useState<string | null>(props.params.path ? null : "");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [mounted, setMounted] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [conflicts, setConflicts] = useState<ConflictBlock[]>([]);
   const ed = useRef<Editor | null>(null);
@@ -80,22 +81,34 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     ed.current.focus();
   };
 
-  const doSave = async () => {
-    if (content === null) { pushConsole({ kind: "info", text: "File did not load; refusing to overwrite it." }); return; }
+  /** Resolves false when nothing was written (cancelled dialog, write error): callers that
+   * go on to use the file on disk (Run, Debug, Mark resolved) must stop then. */
+  const doSave = async (): Promise<boolean> => {
+    if (content === null) { pushConsole({ kind: "info", text: "File did not load; refusing to overwrite it." }); return false; }
     let p = path;
     const wasUntitled = !p;
     if (!p) {
       p = await savePath("untitled.py", [{ name: "Python", extensions: ["py"] }]);
-      if (!p) return;
+      if (!p) return false;
     }
     const text = ed.current?.getValue() ?? content ?? "";
     const ver = ed.current?.getModel()?.getAlternativeVersionId();
+    // Changed on disk since it was loaded / last saved (a `git checkout` in the terminal, a
+    // script that rewrote it) while the window kept focus, so checkReload never ran: ask
+    // before overwriting.  Local files only: a remote read waits behind a running cell.
+    if (!wasUntitled && savedText.current !== null && !isRemote()) {
+      const disk = await readText(p).catch(() => null); // deleted / unreadable: just write
+      if (disk !== null && disk !== savedText.current && disk !== text) {
+        if (!(await confirmAsync(`${p.split("/").pop()} changed on disk since it was opened. Overwrite it with your version?`))) return false;
+        savedText.current = disk; // asked once for this change
+      }
+    }
     saving.current = true;
     try {
       await writeText(p, text);
     } catch (e) {
       pushConsole({ kind: "info", text: `Save failed: ${e}` });
-      return;
+      return false;
     } finally {
       saving.current = false;
     }
@@ -107,20 +120,22 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
       // Re-open under the real path so LSP, breakpoints and "open file" all key on it.
       const { openFile } = await import("../layout");
       const bps = get().debug.breakpoints[uri];
+      for (const b of bps ?? []) toggleBreakpoint(uri, b.line); // moved to the file below, not copied
       closeDocument(uri);
       props.api.close();
       openFile(p, ed.current?.getPosition()?.lineNumber);
       if (bps?.length) setTimeout(() => { for (const b of bps) setBreakpoint(monaco.Uri.file(p!).toString(), b.line, b); }, 300);
-      return;
+      return true;
     }
     saveDocument(uri);
+    return true;
   };
 
   /** MATLAB-style Run: save, then execute the file by name so tracebacks and breakpoints point at it. */
   const run = async () => {
     const text = ed.current?.getValue() ?? "";
     if (path) {
-      if (dirty) await doSave();
+      if (dirty && !(await doSave())) return; // never run the stale file on disk
       pushConsole({ kind: "info", text: `Run ${path.split("/").pop()}` });
       execute(`__import__('pide_kernel').run_file(${JSON.stringify(path)})`, { echo: false });
     } else {
@@ -139,7 +154,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   const runCell = () => { const c = currentCell(); if (c) execute(c.code); };
   const debugThis = async () => {
     if (!path) { pushConsole({ kind: "info", text: "Save the file before debugging it (or use Debug Cell)." }); return; }
-    if (dirty) await doSave();
+    if (dirty && !(await doSave())) return;
     debugFile(path);
   };
   const debugThisCell = () => { const c = currentCell(); if (c) debugCell(c.code, uri, c.start); };
@@ -187,6 +202,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
 
   const onMount: OnMount = (editor, m) => {
     ed.current = editor;
+    setMounted(true); // the decoration effects below ran before the editor existed
     if (import.meta.env.DEV && (window as any).pide) (window as any).pide.editor = editor;
     editor.addAction({ id: "pide.runCellCtrlEnter", label: "Run Cell", keybindings: [m.KeyMod.CtrlCmd | m.KeyCode.Enter], run: () => { editors.get(id)?.runCell(); } });
     editor.addAction({ id: "pide.runOrContinue", label: "Run File / Continue", keybindings: [m.KeyCode.F5], run: () => { if (get().debug.stopped) cont(); else editors.get(id)?.run(); } });
@@ -244,7 +260,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     if (!e) return;
     bpDec.current ??= e.createDecorationsCollection();
     bpDec.current.set((bpLines ?? []).map((b: Breakpoint) => ({ range: new monaco.Range(b.line, 1, b.line, 1), options: { glyphMarginClassName: b.logMessage ? "bp-glyph log" : b.condition || b.hitCondition ? "bp-glyph cond" : "bp-glyph", glyphMarginHoverMessage: { value: bpTitle(b) } } })));
-  }, [bpLines, content]);
+  }, [bpLines, content, mounted]);
   useEffect(() => {
     const e = ed.current;
     if (!e) return;
@@ -256,7 +272,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
       curDec.current.set([{ range: new monaco.Range(line, 1, line, 1), options: { isWholeLine: true, className: "debug-line", glyphMarginClassName: "debug-arrow" } }]);
       e.revealLineInCenterIfOutsideViewport(line);
     } else curDec.current.set([]);
-  }, [debug.stopped, debug.frameId, debug.frames, content]);
+  }, [debug.stopped, debug.frameId, debug.frames, content, mounted]);
 
   /** Replace the conflict block containing the cursor (or the first one) with the chosen side. */
   const acceptAt = (side: Side) => {
@@ -266,7 +282,15 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     const b = conflicts.find((x) => line >= x.start && line <= x.end) ?? conflicts.find((x) => x.start > line) ?? conflicts[0];
     if (!b) return;
     const keep = resolveBlockLines(model.getLinesContent(), b, side);
-    e.executeEdits("conflict", [{ range: new monaco.Range(b.start, 1, b.end, model.getLineMaxColumn(b.end)), text: keep.join("\n") }]);
+    // Nothing kept (that side deleted the lines): remove the block with its line break, or an
+    // empty line would stay behind.
+    const last = model.getLineCount();
+    const range = keep.length || (b.start === 1 && b.end === last)
+      ? new monaco.Range(b.start, 1, b.end, model.getLineMaxColumn(b.end))
+      : b.end < last
+        ? new monaco.Range(b.start, 1, b.end + 1, 1)
+        : new monaco.Range(b.start - 1, model.getLineMaxColumn(b.start - 1), b.end, model.getLineMaxColumn(b.end));
+    e.executeEdits("conflict", [{ range, text: keep.join("\n") }]);
     e.setPosition({ lineNumber: b.start, column: 1 });
     e.focus();
   };
@@ -278,9 +302,9 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
   };
   const markResolved = async () => {
     if (!path) return;
-    await doSave();
+    if (!(await doSave())) return; // do not stage the old content
     const root = get().git.status?.root;
-    if (!root || !path.startsWith(root)) return;
+    if (!root || !path.startsWith(root + "/")) return;
     try {
       await invoke("git_resolve", { cwd: get().cwd, path, side: "workdir", allowMarkers: false });
       pushConsole({ kind: "info", text: `Resolved ${path}` });
@@ -288,7 +312,7 @@ export default function EditorPanel(props: IDockviewPanelProps<{ path: string | 
     } catch (e) { pushConsole({ kind: "info", text: `git: ${e}` }); }
   };
   const gitRoot = useStore((s) => s.git.status?.root);
-  const inRepo = !!(path && gitRoot && path.startsWith(gitRoot));
+  const inRepo = !!(path && gitRoot && path.startsWith(gitRoot + "/"));
   const isConflicted = useStore((s) => !!(path && gitRoot && s.git.status?.entries.some((e) => e.area === "conflicted" && `${gitRoot}/${e.path}` === path)));
 
   if (loadError && loadError !== "retry") return <div className="vv-error">Could not open {path}: {loadError} <button onClick={() => setLoadError("retry")}>Retry</button></div>;

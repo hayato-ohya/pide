@@ -282,7 +282,7 @@ export async function onDebugEvent(ev: { event: string; body: any }) {
     case "terminated":
     case "exited":
       stopGen++;
-      patch({ active: false, stopped: false, frames: [], frameId: null, variables: [] });
+      patch({ active: false, stopped: false, threadId: null, reason: null, frames: [], frameId: null, variables: [], scopes: [], cellFiles: {}, exceptionInfo: null });
       return;
   }
 }

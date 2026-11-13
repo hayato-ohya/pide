@@ -84,7 +84,7 @@ function applyWorkspace(ue: any) {
     }
   }
   vars.sort((a, b) => a.name.localeCompare(b.name));
-  set({ variables: vars, changed });
+  set({ variables: vars, changed, wsTick: get().wsTick + 1 });
 }
 
 function handleEvent(ev: KernelEvent) {
@@ -106,6 +106,9 @@ function handleEvent(ev: KernelEvent) {
         return;
       case "execute_input":
         // Only echo code we did not print ourselves (e.g. from other clients).
+        // The execution starts now: its clear_output must not reach back to the output of a
+        // cell that was still running when this one was queued.
+        if (ev.parent_id && consoleMarks.has(ev.parent_id)) consoleMarks.set(ev.parent_id, get().console[get().console.length - 1]?.id ?? 0);
         return;
       case "stream": {
         flushClear(ev.parent_id);
@@ -169,6 +172,9 @@ function handleEvent(ev: KernelEvent) {
   } else if (ev.channel === "shell") {
     if (ev.msg_type === "execute_reply") {
       applyWorkspace(c.user_expressions);
+      // A cell that raised (or was interrupted) comes back without user_expressions, so its
+      // snapshot is missing: ask again, or variables it did create stay hidden.
+      if (c.status === "error") void refreshWorkspace().catch(() => {});
       if (c.execution_count != null) set({ execCount: c.execution_count });
       // input() was interrupted / raised: the kernel no longer waits for that reply.
       if (ev.parent_id && get().inputRequest?.parent.parent_id === ev.parent_id) set({ inputRequest: null });
@@ -190,6 +196,9 @@ function handleEvent(ev: KernelEvent) {
     }
   } else if (ev.channel === "stdin" && ev.msg_type === "input_request") {
     set({ inputRequest: { parent: ev, prompt: c.prompt ?? "", password: !!c.password } });
+    // The prompt is answered in the Command Window: bring it up, or a notebook cell (or a
+    // script) calling input() looks hung while that tab is hidden.
+    import("./layout").then((l) => { try { l.dockApi()?.getPanel("console")?.api.setActive(); } catch { /* layout not ready */ } });
   }
 }
 
@@ -245,10 +254,14 @@ function resetDebugState() {
  * answers a cheap request, settle everything older. `force` runs even while another resync waits
  * (its marker may itself have been lost; a newer resync settles that marker too). */
 let resyncing = false;
+let resyncSentAt = 0;
 async function resync(note: string, force = false) {
   pushConsole({ kind: "info", text: note });
-  if (resyncing && !force) return;
+  // While one waits, further lag reports only start another after a while: the marker's own
+  // reply can be among the dropped events, and that wait would then never end.
+  if (resyncing && !force && Date.now() - resyncSentAt < 5000) return;
   resyncing = true;
+  resyncSentAt = Date.now();
   try {
     const stale = [...pending.keys()];
     const staleExecs = [...userExecs];
@@ -375,7 +388,8 @@ async function devAutorun() {
 let restarting: Promise<void> | null = null;
 export function restartKernel(): Promise<void> {
   const prev = restarting;
-  if (prev) { startGen++; void invoke("cancel_start").catch(() => {}); }
+  // The restart in progress may be waiting for its setup requests (up to 10 min): end them.
+  if (prev) { startGen++; settlePending("kernel restarted"); void invoke("cancel_start").catch(() => {}); }
   const p: Promise<void> = (prev ? prev.then(restartKernelInner) : restartKernelInner()).finally(() => {
     if (restarting === p) restarting = null;
   });
@@ -448,29 +462,32 @@ export async function refreshWorkspace() {
   await awaitReply(id);
 }
 
+/** The payload of a helper call, or an error that says why there is none: the request was
+ * aborted (a cell queued before it raised) or its reply was lost (lagged / reconnected). */
+function helperData(reply: any, key: string): any {
+  const ue = reply?.user_expressions?.[key];
+  if (!ue) throw new Error(`the kernel did not answer (${reply?.status ?? "no reply"}); it is retried after the next execution`);
+  if (ue.status === "error") throw new Error(`${ue.ename}: ${ue.evalue}`);
+  return ue.data["application/x-pide+json"];
+}
+
 export async function fetchDetail(path: string, win: { row0: number; row1: number; col0: number; col1: number; index?: number[] }): Promise<DetailWindow> {
   const id = await invoke<string>("variable_detail", { path, win });
   const reply = await awaitReply(id);
-  const ue = reply.user_expressions?.detail;
-  if (ue?.status === "error") throw new Error(`${ue.ename}: ${ue.evalue}`);
-  return ue.data["application/x-pide+json"];
+  return helperData(reply, "detail");
 }
 
 export interface ImageData_ { path: string; shape: number[]; dtype: string; layout: string; extra: number[]; index: number[]; h: number; w: number; channels: number; vmin: number; vmax: number; step: number; data: string; error?: string }
 export async function fetchImage(path: string, opts: { index?: number[]; vmin?: number | null; vmax?: number | null; layout?: string }): Promise<ImageData_> {
   const id = await invoke<string>("variable_image", { path, opts });
   const reply = await awaitReply(id);
-  const ue = reply.user_expressions?.image;
-  if (ue?.status === "error") throw new Error(`${ue.ename}: ${ue.evalue}`);
-  return ue.data["application/x-pide+json"];
+  return helperData(reply, "image");
 }
 
 export async function fetchPlotExpr(expr: string): Promise<any> {
   const id = await invoke<string>("plot_expr", { expr });
   const reply = await awaitReply(id);
-  const ue = reply.user_expressions?.plot;
-  if (ue?.status === "error") throw new Error(`${ue.ename}: ${ue.evalue}`);
-  return ue.data["application/x-pide+json"];
+  return helperData(reply, "plot");
 }
 
 export async function complete(code: string, cursor: number): Promise<{ matches: string[]; cursor_start: number; cursor_end: number }> {
@@ -497,6 +514,13 @@ export async function replyInput(value: string) {
 }
 
 export async function setCwd(path: string) {
+  // A typo must not become the working folder (persisted, used to restart the language
+  // servers, while the kernel's own chdir fails silently).  Local folders only: a remote
+  // listing waits behind a running cell.
+  if (!get().remote && !get().connectionFile) {
+    const ok = await invoke("list_dir", { path }).then(() => true).catch(() => false);
+    if (!ok) { pushConsole({ kind: "info", text: `Not a folder: ${path}` }); return; }
+  }
   if (!get().remote && !get().connectionFile) localStorage.setItem("pide.cwd", path);
   set({ cwd: path });
   // The language servers' workspace root follows the cwd (no-op when the root is unchanged).
