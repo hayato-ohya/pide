@@ -241,6 +241,8 @@ def test_plot_thins_before_converting(ns):
 def test_dataframe_size_matches_memory_usage(ns):
     df = pd.DataFrame({"a": np.arange(10), "b": list("abcdefghij"), "c": pd.Categorical(list("aabbccddee")), "d": pd.array(range(10), dtype="Int64")})
     assert k._nbytes(df) == int(df.memory_usage(deep=False).sum())
+    wide = pd.DataFrame(np.zeros((2, 5000)))  # block-based shortcut: plain float blocks are exact
+    assert k._nbytes(wide) == int(wide.memory_usage(deep=False).sum())
 
 
 def test_subclass_and_element_reprs_are_bounded(ns):

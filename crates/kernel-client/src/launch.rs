@@ -139,6 +139,6 @@ mod tests {
         // Files written before the pid was added start with the uuid: swept by age alone.
         assert_eq!(owner_pid("kernel-0b1c2d3e-aaaa-bbbb-cccc-000000000000.json"), None);
         assert_eq!(owner_pid("other.json"), None);
-        assert_eq!(crate::platform::process_alive(std::process::id()).unwrap_or(true), true);
+        assert!(crate::platform::process_alive(std::process::id()).unwrap_or(true));
     }
 }

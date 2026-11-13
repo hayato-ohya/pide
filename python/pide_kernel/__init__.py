@@ -250,12 +250,15 @@ def _quiet(fn):
 
 
 def _df_nbytes(obj):
-    """``memory_usage(deep=False).sum()`` without the per-column Series it builds (0.25 s for
-    100k columns, on every snapshot): the blocks hold the same buffers."""
-    try:
-        return int(sum(b.values.nbytes for b in obj._mgr.blocks) + obj.index.memory_usage())
-    except Exception:  # noqa: BLE001  (private API moved)
-        return int(_safe(lambda: obj.memory_usage(deep=False).sum(), 0))
+    """``memory_usage(deep=False).sum()``; for very wide frames, where the per-column Series
+    it builds costs 0.25 s per 100k columns on every snapshot, the sum over the blocks
+    instead (the same buffers, give or take what extension arrays count)."""
+    if _safe(lambda: obj.shape[1], 0) > 2000:
+        try:
+            return int(sum(b.values.nbytes for b in obj._mgr.blocks) + obj.index.memory_usage())
+        except Exception:  # noqa: BLE001  (private API moved)
+            pass
+    return int(_safe(lambda: obj.memory_usage(deep=False).sum(), 0))
 
 
 def _nbytes(obj):
